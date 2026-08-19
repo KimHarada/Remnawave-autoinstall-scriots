@@ -13,8 +13,8 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # !!! ЗАМЕНИТЕ на свои реальные значения !!!
-GH_USER="ВАШ_ЮЗЕР"
-GH_REPO="ВАШ_РЕПО"
+GH_USER="KimHarada"
+GH_REPO="Remnawave-autoinstall-scriots"
 GH_BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/${GH_BRANCH}/scripts"
 
