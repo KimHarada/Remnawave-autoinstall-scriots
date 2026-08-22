@@ -19,6 +19,26 @@ warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[x]${NC} $1"; }
 info() { echo -e "${BLUE}[i]${NC} $1"; }
 
+# Числовое подтверждение вместо y/n.
+ask_yes_no() {
+    local prompt="$1"
+    local default="${2:-no}"
+    local def_label
+    if [[ "$default" == "yes" ]]; then
+        def_label="по умолчанию — 1"
+    else
+        def_label="по умолчанию — 2"
+    fi
+    echo "$prompt"
+    echo "  1) Да"
+    echo "  2) Нет"
+    read -rp "Выбор [${def_label}]: " CHOICE_NUM
+    if [[ -z "$CHOICE_NUM" ]]; then
+        CHOICE_NUM=$([[ "$default" == "yes" ]] && echo 1 || echo 2)
+    fi
+    [[ "$CHOICE_NUM" == "1" ]]
+}
+
 # Проверяет, существует ли файл конфига, и если да — спрашивает,
 # перезаписывать его или оставить как есть.
 # Возвращает 0 (true) если нужно писать/перезаписывать, 1 если пропустить.
@@ -27,8 +47,7 @@ confirm_overwrite() {
     local label="$2"
     if [[ -f "$file" ]]; then
         warn "${label} уже существует: ${file}"
-        read -rp "Перезаписать существующий конфиг? [y/N]: " OW
-        if [[ "$OW" != "y" && "$OW" != "Y" ]]; then
+        if ! ask_yes_no "Перезаписать существующий конфиг?" "no"; then
             info "Оставляем существующий ${label} без изменений."
             return 1
         fi
@@ -80,8 +99,7 @@ echo "  XHTTP       : $DOMAIN_XHTTP -> 127.0.0.1:$PORT_XHTTP"
 echo "  Hysteria2   : $DOMAIN_HY2 (напрямую, 443/udp)"
 echo "  Email       : $LE_EMAIL"
 echo
-read -rp "Всё верно? Продолжить установку? [y/N]: " CONFIRM
-if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+if ! ask_yes_no "Всё верно? Продолжить установку?" "no"; then
     warn "Отменено пользователем."
     exit 0
 fi
@@ -119,8 +137,7 @@ else
     echo
     if [[ "$DNS_OK" != "true" ]]; then
         err "Не все домены указывают на этот сервер. Certbot гарантированно не пройдёт валидацию."
-        read -rp "Продолжить всё равно? Обычно не имеет смысла. [y/N]: " FORCE_CONTINUE
-        if [[ "$FORCE_CONTINUE" != "y" && "$FORCE_CONTINUE" != "Y" ]]; then
+        if ! ask_yes_no "Продолжить всё равно? Обычно не имеет смысла." "no"; then
             err "Остановлено. Поправьте DNS-записи и запустите скрипт заново."
             exit 1
         fi
@@ -428,8 +445,7 @@ if ! [[ "$NODE_PORT_FINAL" =~ ^[0-9]+$ ]] || (( NODE_PORT_FINAL < 1 || NODE_PORT
     err "Некорректный порт: ${NODE_PORT_FINAL}. Пропускаем открытие порта для панели."
 else
     echo
-    read -rp "Открыть порт ${NODE_PORT_FINAL} в ufw для доступа панели? [y/N]: " OPEN_NODE_PORT
-    if [[ "$OPEN_NODE_PORT" == "y" || "$OPEN_NODE_PORT" == "Y" ]]; then
+    if ask_yes_no "Открыть порт ${NODE_PORT_FINAL} в ufw для доступа панели?" "no"; then
         read -rp "IP панели (Enter — открыть всем, менее безопасно): " PANEL_IP_INPUT
         if [[ -n "$PANEL_IP_INPUT" ]]; then
             ufw allow from "$PANEL_IP_INPUT" to any port "$NODE_PORT_FINAL" proto tcp comment 'Node API - panel' >/dev/null || true
@@ -525,8 +541,7 @@ if [[ -n "${DETECTED_COMPOSE_PATH:-}" && -f "$DETECTED_COMPOSE_PATH" ]] && comma
     else
         echo
         info "Найден compose-файл ноды: ${DETECTED_COMPOSE_PATH}"
-        read -rp "Автоматически дописать volumes для Hysteria2 и перезапустить ноду? [Y/n]: " AUTO_PATCH
-        if [[ "$AUTO_PATCH" != "n" && "$AUTO_PATCH" != "N" ]]; then
+        if ask_yes_no "Автоматически дописать volumes для Hysteria2 и перезапустить ноду?" "yes"; then
             cp "$DETECTED_COMPOSE_PATH" "${DETECTED_COMPOSE_PATH}.bak.$(date +%s)"
             info "Бэкап текущего compose-файла создан."
 

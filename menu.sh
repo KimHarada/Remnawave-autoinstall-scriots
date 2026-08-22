@@ -138,13 +138,14 @@ print_menu() {
     echo
     echo -e "  ${GRAY}Безопасность${NC}"
     echo -e "   ${ORANGE_BOLD}1${NC}  ${ORANGE}►${NC}  Harden SSH  ${DIM}(порт, ufw, fail2ban, таймзона, крон)${NC}"
+    echo -e "   ${ORANGE_BOLD}2${NC}  ${ORANGE}⛨${NC}  Защита панели  ${DIM}(80/443/SSH, fail2ban, таймзона, крон)${NC}"
     echo
     echo -e "  ${GRAY}Инфраструктура${NC}"
-    echo -e "   ${ORANGE_BOLD}2${NC}  ${ORANGE}⚙${NC}  Установить/настроить remnanode  ${DIM}(docker + volumes автоматически)${NC}"
-    echo -e "   ${ORANGE_BOLD}3${NC}  ${ORANGE}◈${NC}  HAProxy + Nginx + Certbot  ${DIM}(на уже установленную ноду)${NC}"
+    echo -e "   ${ORANGE_BOLD}3${NC}  ${ORANGE}⚙${NC}  Установить/настроить remnanode  ${DIM}(docker + volumes автоматически)${NC}"
+    echo -e "   ${ORANGE_BOLD}4${NC}  ${ORANGE}◈${NC}  HAProxy + Nginx + Certbot  ${DIM}(на уже установленную ноду)${NC}"
     echo
     echo -e "  ${GRAY}Наблюдение${NC}"
-    echo -e "   ${ORANGE_BOLD}4${NC}  ${ORANGE}≡${NC}  Статус ufw / fail2ban / cron"
+    echo -e "   ${ORANGE_BOLD}5${NC}  ${ORANGE}≡${NC}  Статус ufw / fail2ban / cron"
     echo
     echo -e "   ${ORANGE_BOLD}0${NC}  ${RED}✕${NC}  Выход"
     echo
@@ -184,12 +185,15 @@ main() {
             run_remote_script "harden-ssh.sh"
             ;;
         2)
-            run_remote_script "remnanode-setup.sh"
+            run_remote_script "panel-protect.sh"
             ;;
         3)
-            run_remote_script "haproxy-setup.sh"
+            run_remote_script "remnanode-setup.sh"
             ;;
         4)
+            run_remote_script "haproxy-setup.sh"
+            ;;
+        5)
             show_status
             ;;
         0)

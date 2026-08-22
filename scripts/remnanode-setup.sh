@@ -18,6 +18,26 @@ warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[x]${NC} $1"; }
 info() { echo -e "${BLUE}[i]${NC} $1"; }
 
+# Числовое подтверждение вместо y/n.
+ask_yes_no() {
+    local prompt="$1"
+    local default="${2:-no}"
+    local def_label
+    if [[ "$default" == "yes" ]]; then
+        def_label="по умолчанию — 1"
+    else
+        def_label="по умолчанию — 2"
+    fi
+    echo "$prompt"
+    echo "  1) Да"
+    echo "  2) Нет"
+    read -rp "Выбор [${def_label}]: " CHOICE_NUM
+    if [[ -z "$CHOICE_NUM" ]]; then
+        CHOICE_NUM=$([[ "$default" == "yes" ]] && echo 1 || echo 2)
+    fi
+    [[ "$CHOICE_NUM" == "1" ]]
+}
+
 if [[ $EUID -ne 0 ]]; then
     err "Запускать нужно от root."
     exit 1
@@ -63,8 +83,7 @@ COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
 REINSTALL=false
 if [[ -f "$COMPOSE_FILE" ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
     warn "Найдена существующая установка remnanode в ${INSTALL_DIR}."
-    read -rp "Пропустить установку и просто проверить/дочинить volumes? [Y/n]: " SKIP_INSTALL
-    if [[ "$SKIP_INSTALL" != "n" && "$SKIP_INSTALL" != "N" ]]; then
+    if ask_yes_no "Пропустить установку и просто проверить/дочинить volumes?" "yes"; then
         REINSTALL=false
         info "Пропускаем пересоздание — будем работать с существующим compose-файлом."
     else
@@ -92,8 +111,7 @@ fi
 
 if [[ -n "$EXISTING_SECRET_KEY" ]]; then
     info "Найден существующий SECRET_KEY в конфиге."
-    read -rp "Оставить текущий SECRET_KEY? [Y/n]: " KEEP_KEY
-    if [[ "$KEEP_KEY" == "n" || "$KEEP_KEY" == "N" ]]; then
+    if ! ask_yes_no "Оставить текущий SECRET_KEY?" "yes"; then
         EXISTING_SECRET_KEY=""
     fi
 fi
@@ -140,8 +158,7 @@ if (( ${#CERT_DOMAINS[@]} == 0 )); then
     warn "Сертификаты Let's Encrypt не найдены в /etc/letsencrypt/live/."
     warn "Если планируете использовать Hysteria2 — сначала выпустите сертификат"
     warn "(например через отдельный скрипт настройки HAProxy+Nginx+Certbot), затем перезапустите этот шаг."
-    read -rp "Продолжить БЕЗ сертификата для Hysteria2 (только VLESS-протоколы)? [y/N]: " CONTINUE_NO_CERT
-    if [[ "$CONTINUE_NO_CERT" != "y" && "$CONTINUE_NO_CERT" != "Y" ]]; then
+    if ! ask_yes_no "Продолжить БЕЗ сертификата для Hysteria2 (только VLESS-протоколы)?" "no"; then
         err "Остановлено. Настройте сертификат и запустите заново."
         exit 1
     fi
