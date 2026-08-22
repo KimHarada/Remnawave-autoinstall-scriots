@@ -62,6 +62,47 @@ SSH_SERVICE=${SSH_SERVICE:-ssh}
 info "systemd-юнит SSH: ${SSH_SERVICE}.service"
 
 # ------------------------------------------------------------
+# 1.5 Проверяем privilege separation directory (/run/sshd)
+#     Частая причина ложной ошибки 'Missing privilege separation
+#     directory' в sshd -t — это НЕ ошибка конфига, а просто
+#     пропавшая служебная директория (например, после очистки /run).
+#     sshd -t требует её для проверки, даже если конфиг корректен.
+# ------------------------------------------------------------
+echo
+log "Проверяем privilege separation directory (/run/sshd)..."
+if [[ -d /run/sshd ]]; then
+    info "/run/sshd уже существует."
+else
+    warn "/run/sshd отсутствует — создаём (это не связано с содержимым конфига)."
+    mkdir -p /run/sshd
+    chmod 0755 /run/sshd
+    log "/run/sshd создана."
+fi
+
+# Проверяем, что есть системное правило автосоздания /run/sshd при каждой
+# загрузке (обычно через systemd-tmpfiles) — если правило пропало, именно
+# поэтому директория и не пересоздалась сама после рестарта/очистки /run.
+TMPFILES_RULE_FOUND=false
+for f in /usr/lib/tmpfiles.d/*.conf /etc/tmpfiles.d/*.conf; do
+    [[ -f "$f" ]] || continue
+    if grep -qE '^\s*d\s+/run/sshd\s' "$f" 2>/dev/null; then
+        TMPFILES_RULE_FOUND=true
+        info "Правило автосоздания /run/sshd найдено в: ${f}"
+        break
+    fi
+done
+
+if [[ "$TMPFILES_RULE_FOUND" != "true" ]]; then
+    warn "Системное правило автосоздания /run/sshd не найдено — после перезагрузки директория может пропасть снова."
+    log "Добавляем постоянное правило в /etc/tmpfiles.d/sshd.conf..."
+    echo "d /run/sshd 0755 root root -" > /etc/tmpfiles.d/sshd.conf
+    systemd-tmpfiles --create /etc/tmpfiles.d/sshd.conf >/dev/null 2>&1 || true
+    log "Правило добавлено — /run/sshd теперь будет создаваться автоматически при каждой загрузке."
+else
+    info "Системное правило автосоздания /run/sshd уже есть — перезагрузки безопасны."
+fi
+
+# ------------------------------------------------------------
 # 2. Проверяем синтаксис sshd_config
 # ------------------------------------------------------------
 echo
