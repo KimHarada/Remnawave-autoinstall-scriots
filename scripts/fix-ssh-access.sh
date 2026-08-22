@@ -62,6 +62,32 @@ SSH_SERVICE=${SSH_SERVICE:-ssh}
 info "systemd-юнит SSH: ${SSH_SERVICE}.service"
 
 # ------------------------------------------------------------
+# 1.4 КРИТИЧНО: проверяем, что служба включена (enabled) для автозапуска
+#     Если служба disabled — она не поднимется сама даже после простого
+#     restart в конце сессии, и особенно опасна при авто-перезагрузке
+#     по крону (4:00) — можно навсегда потерять доступ без консоли хостера.
+# ------------------------------------------------------------
+echo
+log "Проверяем, включена ли служба ${SSH_SERVICE} для автозапуска..."
+ENABLED_STATE=$(systemctl is-enabled "${SSH_SERVICE}.service" 2>/dev/null || true)
+info "Текущее состояние: ${ENABLED_STATE:-неизвестно}"
+
+if [[ "$ENABLED_STATE" != "enabled" ]]; then
+    err "Служба ${SSH_SERVICE}.service НЕ включена для автозапуска (текущее: ${ENABLED_STATE:-нет данных})!"
+    err "При следующей перезагрузке (в т.ч. по крону в 04:00, если настроен) SSH может не подняться вообще."
+    log "Включаем автозапуск..."
+    systemctl enable "${SSH_SERVICE}.service" >/dev/null 2>&1
+    ENABLED_STATE_AFTER=$(systemctl is-enabled "${SSH_SERVICE}.service" 2>/dev/null || true)
+    if [[ "$ENABLED_STATE_AFTER" == "enabled" ]]; then
+        log "Автозапуск включён."
+    else
+        err "Не удалось включить автозапуск автоматически! Проверьте вручную: systemctl enable ${SSH_SERVICE}"
+    fi
+else
+    log "Автозапуск уже включён."
+fi
+
+# ------------------------------------------------------------
 # 1.5 Проверяем privilege separation directory (/run/sshd)
 #     Частая причина ложной ошибки 'Missing privilege separation
 #     directory' в sshd -t — это НЕ ошибка конфига, а просто
@@ -205,6 +231,7 @@ if (( ${#REAL_PORTS[@]} == 0 )); then
     err "SSH вообще не слушает ни один порт! Служба не запущена?"
     systemctl status "${SSH_SERVICE}" --no-pager -l | tail -20
     err "Пробуем запустить..."
+    systemctl enable "${SSH_SERVICE}.service" >/dev/null 2>&1 || true
     systemctl restart "${SSH_SERVICE}"
     sleep 2
     mapfile -t REAL_PORTS < <(ss -tlnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | tr -d ':' | sort -u)
@@ -212,6 +239,7 @@ if (( ${#REAL_PORTS[@]} == 0 )); then
         err "Не удалось поднять SSH. Смотрите логи: journalctl -u ${SSH_SERVICE} -n 50"
         exit 1
     fi
+    log "SSH поднят и включён для автозапуска."
 fi
 
 log "SSH реально слушает порт(ы): ${REAL_PORTS[*]}"
