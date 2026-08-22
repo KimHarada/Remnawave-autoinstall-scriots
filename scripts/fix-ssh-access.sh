@@ -229,7 +229,7 @@ done
 
 if (( ${#REAL_PORTS[@]} == 0 )); then
     err "SSH вообще не слушает ни один порт! Служба не запущена?"
-    systemctl status "${SSH_SERVICE}" --no-pager -l | tail -20
+    systemctl status "${SSH_SERVICE}" --no-pager -l 2>&1 | tail -20 || true
     err "Пробуем запустить..."
     systemctl enable "${SSH_SERVICE}.service" >/dev/null 2>&1 || true
     systemctl restart "${SSH_SERVICE}"
