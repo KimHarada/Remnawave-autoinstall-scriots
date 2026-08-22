@@ -113,27 +113,52 @@ else
     err "Обнаружена ошибка в sshd_config:"
     cat /tmp/sshd_check_err
     echo
-    LATEST_BACKUP=$(ls -t /etc/ssh/sshd_config.bak.* 2>/dev/null | head -n1 || true)
-    if [[ -n "$LATEST_BACKUP" ]]; then
-        warn "Найден бэкап: ${LATEST_BACKUP}"
-        if ask_yes_no "Восстановить sshd_config из этого бэкапа?" "yes"; then
+    warn "Есть три варианта восстановления:"
+    echo "  1) Восстановить из бэкапа (если он валидный)"
+    echo "  2) Просто сбросить порт на 22 и перезапустить службу (без бэкапа)"
+    echo "  3) Чинить вручную самому"
+    read -rp "Выбор [1/2/3]: " RECOVERY_CHOICE
+
+    case "$RECOVERY_CHOICE" in
+        1)
+            LATEST_BACKUP=$(ls -t /etc/ssh/sshd_config.bak.* 2>/dev/null | head -n1 || true)
+            if [[ -z "$LATEST_BACKUP" ]]; then
+                err "Бэкапов не найдено."
+                exit 1
+            fi
+            warn "Восстанавливаем из: ${LATEST_BACKUP}"
             cp "$LATEST_BACKUP" /etc/ssh/sshd_config
             if sshd -t 2>/tmp/sshd_check_err2; then
                 log "Конфиг восстановлен и прошёл проверку."
+                systemctl restart "${SSH_SERVICE}" 2>/dev/null || true
+                log "Служба перезапущена."
             else
                 err "Даже бэкап содержит ошибку:"
                 cat /tmp/sshd_check_err2
-                err "Нужно чинить sshd_config вручную. Смотрите: nano /etc/ssh/sshd_config"
                 exit 1
             fi
-        else
-            err "Без исправления sshd_config продолжать бессмысленно. Почините вручную и запустите скрипт снова."
+            ;;
+        2)
+            warn "Сбрасываем порт на 22 (без восстановления из бэкапа)..."
+            cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.reset.$(date +%s)"
+            sed -i '/^Port /d' /etc/ssh/sshd_config
+            echo "Port 22" >> /etc/ssh/sshd_config
+            if sshd -t 2>/tmp/sshd_check_err3; then
+                log "Порт сброшен на 22, конфиг прошёл проверку."
+                systemctl restart "${SSH_SERVICE}" 2>/dev/null || true
+                log "Служба перезапущена на порту 22."
+            else
+                err "Конфиг всё ещё содержит ошибку (дело не только в порте):"
+                cat /tmp/sshd_check_err3
+                err "Нужно чинить вручную: nano /etc/ssh/sshd_config"
+                exit 1
+            fi
+            ;;
+        *)
+            err "Чините вручную: nano /etc/ssh/sshd_config, затем запустите скрипт заново."
             exit 1
-        fi
-    else
-        err "Бэкапов не найдено. Нужно чинить sshd_config вручную: nano /etc/ssh/sshd_config"
-        exit 1
-    fi
+            ;;
+    esac
 fi
 
 # ------------------------------------------------------------
