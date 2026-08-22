@@ -1,0 +1,228 @@
+#!/bin/bash
+set -euo pipefail
+
+# ============================================================
+#  fix-ssh-access — восстановление SSH-доступа
+#  Определяет РЕАЛЬНЫЙ слушающий порт (через ss, а не через
+#  config-парсинг), чинит ufw и ssh.socket при необходимости.
+# ============================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log()  { echo -e "${GREEN}[+]${NC} $1"; }
+warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+err()  { echo -e "${RED}[x]${NC} $1"; }
+info() { echo -e "${BLUE}[i]${NC} $1"; }
+
+ask_yes_no() {
+    local prompt="$1"
+    local default="${2:-no}"
+    local def_label
+    if [[ "$default" == "yes" ]]; then
+        def_label="по умолчанию — 1"
+    else
+        def_label="по умолчанию — 2"
+    fi
+    echo "$prompt"
+    echo "  1) Да"
+    echo "  2) Нет"
+    read -rp "Выбор [${def_label}]: " CHOICE_NUM
+    if [[ -z "$CHOICE_NUM" ]]; then
+        CHOICE_NUM=$([[ "$default" == "yes" ]] && echo 1 || echo 2)
+    fi
+    [[ "$CHOICE_NUM" == "1" ]]
+}
+
+if [[ $EUID -ne 0 ]]; then
+    err "Запускать нужно от root."
+    exit 1
+fi
+
+echo "============================================================"
+echo " fix-ssh-access — диагностика и восстановление SSH-доступа"
+echo "============================================================"
+echo
+
+# ------------------------------------------------------------
+# 1. Определяем СЕРВИС (ssh или sshd — зависит от дистрибутива)
+# ------------------------------------------------------------
+SSH_SERVICE=""
+for candidate in ssh sshd; do
+    FRAGMENT=$(systemctl show -p FragmentPath --value "${candidate}.service" 2>/dev/null || true)
+    if [[ -n "$FRAGMENT" && "$FRAGMENT" != "/dev/null" ]]; then
+        SSH_SERVICE="$candidate"
+        break
+    fi
+done
+SSH_SERVICE=${SSH_SERVICE:-ssh}
+info "systemd-юнит SSH: ${SSH_SERVICE}.service"
+
+# ------------------------------------------------------------
+# 2. Проверяем синтаксис sshd_config
+# ------------------------------------------------------------
+echo
+log "Проверяем sshd_config..."
+if sshd -t 2>/tmp/sshd_check_err; then
+    log "Синтаксис sshd_config корректен."
+else
+    err "Обнаружена ошибка в sshd_config:"
+    cat /tmp/sshd_check_err
+    echo
+    LATEST_BACKUP=$(ls -t /etc/ssh/sshd_config.bak.* 2>/dev/null | head -n1 || true)
+    if [[ -n "$LATEST_BACKUP" ]]; then
+        warn "Найден бэкап: ${LATEST_BACKUP}"
+        if ask_yes_no "Восстановить sshd_config из этого бэкапа?" "yes"; then
+            cp "$LATEST_BACKUP" /etc/ssh/sshd_config
+            if sshd -t 2>/tmp/sshd_check_err2; then
+                log "Конфиг восстановлен и прошёл проверку."
+            else
+                err "Даже бэкап содержит ошибку:"
+                cat /tmp/sshd_check_err2
+                err "Нужно чинить sshd_config вручную. Смотрите: nano /etc/ssh/sshd_config"
+                exit 1
+            fi
+        else
+            err "Без исправления sshd_config продолжать бессмысленно. Почините вручную и запустите скрипт снова."
+            exit 1
+        fi
+    else
+        err "Бэкапов не найдено. Нужно чинить sshd_config вручную: nano /etc/ssh/sshd_config"
+        exit 1
+    fi
+fi
+
+# ------------------------------------------------------------
+# 3. Проверяем ssh.socket (частая причина игнорирования Port)
+# ------------------------------------------------------------
+echo
+log "Проверяем socket-активацию (ssh.socket)..."
+if systemctl list-units --all 2>/dev/null | grep -q "ssh\.socket"; then
+    if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+        warn "ssh.socket активен — он может игнорировать Port из sshd_config."
+        SOCKET_LISTEN=$(systemctl show -p Listen --value ssh.socket 2>/dev/null || true)
+        info "ssh.socket слушает: ${SOCKET_LISTEN:-неизвестно}"
+        if ask_yes_no "Отключить ssh.socket и перейти на обычный запуск через ${SSH_SERVICE}.service?" "yes"; then
+            systemctl stop ssh.socket
+            systemctl disable ssh.socket >/dev/null 2>&1 || true
+            systemctl enable "${SSH_SERVICE}.service" >/dev/null 2>&1 || true
+            systemctl restart "${SSH_SERVICE}.service"
+            log "ssh.socket отключён."
+        fi
+    else
+        info "ssh.socket присутствует, но неактивен — не мешает."
+    fi
+else
+    info "ssh.socket не используется в этой системе."
+fi
+
+# ------------------------------------------------------------
+# 4. Определяем РЕАЛЬНЫЙ слушающий порт (через ss — не через конфиг!)
+# ------------------------------------------------------------
+echo
+log "Ищем реальный слушающий порт SSH через ss..."
+
+# Пытаемся до 5 раз с паузой — на случай если служба ещё перезапускается
+REAL_PORTS=()
+for i in 1 2 3 4 5; do
+    mapfile -t REAL_PORTS < <(ss -tlnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | tr -d ':' | sort -u)
+    if (( ${#REAL_PORTS[@]} > 0 )); then
+        break
+    fi
+    sleep 1
+done
+
+if (( ${#REAL_PORTS[@]} == 0 )); then
+    err "SSH вообще не слушает ни один порт! Служба не запущена?"
+    systemctl status "${SSH_SERVICE}" --no-pager -l | tail -20
+    err "Пробуем запустить..."
+    systemctl restart "${SSH_SERVICE}"
+    sleep 2
+    mapfile -t REAL_PORTS < <(ss -tlnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | tr -d ':' | sort -u)
+    if (( ${#REAL_PORTS[@]} == 0 )); then
+        err "Не удалось поднять SSH. Смотрите логи: journalctl -u ${SSH_SERVICE} -n 50"
+        exit 1
+    fi
+fi
+
+log "SSH реально слушает порт(ы): ${REAL_PORTS[*]}"
+
+# Для сравнения — что показывает sshd -T (может отличаться, если конфиг
+# поменяли, но службу ещё не перезапускали)
+CONFIG_PORT=$(sshd -T 2>/dev/null | grep -i "^port" | awk '{print $2}' | head -n1 || true)
+if [[ -n "$CONFIG_PORT" ]]; then
+    info "sshd_config (после перезапуска) указывает порт: ${CONFIG_PORT}"
+    if ! printf '%s\n' "${REAL_PORTS[@]}" | grep -qx "$CONFIG_PORT"; then
+        warn "Внимание: конфиг говорит про порт ${CONFIG_PORT}, но реально слушается ${REAL_PORTS[*]}."
+        warn "Возможно, служба не перезапускалась после последней правки конфига."
+    fi
+fi
+
+# ------------------------------------------------------------
+# 5. Проверяем ufw — открыты ли реальные порты
+# ------------------------------------------------------------
+echo
+if ! command -v ufw >/dev/null 2>&1; then
+    info "ufw не установлен — блокировки на этом уровне быть не может."
+else
+    log "Проверяем правила ufw..."
+    UFW_ACTIVE=$(ufw status | head -n1)
+    info "Статус ufw: ${UFW_ACTIVE}"
+
+    MISSING_PORTS=()
+    for p in "${REAL_PORTS[@]}"; do
+        if ! ufw status | grep -qE "^${p}/tcp"; then
+            MISSING_PORTS+=("$p")
+        fi
+    done
+
+    if (( ${#MISSING_PORTS[@]} > 0 )); then
+        err "Эти реально слушающие SSH-порты НЕ разрешены в ufw: ${MISSING_PORTS[*]}"
+        if ask_yes_no "Открыть их в ufw прямо сейчас?" "yes"; then
+            for p in "${MISSING_PORTS[@]}"; do
+                ufw allow "${p}/tcp" comment 'SSH (restored)' >/dev/null
+                log "Порт ${p}/tcp открыт в ufw."
+            done
+            # Если ufw ещё не был активен (default deny не применён) — включаем аккуратно
+            if ! ufw status | grep -q "Status: active"; then
+                warn "ufw был неактивен. Включаем."
+                ufw --force enable >/dev/null
+            fi
+        fi
+    else
+        log "Все реально слушающие SSH-порты уже разрешены в ufw."
+    fi
+fi
+
+# ------------------------------------------------------------
+# 6. Финальная проверка
+# ------------------------------------------------------------
+echo
+echo "============================================================"
+log "Финальная проверка"
+echo "============================================================"
+
+if systemctl is-active --quiet "$SSH_SERVICE"; then
+    log "${SSH_SERVICE}: активен"
+else
+    err "${SSH_SERVICE}: НЕ активен!"
+fi
+
+echo
+info "Реально слушающие порты SSH:"
+ss -tlnp 2>/dev/null | grep -i sshd
+
+echo
+info "ufw status:"
+ufw status verbose 2>/dev/null || echo "  ufw не установлен"
+
+echo
+echo "============================================================"
+log "Готово! Проверьте подключение в НОВОМ окне терминала, не закрывая текущее:"
+for p in "${REAL_PORTS[@]}"; do
+    echo "  ssh -p ${p} $(whoami)@ВАШ_IP"
+done
+echo "============================================================"

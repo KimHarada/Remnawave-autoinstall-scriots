@@ -52,20 +52,63 @@ echo
 
 # ------------------------------------------------------------
 # 1. Определяем текущий SSH-порт
+#    ВАЖНО: используем ss (реально слушающий сокет) как основной
+#    источник истины, а не только sshd -T (парсинг конфига) —
+#    если конфиг и реальность разошлись (например, служба не была
+#    перезапущена после правки), config-based детекция обманет
+#    и приведёт к блокировке реального порта в ufw.
 # ------------------------------------------------------------
-DETECTED_SSH_PORT=""
-if command -v sshd >/dev/null 2>&1; then
-    DETECTED_SSH_PORT=$(sshd -T 2>/dev/null | grep -i "^port" | awk '{print $2}' | head -n1) || true
-fi
-DETECTED_SSH_PORT=${DETECTED_SSH_PORT:-22}
+REAL_LISTEN_PORTS=()
+mapfile -t REAL_LISTEN_PORTS < <(ss -tlnp 2>/dev/null | grep -i sshd | grep -oE ':[0-9]+' | tr -d ':' | sort -u)
 
-info "Обнаруженный SSH-порт: ${DETECTED_SSH_PORT}"
+CONFIG_PORT=""
+if command -v sshd >/dev/null 2>&1; then
+    CONFIG_PORT=$(sshd -T 2>/dev/null | grep -i "^port" | awk '{print $2}' | head -n1) || true
+fi
+
+if (( ${#REAL_LISTEN_PORTS[@]} == 1 )); then
+    DETECTED_SSH_PORT="${REAL_LISTEN_PORTS[0]}"
+    info "Реально слушающий SSH-порт (по ss): ${DETECTED_SSH_PORT}"
+    if [[ -n "$CONFIG_PORT" && "$CONFIG_PORT" != "$DETECTED_SSH_PORT" ]]; then
+        warn "Конфиг sshd_config указывает порт ${CONFIG_PORT}, но реально слушается ${DETECTED_SSH_PORT}."
+        warn "Используем реально слушающий порт — именно он важен для firewall."
+    fi
+elif (( ${#REAL_LISTEN_PORTS[@]} > 1 )); then
+    warn "SSH слушает НЕСКОЛЬКО портов одновременно: ${REAL_LISTEN_PORTS[*]}"
+    DETECTED_SSH_PORT="${REAL_LISTEN_PORTS[0]}"
+    warn "Взят первый (${DETECTED_SSH_PORT}) как предложение — проверьте внимательно перед подтверждением."
+else
+    err "Не удалось определить порт SSH через ss (сервис не слушает ни один порт?)."
+    if [[ -n "$CONFIG_PORT" ]]; then
+        warn "Используем значение из конфига как fallback: ${CONFIG_PORT}"
+        DETECTED_SSH_PORT="$CONFIG_PORT"
+    else
+        err "Fallback тоже недоступен. Используем дефолт 22 — ОБЯЗАТЕЛЬНО проверьте вручную перед продолжением!"
+        DETECTED_SSH_PORT=22
+    fi
+fi
+
+echo
+warn "ВАЖНО: убедитесь, что порт ниже — это ТОЧНО тот порт, которым вы пользуетесь для SSH."
+warn "Если ошибётесь — после включения ufw вы потеряете доступ к серверу."
 read -rp "Подтвердите SSH-порт (Enter — ${DETECTED_SSH_PORT}): " SSH_PORT_INPUT
 SSH_PORT=${SSH_PORT_INPUT:-$DETECTED_SSH_PORT}
 
 if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
     err "Некорректный порт: ${SSH_PORT}"
     exit 1
+fi
+
+# Финальная защитная проверка: если введённый порт не совпадает
+# ни с одним реально слушающим — предупреждаем явно и требуем
+# отдельного подтверждения, а не тихо продолжаем.
+if (( ${#REAL_LISTEN_PORTS[@]} > 0 )) && ! printf '%s\n' "${REAL_LISTEN_PORTS[@]}" | grep -qx "$SSH_PORT"; then
+    err "ВНИМАНИЕ: порт ${SSH_PORT} НЕ входит в реально слушающие SSH-порты (${REAL_LISTEN_PORTS[*]})!"
+    err "Если продолжить — вы, скорее всего, потеряете доступ к серверу после включения ufw."
+    if ! ask_yes_no "Вы АБСОЛЮТНО уверены, что хотите использовать именно порт ${SSH_PORT}?" "no"; then
+        err "Остановлено для вашей безопасности. Перепроверьте порт и запустите скрипт заново."
+        exit 1
+    fi
 fi
 
 # ------------------------------------------------------------

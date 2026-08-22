@@ -139,6 +139,7 @@ print_menu() {
     echo -e "  ${GRAY}Безопасность${NC}"
     echo -e "   ${ORANGE_BOLD}1${NC}  ${ORANGE}►${NC}  Harden SSH  ${DIM}(порт, ufw, fail2ban, таймзона, крон)${NC}"
     echo -e "   ${ORANGE_BOLD}2${NC}  ${ORANGE}⛨${NC}  Защита панели  ${DIM}(80/443/SSH, fail2ban, таймзона, крон)${NC}"
+    echo -e "   ${ORANGE_BOLD}6${NC}  ${RED}✚${NC}  Восстановить SSH-доступ  ${DIM}(если потеряли доступ после защиты)${NC}"
     echo
     echo -e "  ${GRAY}Инфраструктура${NC}"
     echo -e "   ${ORANGE_BOLD}3${NC}  ${ORANGE}⚙${NC}  Установить/настроить remnanode  ${DIM}(docker + volumes автоматически)${NC}"
@@ -195,6 +196,9 @@ main() {
             ;;
         5)
             show_status
+            ;;
+        6)
+            run_remote_script "fix-ssh-access.sh"
             ;;
         0)
             echo "Выход."
