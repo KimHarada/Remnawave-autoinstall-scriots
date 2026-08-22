@@ -146,19 +146,67 @@ if ! ask_yes_no "Продолжить и применить эти правил�
 fi
 
 # ------------------------------------------------------------
-# 4. Применяем правила
+# 4. Применяем правила (безопасно — не закрываем старые SSH-порты
+#    сразу, только после вашего подтверждения, что новый работает)
 # ------------------------------------------------------------
-log "Настраиваем ufw..."
-
-ufw default deny incoming >/dev/null
-ufw default allow outgoing >/dev/null
+log "Открываем нужные порты (старые SSH-правила пока не трогаем)..."
 
 ufw allow "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
 ufw allow 80/tcp comment 'HTTP' >/dev/null
 ufw allow 443/tcp comment 'HTTPS' >/dev/null
 
+ufw default deny incoming >/dev/null
+ufw default allow outgoing >/dev/null
 ufw --force enable >/dev/null
-log "ufw настроен и активен."
+log "ufw активирован. SSH-порт ${SSH_PORT}, 80 и 443 открыты."
+
+echo
+warn "=========================================================="
+warn " ВАЖНО: НЕ ЗАКРЫВАЙТЕ ЭТУ СЕССИЮ!"
+warn " Откройте НОВОЕ окно терминала и подключитесь так:"
+echo
+echo -e "   ssh -p ${SSH_PORT} $(whoami)@$(curl -s -4 ifconfig.me 2>/dev/null || echo 'ВАШ_IP')"
+echo
+warn " Только убедившись, что подключение прошло успешно,"
+warn " возвращайтесь сюда и подтверждайте продолжение."
+warn "=========================================================="
+echo
+
+CLEANUP_OLD_SSH=false
+if ask_yes_no "Подключение на порту ${SSH_PORT} точно работает? Убрать старые SSH-правила (если есть)?" "no"; then
+    CLEANUP_OLD_SSH=true
+else
+    warn "Оставлено как есть. Старые SSH-правила (если были) НЕ удалены — можете почистить вручную позже:"
+    echo "  ufw status numbered"
+    echo "  ufw --force delete <номер>"
+fi
+
+if [[ "$CLEANUP_OLD_SSH" == "true" ]]; then
+    log "Ищем старые SSH-правила (по комментарию '# SSH'), отличные от порта ${SSH_PORT}..."
+
+    # ВАЖНО: номера правил у ufw дополняются пробелом для выравнивания
+    # (например "[ 4]"), поэтому извлекаем номер через sed, а не через
+    # grep -oE '^\[[0-9]+\]', который такие строки не матчит вообще.
+    STALE_SSH_RULES=$(ufw status numbered 2>/dev/null | grep -E "# SSH$" | grep -vE "^\[[[:space:]0-9]+\][[:space:]]+${SSH_PORT}/tcp" || true)
+
+    if [[ -n "$STALE_SSH_RULES" ]]; then
+        warn "Найдены старые SSH-правила для удаления:"
+        echo "$STALE_SSH_RULES"
+        while IFS= read -r num; do
+            [[ -n "$num" ]] && ufw --force delete "$num" >/dev/null 2>&1
+        done < <(echo "$STALE_SSH_RULES" | sed -E 's/^\[[[:space:]]*([0-9]+)\].*/\1/' | sort -rn)
+
+        REMAINING=$(ufw status numbered 2>/dev/null | grep -E "# SSH$" | grep -vE "^\[[[:space:]0-9]+\][[:space:]]+${SSH_PORT}/tcp" || true)
+        if [[ -z "$REMAINING" ]]; then
+            log "Старые SSH-правила удалены."
+        else
+            warn "Не всё удалилось автоматически, осталось:"
+            echo "$REMAINING"
+        fi
+    else
+        info "Старых SSH-правил не найдено — нечего чистить."
+    fi
+fi
 
 # ------------------------------------------------------------
 # 5. fail2ban — защита SSH от брутфорса
