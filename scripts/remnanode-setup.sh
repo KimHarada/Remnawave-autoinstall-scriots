@@ -2,9 +2,8 @@
 set -euo pipefail
 
 # ============================================================
-#  remnanode setup — установка/настройка ноды Remnawave
-#  Автоматически прописывает volumes (включая сертификаты для
-#  Hysteria2) в docker-compose.yml — без ручной правки руками.
+#  remnanode-setup — установка и настройка ноды Remnawave
+#  Явно спрашивает про Hysteria2, сам прописывает volumes.
 # ============================================================
 
 RED='\033[0;31m'
@@ -18,7 +17,6 @@ warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 err()  { echo -e "${RED}[x]${NC} $1"; }
 info() { echo -e "${BLUE}[i]${NC} $1"; }
 
-# Числовое подтверждение вместо y/n.
 ask_yes_no() {
     local prompt="$1"
     local default="${2:-no}"
@@ -49,14 +47,14 @@ echo "============================================================"
 echo
 
 # ------------------------------------------------------------
-# 1. Docker + Compose plugin — ставим, если нет
+# 1. Docker + Compose plugin
 # ------------------------------------------------------------
 if command -v docker >/dev/null 2>&1; then
     info "Docker уже установлен ($(docker --version))."
 else
     log "Docker не найден — устанавливаем..."
     if ! curl -fsSL https://get.docker.com | sh; then
-        err "Не удалось установить Docker. Проверьте подключение к сети/репозиториям."
+        err "Не удалось установить Docker."
         exit 1
     fi
     systemctl enable --now docker >/dev/null 2>&1 || true
@@ -65,10 +63,8 @@ fi
 
 if ! docker compose version >/dev/null 2>&1; then
     err "Плагин 'docker compose' недоступен даже после установки Docker."
-    err "Проверьте вручную: docker compose version"
     exit 1
 fi
-info "docker compose: $(docker compose version --short 2>/dev/null || echo OK)"
 
 # ------------------------------------------------------------
 # 2. Каталог установки
@@ -77,17 +73,14 @@ echo
 read -rp "Каталог для remnanode (Enter — /opt/remnanode): " INSTALL_DIR
 INSTALL_DIR=${INSTALL_DIR:-/opt/remnanode}
 mkdir -p "$INSTALL_DIR"
-
 COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
 
-REINSTALL=false
+REINSTALL=true
 if [[ -f "$COMPOSE_FILE" ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
     warn "Найдена существующая установка remnanode в ${INSTALL_DIR}."
     if ask_yes_no "Пропустить установку и просто проверить/дочинить volumes?" "yes"; then
         REINSTALL=false
-        info "Пропускаем пересоздание — будем работать с существующим compose-файлом."
-    else
-        REINSTALL=true
+        info "Пропускаем пересоздание — работаем с существующим compose-файлом."
     fi
 fi
 
@@ -124,125 +117,155 @@ else
     SECRET_KEY_INPUT="$EXISTING_SECRET_KEY"
 fi
 
-# Защита от старой известной проблемы: если ключ случайно вставлен в кавычках —
-# убираем их автоматически, а не роняем контейнер с 'Invalid SECRET_KEY payload'.
+# Автоматически убираем случайно вставленные кавычки/переносы —
+# частая причина 'Invalid SECRET_KEY payload'.
 SECRET_KEY_CLEAN=$(echo "$SECRET_KEY_INPUT" | sed -E 's/^"+//; s/"+$//' | tr -d '\r\n')
-
 if [[ -z "$SECRET_KEY_CLEAN" ]]; then
     err "SECRET_KEY пустой — без него нода не запустится."
     exit 1
 fi
-
 if [[ "$SECRET_KEY_INPUT" != "$SECRET_KEY_CLEAN" ]]; then
-    warn "Обнаружены и автоматически убраны лишние кавычки/пробелы вокруг SECRET_KEY."
+    warn "Обнаружены и убраны лишние кавычки/пробелы вокруг SECRET_KEY."
 fi
 
 # ------------------------------------------------------------
-# 4. Поиск сертификатов Let's Encrypt для Hysteria2
+# 4. Явный вопрос про Hysteria2
 # ------------------------------------------------------------
 echo
-log "Ищем существующие сертификаты Let's Encrypt для Hysteria2..."
-
-CERT_DOMAINS=()
-if [[ -d /etc/letsencrypt/live ]]; then
-    while IFS= read -r -d '' dir; do
-        domain=$(basename "$dir")
-        if [[ "$domain" != "README" && -f "${dir}/fullchain.pem" && -f "${dir}/privkey.pem" ]]; then
-            CERT_DOMAINS+=("$domain")
-        fi
-    done < <(find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+USE_HYSTERIA=false
+if ask_yes_no "Будем использовать Hysteria2 на этой ноде?" "yes"; then
+    USE_HYSTERIA=true
 fi
 
 HYSTERIA_CERT_DIR=""
-if (( ${#CERT_DOMAINS[@]} == 0 )); then
-    warn "Сертификаты Let's Encrypt не найдены в /etc/letsencrypt/live/."
-    warn "Если планируете использовать Hysteria2 — сначала выпустите сертификат"
-    warn "(например через отдельный скрипт настройки HAProxy+Nginx+Certbot), затем перезапустите этот шаг."
-    if ! ask_yes_no "Продолжить БЕЗ сертификата для Hysteria2 (только VLESS-протоколы)?" "no"; then
-        err "Остановлено. Настройте сертификат и запустите заново."
-        exit 1
+if [[ "$USE_HYSTERIA" == "true" ]]; then
+    log "Ищем существующие сертификаты Let's Encrypt для Hysteria2..."
+
+    CERT_DOMAINS=()
+    if [[ -d /etc/letsencrypt/live ]]; then
+        while IFS= read -r -d '' dir; do
+            domain=$(basename "$dir")
+            if [[ "$domain" != "README" && -f "${dir}/fullchain.pem" && -f "${dir}/privkey.pem" ]]; then
+                CERT_DOMAINS+=("$domain")
+            fi
+        done < <(find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
     fi
-elif (( ${#CERT_DOMAINS[@]} == 1 )); then
-    HYSTERIA_CERT_DIR="${CERT_DOMAINS[0]}"
-    info "Найден сертификат: ${HYSTERIA_CERT_DIR} (будет использован для Hysteria2)."
-else
-    echo "Найдено несколько сертификатов:"
-    local_i=1
-    for d in "${CERT_DOMAINS[@]}"; do
-        echo "  ${local_i}) ${d}"
-        ((local_i++))
-    done
-    echo "  0) Не использовать (пропустить Hysteria2)"
-    read -rp "Выберите номер: " CERT_CHOICE
-    if [[ "$CERT_CHOICE" == "0" ]]; then
-        HYSTERIA_CERT_DIR=""
-    elif [[ "$CERT_CHOICE" =~ ^[0-9]+$ ]] && (( CERT_CHOICE >= 1 && CERT_CHOICE <= ${#CERT_DOMAINS[@]} )); then
-        HYSTERIA_CERT_DIR="${CERT_DOMAINS[$((CERT_CHOICE-1))]}"
+
+    if (( ${#CERT_DOMAINS[@]} == 0 )); then
+        warn "Сертификаты Let's Encrypt не найдены в /etc/letsencrypt/live/."
+        warn "Сначала выпустите сертификат (пункт 'Только Nginx + self-steal'), затем перезапустите этот шаг."
+        if ! ask_yes_no "Продолжить БЕЗ сертификата для Hysteria2 (только VLESS-протоколы)?" "no"; then
+            err "Остановлено. Настройте сертификат и запустите заново."
+            exit 1
+        fi
+    elif (( ${#CERT_DOMAINS[@]} == 1 )); then
+        HYSTERIA_CERT_DIR="${CERT_DOMAINS[0]}"
+        info "Найден сертификат: ${HYSTERIA_CERT_DIR}"
     else
-        err "Некорректный выбор."
+        echo "Найдено несколько сертификатов:"
+        idx=1
+        for d in "${CERT_DOMAINS[@]}"; do
+            echo "  ${idx}) ${d}"
+            ((idx++))
+        done
+        echo "  0) Не использовать"
+        read -rp "Выберите номер: " CERT_CHOICE
+        if [[ "$CERT_CHOICE" == "0" ]]; then
+            HYSTERIA_CERT_DIR=""
+        elif [[ "$CERT_CHOICE" =~ ^[0-9]+$ ]] && (( CERT_CHOICE >= 1 && CERT_CHOICE <= ${#CERT_DOMAINS[@]} )); then
+            HYSTERIA_CERT_DIR="${CERT_DOMAINS[$((CERT_CHOICE-1))]}"
+        fi
+    fi
+
+    if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
+        CERT_FULLCHAIN="/etc/letsencrypt/live/${HYSTERIA_CERT_DIR}/fullchain.pem"
+        CERT_PRIVKEY="/etc/letsencrypt/live/${HYSTERIA_CERT_DIR}/privkey.pem"
+        if [[ ! -f "$CERT_FULLCHAIN" || ! -f "$CERT_PRIVKEY" ]]; then
+            err "Файлы сертификата не найдены. Отменяем монтирование."
+            HYSTERIA_CERT_DIR=""
+        fi
+    fi
+else
+    info "Hysteria2 использоваться не будет — volumes под сертификат не добавляем."
+fi
+
+# ------------------------------------------------------------
+# 5. Собираем docker-compose.yml
+# ------------------------------------------------------------
+if [[ "$REINSTALL" == "true" ]]; then
+    echo
+    log "Собираем docker-compose.yml..."
+
+    if [[ -f "$COMPOSE_FILE" ]]; then
+        cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak.$(date +%s)"
+        info "Бэкап текущего compose-файла создан."
+    fi
+
+    {
+        echo "services:"
+        echo "  remnanode:"
+        echo "    container_name: remnanode"
+        echo "    hostname: remnanode"
+        echo "    image: remnawave/node:latest"
+        echo "    network_mode: host"
+        echo "    restart: always"
+        echo "    cap_add:"
+        echo "      - NET_ADMIN"
+        echo "    ulimits:"
+        echo "      nofile:"
+        echo "        soft: 1048576"
+        echo "        hard: 1048576"
+        echo "    environment:"
+        echo "      - NODE_PORT=${NODE_PORT}"
+        echo "      - SECRET_KEY=${SECRET_KEY_CLEAN}"
+        echo "    volumes:"
+        echo "      - /var/log/remnanode:/var/log/remnanode"
+        if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
+            echo "      - ${CERT_FULLCHAIN}:/etc/hysteria/fullchain.pem:ro"
+            echo "      - ${CERT_PRIVKEY}:/etc/hysteria/privkey.pem:ro"
+        fi
+    } > "$COMPOSE_FILE"
+
+    log "docker-compose.yml записан: ${COMPOSE_FILE}"
+    if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
+        log "Volumes для Hysteria2 добавлены автоматически (домен: ${HYSTERIA_CERT_DIR})."
+    fi
+
+    if ! docker compose -f "$COMPOSE_FILE" config >/dev/null 2>/tmp/compose_err; then
+        err "docker-compose.yml содержит ошибки синтаксиса:"
+        cat /tmp/compose_err
         exit 1
     fi
-fi
-
-if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
-    CERT_FULLCHAIN="/etc/letsencrypt/live/${HYSTERIA_CERT_DIR}/fullchain.pem"
-    CERT_PRIVKEY="/etc/letsencrypt/live/${HYSTERIA_CERT_DIR}/privkey.pem"
-    if [[ ! -f "$CERT_FULLCHAIN" || ! -f "$CERT_PRIVKEY" ]]; then
-        err "Файлы сертификата не найдены по ожидаемым путям. Отменяем монтирование сертификата."
-        HYSTERIA_CERT_DIR=""
-    fi
-fi
-
-# ------------------------------------------------------------
-# 5. Собираем docker-compose.yml — volumes прописываются АВТОМАТИЧЕСКИ
-# ------------------------------------------------------------
-echo
-log "Собираем docker-compose.yml..."
-
-if [[ -f "$COMPOSE_FILE" ]]; then
-    cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak.$(date +%s)"
-    info "Бэкап текущего compose-файла создан."
-fi
-
-{
-    echo "services:"
-    echo "  remnanode:"
-    echo "    container_name: remnanode"
-    echo "    hostname: remnanode"
-    echo "    image: remnawave/node:latest"
-    echo "    network_mode: host"
-    echo "    restart: always"
-    echo "    cap_add:"
-    echo "      - NET_ADMIN"
-    echo "    ulimits:"
-    echo "      nofile:"
-    echo "        soft: 1048576"
-    echo "        hard: 1048576"
-    echo "    environment:"
-    echo "      - NODE_PORT=${NODE_PORT}"
-    echo "      - SECRET_KEY=${SECRET_KEY_CLEAN}"
-    echo "    volumes:"
-    echo "      - /var/log/remnanode:/var/log/remnanode"
-    if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
-        echo "      - ${CERT_FULLCHAIN}:/etc/hysteria/fullchain.pem:ro"
-        echo "      - ${CERT_PRIVKEY}:/etc/hysteria/privkey.pem:ro"
-    fi
-} > "$COMPOSE_FILE"
-
-log "docker-compose.yml записан: ${COMPOSE_FILE}"
-if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
-    log "Volumes для Hysteria2 добавлены автоматически (домен: ${HYSTERIA_CERT_DIR})."
+    log "Синтаксис docker-compose.yml корректен."
 else
-    info "Volumes для Hysteria2 не добавлены (сертификат не выбран)."
+    # Не пересоздаём файл, но если пользователь хочет Hysteria2, а volumes
+    # ещё не прописаны — дописываем их в существующий файл.
+    if [[ "$USE_HYSTERIA" == "true" && -n "$HYSTERIA_CERT_DIR" ]]; then
+        if grep -q "/etc/hysteria/fullchain.pem" "$COMPOSE_FILE" 2>/dev/null; then
+            info "Volumes для Hysteria2 уже прописаны в существующем compose-файле."
+        else
+            log "Дописываем volumes для Hysteria2 в существующий compose-файл..."
+            cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak.$(date +%s)"
+            if grep -q "^\s*volumes:" "$COMPOSE_FILE"; then
+                sed -i "/^\s*volumes:/a\\      - ${CERT_FULLCHAIN}:/etc/hysteria/fullchain.pem:ro\\n      - ${CERT_PRIVKEY}:/etc/hysteria/privkey.pem:ro" "$COMPOSE_FILE"
+            else
+                {
+                    echo "    volumes:"
+                    echo "      - /var/log/remnanode:/var/log/remnanode"
+                    echo "      - ${CERT_FULLCHAIN}:/etc/hysteria/fullchain.pem:ro"
+                    echo "      - ${CERT_PRIVKEY}:/etc/hysteria/privkey.pem:ro"
+                } >> "$COMPOSE_FILE"
+            fi
+            if ! docker compose -f "$COMPOSE_FILE" config >/dev/null 2>/tmp/compose_err2; then
+                err "Ошибка синтаксиса после правки:"
+                cat /tmp/compose_err2
+                cp "${COMPOSE_FILE}.bak."* "$COMPOSE_FILE"
+                exit 1
+            fi
+            log "Volumes дописаны."
+        fi
+    fi
 fi
-
-# Проверка синтаксиса compose-файла ПЕРЕД запуском
-if ! docker compose -f "$COMPOSE_FILE" config >/dev/null 2>/tmp/compose_err; then
-    err "docker-compose.yml содержит ошибки синтаксиса:"
-    cat /tmp/compose_err
-    exit 1
-fi
-log "Синтаксис docker-compose.yml корректен."
 
 # ------------------------------------------------------------
 # 6. Запуск
@@ -296,9 +319,7 @@ done
 if [[ "$XRAY_OK" == "true" ]]; then
     log "XRay Core успешно запущен внутри контейнера."
 else
-    warn "Не удалось подтвердить строку об успешном старте XRay Core в логах за 15 секунд."
-    warn "Это не обязательно ошибка — панель могла ещё не запушить конфиг с инбаундами."
-    echo "--- Последние строки логов ---"
+    warn "Не удалось подтвердить старт XRay Core за 15 секунд — панель могла ещё не запушить конфиг."
     docker logs remnanode --tail 30 2>&1 || true
 fi
 
@@ -308,37 +329,30 @@ sleep 1
 if ss -tlnp 2>/dev/null | grep -q ":${NODE_PORT} "; then
     log "Порт ${NODE_PORT} подтверждён слушающим."
 else
-    err "Порт ${NODE_PORT} НЕ слушается! Проверьте логи контейнера:"
+    err "Порт ${NODE_PORT} НЕ слушается! Логи:"
     docker logs remnanode --tail 50 2>&1 || true
 fi
 
 if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
     echo
-    log "Проверяем, что сертификаты примонтировались внутрь контейнера..."
+    log "Проверяем сертификаты внутри контейнера..."
     if docker exec remnanode test -f /etc/hysteria/fullchain.pem 2>/dev/null && \
        docker exec remnanode test -f /etc/hysteria/privkey.pem 2>/dev/null; then
-        log "Сертификаты внутри контейнера на месте (/etc/hysteria/fullchain.pem, privkey.pem)."
+        log "Сертификаты на месте (/etc/hysteria/fullchain.pem, privkey.pem)."
     else
         err "Сертификаты НЕ найдены внутри контейнера! Volumes не примонтировались."
-        err "Проверьте вручную: docker exec remnanode ls -la /etc/hysteria/"
     fi
 fi
 
-# ------------------------------------------------------------
-# 8. Итоговая сводка
-# ------------------------------------------------------------
 echo
 echo "============================================================"
 log "Готово!"
 echo "  Каталог:        ${INSTALL_DIR}"
-echo "  Compose-файл:   ${COMPOSE_FILE}"
 echo "  NODE_PORT:      ${NODE_PORT}"
 if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
 echo "  Hysteria2 cert: ${HYSTERIA_CERT_DIR} (примонтирован)"
 else
-echo "  Hysteria2 cert: не настроен"
+echo "  Hysteria2:      не настроен"
 fi
-echo
 echo "  Логи:           docker logs remnanode -f"
-echo "  Перезапуск:     cd ${INSTALL_DIR} && docker compose restart"
 echo "============================================================"
