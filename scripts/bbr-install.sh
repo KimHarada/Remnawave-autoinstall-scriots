@@ -65,7 +65,8 @@ warn "Скрипт стороннего автора (ivan-nginx/bbr3), не н�
 echo
 
 # Сам скрипт интерактивный (задаёт свои вопросы) — запускаем напрямую,
-# не через pipe, чтобы stdin остался доступен для его собственных промптов.
+# не через pipe для stdin, но выход дублируем в лог через tee, чтобы
+# потом проверить, не инициировал ли он сам перезагрузку сервера.
 TMPFILE=$(mktemp /tmp/bbr3-XXXXXX.sh)
 if ! curl -fsSL https://raw.githubusercontent.com/ivan-nginx/bbr3/main/optimize_network.sh -o "$TMPFILE"; then
     err "Не удалось скачать скрипт BBR3."
@@ -73,9 +74,30 @@ if ! curl -fsSL https://raw.githubusercontent.com/ivan-nginx/bbr3/main/optimize_
     exit 1
 fi
 chmod +x "$TMPFILE"
-bash "$TMPFILE"
-BBR_EXIT_CODE=$?
+
+BBR_LOG=$(mktemp /tmp/bbr3-log-XXXXXX.log)
+set +e
+bash "$TMPFILE" 2>&1 | tee "$BBR_LOG"
+BBR_EXIT_CODE=${PIPESTATUS[0]}
+set -e
 rm -f "$TMPFILE"
+
+# Если сторонний скрипт сам запустил reboot — наша проверка ниже будет
+# смотреть на СТАРОЕ (до-перезагрузочное) состояние ядра и ошибочно
+# покажет "не сработало", хотя на самом деле нужно просто подождать
+# перезагрузку. Ловим этот случай отдельно.
+if grep -qi "rebooting" "$BBR_LOG"; then
+    rm -f "$BBR_LOG"
+    echo
+    warn "=========================================================="
+    warn " Сторонний скрипт сам инициировал ПЕРЕЗАГРУЗКУ сервера."
+    warn " Это нормально — модуль ядра для BBR встаёт только после ребута."
+    warn " Подождите 30-60 секунд, переподключитесь по SSH и проверьте:"
+    echo "   sysctl net.ipv4.tcp_congestion_control"
+    warn "=========================================================="
+    exit 0
+fi
+rm -f "$BBR_LOG"
 
 echo
 echo "============================================================"
@@ -90,8 +112,92 @@ if [[ "$NEW_CC" == bbr* ]]; then
     log "BBR активен: ${NEW_CC}"
 else
     err "BBR не подтверждён как активный алгоритм (сейчас: ${NEW_CC})."
-    err "Возможно, требуется перезагрузка сервера, либо скрипт завершился с ошибкой (код: ${BBR_EXIT_CODE})."
-    warn "Проверьте вручную: sysctl net.ipv4.tcp_congestion_control"
+    echo
+
+    # ВАЖНО: tcp_available_congestion_control показывает только УЖЕ
+    # загруженные модули. Модуль bbr может существовать на диске, но
+    # быть не загруженным — поэтому сначала реально пробуем modprobe,
+    # а не просто смотрим на список "доступного".
+    log "Пробуем загрузить модуль tcp_bbr..."
+    MODPROBE_ERR=""
+    if modprobe tcp_bbr 2>/tmp/modprobe_err; then
+        log "Модуль tcp_bbr успешно загружен."
+    else
+        MODPROBE_ERR=$(cat /tmp/modprobe_err 2>/dev/null || true)
+        warn "modprobe tcp_bbr не сработал: ${MODPROBE_ERR}"
+    fi
+
+    AVAILABLE_CC=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+    info "Доступные алгоритмы после попытки загрузки: ${AVAILABLE_CC}"
+
+    if echo "$AVAILABLE_CC" | grep -qw "bbr3"; then
+        warn "bbr3 доступен, но не был включён автоматически — возможно, нужна перезагрузка."
+    elif echo "$AVAILABLE_CC" | grep -qw "bbr2"; then
+        warn "true bbr3 недоступен, но найден bbr2."
+        if ask_yes_no "Включить bbr2?" "yes"; then
+            sysctl -w net.ipv4.tcp_congestion_control=bbr2 >/dev/null
+            echo "net.ipv4.tcp_congestion_control=bbr2" >> /etc/sysctl.d/99-bbr-fallback.conf
+            log "bbr2 включён."
+        fi
+    elif echo "$AVAILABLE_CC" | grep -qw "bbr"; then
+        warn "true bbr3/bbr2 недоступны на этом ядре (обычно требуют кастомную сборку,"
+        warn "например Xanmod) — стоковое ядро Ubuntu/Debian их не содержит."
+        warn "Обычный bbr (BBR1) загружен и доступен — он тоже заметно лучше cubic."
+        if ask_yes_no "Включить обычный bbr?" "yes"; then
+            sysctl -w net.core.default_qdisc=fq >/dev/null
+            sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null
+            {
+                echo "net.core.default_qdisc=fq"
+                echo "net.ipv4.tcp_congestion_control=bbr"
+            } >> /etc/sysctl.d/99-bbr-fallback.conf
+            log "bbr включён."
+            FINAL_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "неизвестно")
+            if [[ "$FINAL_CC" == bbr* ]]; then
+                log "Подтверждено: ${FINAL_CC}"
+            else
+                err "Даже обычный bbr не включился (сейчас: ${FINAL_CC}). Нужна ручная диагностика."
+            fi
+        fi
+    else
+        err "Модуль tcp_bbr не удалось загрузить, и его нет в списке доступных."
+        echo
+        MODULE_FILE=$(find "/lib/modules/$(uname -r)" -iname "tcp_bbr*" 2>/dev/null | head -n1)
+        if [[ -n "$MODULE_FILE" ]]; then
+            warn "Файл модуля найден на диске (${MODULE_FILE}), но modprobe его не загрузил."
+            warn "Ошибка modprobe: ${MODPROBE_ERR:-нет данных}"
+            warn "Возможно, требуется перезагрузка сервера, чтобы модуль подхватился."
+        else
+            warn "Файл модуля tcp_bbr НЕ найден в /lib/modules/$(uname -r)/."
+            warn "На некоторых минимальных/облачных сборках ядра он вынесен в отдельный пакет."
+            if ask_yes_no "Попробовать установить linux-modules-extra-\$(uname -r) и повторить?" "yes"; then
+                if apt install -y "linux-modules-extra-$(uname -r)" 2>/tmp/apt_modules_err; then
+                    log "Пакет установлен. Пробуем modprobe ещё раз..."
+                    if modprobe tcp_bbr 2>/dev/null; then
+                        sysctl -w net.core.default_qdisc=fq >/dev/null
+                        sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null
+                        {
+                            echo "net.core.default_qdisc=fq"
+                            echo "net.ipv4.tcp_congestion_control=bbr"
+                        } >> /etc/sysctl.d/99-bbr-fallback.conf
+                        FINAL_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "неизвестно")
+                        if [[ "$FINAL_CC" == bbr* ]]; then
+                            log "Успех! bbr включён: ${FINAL_CC}"
+                        else
+                            err "Модуль загрузился, но sysctl всё равно не подтверждает bbr (${FINAL_CC})."
+                        fi
+                    else
+                        err "modprobe всё ещё не срабатывает после установки пакета."
+                        err "Скорее всего нужна перезагрузка сервера."
+                    fi
+                else
+                    err "Не удалось установить пакет:"
+                    cat /tmp/apt_modules_err
+                    err "Такого пакета может не быть для этого ядра/провайдера (частый случай на урезанных облачных образах)."
+                fi
+            fi
+        fi
+    fi
+    warn "Проверить вручную в любой момент: sysctl net.ipv4.tcp_congestion_control"
 fi
 
 echo
