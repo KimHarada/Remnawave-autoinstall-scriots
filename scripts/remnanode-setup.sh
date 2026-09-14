@@ -47,6 +47,30 @@ echo "============================================================"
 echo
 
 # ------------------------------------------------------------
+# 0. Полное обновление системы (Ubuntu/Debian)
+# ------------------------------------------------------------
+log "Проверяем обновления системы..."
+export DEBIAN_FRONTEND=noninteractive
+apt update -qq
+UPGRADABLE_COUNT=$(apt list --upgradable 2>/dev/null | grep -c upgradable || true)
+if (( UPGRADABLE_COUNT == 0 )); then
+    info "Система уже полностью обновлена — пропускаем apt upgrade."
+else
+    info "Найдено пакетов для обновления: ${UPGRADABLE_COUNT}. Обновляем..."
+    apt upgrade -y -qq
+    apt full-upgrade -y -qq
+    apt autoremove -y -qq
+    apt autoclean -qq
+    log "Система обновлена."
+fi
+
+if [[ -f /var/run/reboot-required ]]; then
+    warn "Обновление ядра/системы требует перезагрузки. Продолжаем установку, но"
+    warn "рекомендуем перезагрузить сервер после завершения всех шагов."
+fi
+echo
+
+# ------------------------------------------------------------
 # 1. Docker + Compose plugin
 # ------------------------------------------------------------
 if command -v docker >/dev/null 2>&1; then
