@@ -26,7 +26,7 @@ step "Установка Nginx / HAProxy / Certbot"
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx haproxy certbot unzip dnsutils 2>&1 | tail -5 || true
 
 confirm_overwrite() {
-  local f="$1"
+  local f="${1:-}"
   if [ -f "$f" ]; then
     if [ "$NONINTERACTIVE" = "1" ]; then return 0; fi
     ask_yes_no "Файл $f уже существует, перезаписать?" "1"

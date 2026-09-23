@@ -28,7 +28,7 @@ banner() {
 }
 
 run_remote_script() {
-  local name="$1"; shift
+  local name="${1:?run_remote_script: script name required}"; shift
   local tmp; tmp="$(mktemp)"
   curl -fsSL "${BASE_URL}/${name}" -o "$tmp"
   chmod +x "$tmp"

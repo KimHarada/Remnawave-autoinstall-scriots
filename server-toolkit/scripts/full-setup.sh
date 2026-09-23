@@ -73,7 +73,7 @@ fi
 
 FAIL_LOG=()
 run_step() {
-  local title="$1"; shift
+  local title="${1:-step}"; shift
   step "$title"
   if "$@"; then
     ok "$title — готово"
@@ -103,15 +103,17 @@ do_ssh_harden() {
     mkdir -p /run/sshd
     ufw allow "${NEW_SSH_PORT}/tcp" comment "SSH new" &>/dev/null || true
     restart_ssh_service >/dev/null
-    if wait_for_port "${NEW_SSH_PORT}"; then
-      ok "Новый SSH порт ${NEW_SSH_PORT} слушает."
+    sleep 1
+    if ssh_is_really_up "${NEW_SSH_PORT}"; then
+      ok "Новый SSH порт ${NEW_SSH_PORT}: реально работает (не просто слушает, а живой sshd)."
       ufw_delete_matching ":${CUR_SSH_PORT}[[:space:]]"
     else
-      err "Новый порт не поднялся — откатываю на ${CUR_SSH_PORT}."
+      err "Новый порт не поднялся по-настоящему — откатываю на ${CUR_SSH_PORT}."
       sed -i -E "/^Port ${NEW_SSH_PORT}$/d" /etc/ssh/sshd_config
       echo "Port ${CUR_SSH_PORT}" >> /etc/ssh/sshd_config
       restart_ssh_service >/dev/null
       NEW_SSH_PORT="${CUR_SSH_PORT}"
+      ssh_selfheal "${CUR_SSH_PORT}" || true
       return 1
     fi
   else
@@ -210,6 +212,14 @@ if [ "$ROLE" = "1" ]; then
   run_step "Установка Remnanode (+ автопривязка Hysteria2 volume)" do_remnanode
 
 fi
+
+# ---------------------------------------------------------------------------
+# Финальная страховочная проверка SSH
+# ---------------------------------------------------------------------------
+# Промежуточные шаги (apt install nginx/haproxy/certbot, docker install)
+# тоже дёргают apt и потенциально needrestart — перепроверяем SSH ещё раз
+# в самом конце, а не только сразу после смены порта.
+run_step "Финальная проверка SSH" ssh_selfheal "${NEW_SSH_PORT}"
 
 # ---------------------------------------------------------------------------
 # Итог
