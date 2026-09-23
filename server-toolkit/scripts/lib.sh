@@ -54,12 +54,44 @@ apt_upgrade_smart() {
 }
 
 # ---- ssh.socket vs ssh.service ---------------------------------------------
+# LoadState-проверка надёжнее grep по list-unit-files: формат вывода
+# list-unit-files (колонки/пробелы) отличается между версиями systemd и
+# однажды дал ложный результат — "sshd" вместо реального "ssh", и
+# systemctl restart падал с "Unit sshd.service not found."
 detect_ssh_unit() {
+  local u
+  for u in ssh sshd; do
+    if [ "$(systemctl show -p LoadState --value "${u}.service" 2>/dev/null)" = "loaded" ]; then
+      echo "$u"
+      return 0
+    fi
+  done
+  # ничего не нашли штатным способом — последняя попытка через list-unit-files
   if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
     echo "ssh"
   else
-    echo "sshd"
+    echo "ssh"  # ssh.service — норма для Debian/Ubuntu, sshd.service — для RHEL/CentOS
   fi
+}
+
+# Перезапускает SSH-службу, определяя юнит заново и подстраховываясь
+# альтернативным именем, если определение всё равно ошиблось.
+restart_ssh_service() {
+  local unit alt out
+  unit="$(detect_ssh_unit)"
+  out=$(systemctl restart "${unit}.service" 2>&1)
+  if [ $? -ne 0 ]; then
+    warn "systemctl restart ${unit}.service не сработал (${out}), пробую альтернативное имя."
+    alt="sshd"; [ "$unit" = "sshd" ] && alt="ssh"
+    if systemctl restart "${alt}.service" 2>&1; then
+      unit="$alt"
+    else
+      err "Не удалось перезапустить ни ${unit}.service, ни ${alt}.service."
+      return 1
+    fi
+  fi
+  echo "$unit"
+  return 0
 }
 
 ensure_no_ssh_socket() {
@@ -97,4 +129,30 @@ ufw_delete_matching() {
 
 get_real_ssh_port() {
   ss -tlnp 2>/dev/null | grep sshd | grep -oE ':[0-9]+' | head -1 | tr -d ':'
+}
+
+# ---- DNS preflight ---------------------------------------------------------
+# Certbot fails silently-ish ("challenge failed") if the domain doesn't point
+# at this server yet. Checking this BEFORE calling certbot avoids burning
+# Let's Encrypt's rate limit on doomed attempts and gives a clear reason.
+get_public_ip() {
+  curl -fsS -4 --max-time 5 https://api.ipify.org 2>/dev/null \
+    || curl -fsS -4 --max-time 5 https://ifconfig.me 2>/dev/null \
+    || true
+}
+
+# Usage: dns_points_here <domain> <public_ip>  → 0 if match, 1 otherwise.
+dns_points_here() {
+  local domain="$1" pubip="$2" resolved
+  resolved=$(dig +short A "$domain" 2>/dev/null | tail -1)
+  if [ -z "$resolved" ]; then
+    resolved=$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -1)
+  fi
+  [ -n "$resolved" ] && [ -n "$pubip" ] && [ "$resolved" = "$pubip" ]
+}
+
+# ---- сертификат существует и не протух -------------------------------------
+cert_is_valid() {
+  local domain="$1" cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+  [ -f "$cert" ] && openssl x509 -checkend 86400 -noout -in "$cert" &>/dev/null
 }

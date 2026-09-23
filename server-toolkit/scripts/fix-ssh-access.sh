@@ -45,7 +45,7 @@ fi
 ensure_no_ssh_socket
 
 systemctl status "${UNIT}" --no-pager -l 2>&1 | tail -20 || true
-systemctl restart "${UNIT}" 2>&1 || true
+UNIT="$(restart_ssh_service)" || err "Перезапуск SSH не удался ни под одним именем юнита."
 
 PORTS=$(ss -tlnp 2>/dev/null | grep sshd | grep -oE ':[0-9]+' | tr -d ':' | sort -u)
 if [ -z "$PORTS" ]; then
