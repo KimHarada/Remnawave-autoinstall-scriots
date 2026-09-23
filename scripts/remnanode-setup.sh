@@ -44,7 +44,11 @@ if [ "$USE_HY2" = "1" ]; then
   step "Поиск существующего сертификата Let's Encrypt для Hysteria2"
   mapfile -t CERTS < <(find /etc/letsencrypt/live -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
   CERT_DOMAIN=""
-  if [ "${#CERTS[@]}" -eq 1 ]; then
+  # Если известен конкретный домен Hysteria2 (передан из full-setup.sh) и для
+  # него есть сертификат — берём именно его, а не первый случайный из find.
+  if [ -n "${DOMAIN_HY2:-}" ] && [ -d "/etc/letsencrypt/live/${DOMAIN_HY2}" ]; then
+    CERT_DOMAIN="$DOMAIN_HY2"
+  elif [ "${#CERTS[@]}" -eq 1 ]; then
     CERT_DOMAIN=$(basename "${CERTS[0]}")
   elif [ "${#CERTS[@]}" -gt 1 ]; then
     if [ "$NONINTERACTIVE" = "1" ]; then
@@ -74,6 +78,7 @@ services:
     network_mode: host
     environment:
       - SECRET_KEY=${SECRET_KEY}
+      - NODE_PORT=${NODE_PORT}
 EOF
 
 if [ -n "$VOLUME_LINES" ]; then
@@ -101,18 +106,36 @@ else
   exit 1
 fi
 
+step "Итоговая проверка"
+CHECK_FAIL=0
+
 if ss -tlnp 2>/dev/null | grep -q ":${NODE_PORT} "; then
-  ok "Порт ноды ${NODE_PORT} слушает."
+  ok "Порт ноды ${NODE_PORT}: слушает"
 else
-  warn "Порт ${NODE_PORT} не слушается — проверьте конфигурацию в панели."
+  err "Порт ноды ${NODE_PORT}: НЕ слушает — панель не сможет подключиться"
+  CHECK_FAIL=1
 fi
 
 if [ "$USE_HY2" = "1" ]; then
   if docker exec remnanode test -f /etc/hysteria/fullchain.pem 2>/dev/null; then
-    ok "Сертификат Hysteria2 виден внутри контейнера."
+    ok "Сертификат Hysteria2 внутри контейнера: на месте"
   else
-    warn "Сертификат Hysteria2 не найден внутри контейнера — проверьте volumes."
+    err "Сертификат Hysteria2 внутри контейнера: ОТСУТСТВУЕТ"
+    CHECK_FAIL=1
   fi
 fi
 
-ok "Remnanode установлен."
+# Явная ошибка конфигурации ("NODE_PORT: Invalid input...") видна в первые
+# секунды после старта — если контейнер уже перезапускается по кругу
+# (restart: always), логирования покажет её прямо тут.
+sleep 2
+if docker logs remnanode --tail 5 2>&1 | grep -qi "Environment Configuration Errors"; then
+  err "В логах remnanode есть ошибка конфигурации окружения — смотрите: docker logs remnanode --tail 30"
+  CHECK_FAIL=1
+fi
+
+if [ "$CHECK_FAIL" = "1" ]; then
+  warn "remnanode-setup.sh завершён С ПРЕДУПРЕЖДЕНИЯМИ — см. [✗] выше."
+else
+  ok "Remnanode установлен, все проверки пройдены."
+fi

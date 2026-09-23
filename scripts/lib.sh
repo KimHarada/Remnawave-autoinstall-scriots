@@ -98,3 +98,29 @@ ufw_delete_matching() {
 get_real_ssh_port() {
   ss -tlnp 2>/dev/null | grep sshd | grep -oE ':[0-9]+' | head -1 | tr -d ':'
 }
+
+# ---- DNS preflight ---------------------------------------------------------
+# Certbot fails silently-ish ("challenge failed") if the domain doesn't point
+# at this server yet. Checking this BEFORE calling certbot avoids burning
+# Let's Encrypt's rate limit on doomed attempts and gives a clear reason.
+get_public_ip() {
+  curl -fsS -4 --max-time 5 https://api.ipify.org 2>/dev/null \
+    || curl -fsS -4 --max-time 5 https://ifconfig.me 2>/dev/null \
+    || true
+}
+
+# Usage: dns_points_here <domain> <public_ip>  → 0 if match, 1 otherwise.
+dns_points_here() {
+  local domain="$1" pubip="$2" resolved
+  resolved=$(dig +short A "$domain" 2>/dev/null | tail -1)
+  if [ -z "$resolved" ]; then
+    resolved=$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -1)
+  fi
+  [ -n "$resolved" ] && [ -n "$pubip" ] && [ "$resolved" = "$pubip" ]
+}
+
+# ---- сертификат существует и не протух -------------------------------------
+cert_is_valid() {
+  local domain="$1" cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+  [ -f "$cert" ] && openssl x509 -checkend 86400 -noout -in "$cert" &>/dev/null
+}

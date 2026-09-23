@@ -58,6 +58,8 @@ if [ "$ROLE" = "1" ]; then
   else
     OPEN_NODE_PORT=0
   fi
+  SECRET_KEY=$(ask_value "SECRET_KEY ноды (из панели Remnawave)" "")
+  SECRET_KEY=$(echo -n "$SECRET_KEY" | sed -E 's/^"+//; s/"+$//' | tr -d '\r\n')
 else
   PANEL_IP=$(ask_value "IP панели (если нужно ограничить доступ, Enter — пропустить)" "")
 fi
@@ -185,11 +187,14 @@ if [ "$ROLE" = "1" ]; then
   if [ "$USE_BBR" = "1" ]; then
     do_bbr() {
       if [ -f "${SCRIPT_DIR}/bbr-install.sh" ]; then
-        bash "${SCRIPT_DIR}/bbr-install.sh"
+        SRC="${SCRIPT_DIR}/bbr-install.sh"
       else
-        local t; t="$(mktemp)"; curl -fsSL "${RAW}/scripts/bbr-install.sh" -o "$t"
-        bash "$t"
+        SRC="$(mktemp)"; curl -fsSL "${RAW}/scripts/bbr-install.sh" -o "$SRC"
       fi
+      # NONINTERACTIVE=1 обязателен: без него bbr-install.sh на повторном
+      # запуске, увидев что BBR уже стоит, задаёт интерактивный вопрос
+      # "переустановить?" — а в этом пайплайне спрашивать уже нельзя.
+      NONINTERACTIVE=1 bash "$SRC"
     }
     run_step "BBR3" do_bbr
   fi
@@ -200,7 +205,8 @@ if [ "$ROLE" = "1" ]; then
     else
       SRC="$(mktemp)"; curl -fsSL "${RAW}/scripts/remnanode-setup.sh" -o "$SRC"
     fi
-    NODE_PORT="$NODE_PORT" USE_HY2="$USE_HY2" NONINTERACTIVE=1 bash "$SRC"
+    NODE_PORT="$NODE_PORT" USE_HY2="$USE_HY2" SECRET_KEY="$SECRET_KEY" \
+      DOMAIN_HY2="$DOMAIN_HY2" NONINTERACTIVE=1 bash "$SRC"
   }
   run_step "Установка Remnanode (+ автопривязка Hysteria2 volume)" do_remnanode
 
