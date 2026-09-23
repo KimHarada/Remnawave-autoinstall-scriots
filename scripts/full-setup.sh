@@ -42,12 +42,47 @@ if [ "$ROLE" = "1" ]; then
   DOMAIN_GRPC=$(ask_value "Домен для VLESS gRPC" "")
   DOMAIN_XHTTP=$(ask_value "Домен для VLESS XHTTP" "")
   DOMAIN_HY2=$(ask_value "Домен для Hysteria2" "")
+
+  # ---- предварительная проверка DNS сразу после ввода доменов --------------
+  # Раньше это проверялось только внутри haproxy-setup.sh, глубоко в
+  # пайплайне — пользователь узнавал о неправильном DNS только когда certbot
+  # уже проваливался. Теперь видно сразу, до подтверждения запуска, пока
+  # ещё можно поправить A-записи и не жечь лимит Let's Encrypt.
+  step "Предварительная проверка DNS"
+  PREFLIGHT_PUB_IP="$(get_public_ip)"
+  if [ -z "$PREFLIGHT_PUB_IP" ]; then
+    warn "Не удалось определить публичный IP сервера — проверку DNS пропускаю."
+  else
+    info "Публичный IP сервера: ${PREFLIGHT_PUB_IP}"
+    DNS_PREFLIGHT_BAD=0
+    for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2"; do
+      [ -z "$d" ] && continue
+      if dns_points_here "$d" "$PREFLIGHT_PUB_IP"; then
+        ok "${d}: DNS указывает на этот сервер."
+      else
+        RESOLVED=$(dig +short A "$d" 2>/dev/null | tail -1)
+        warn "${d}: DNS указывает на '${RESOLVED:-<нет ответа>}', а не на ${PREFLIGHT_PUB_IP}. Сертификат для этого домена НЕ будет выпущен, пока не поправишь A-запись."
+        DNS_PREFLIGHT_BAD=1
+      fi
+    done
+    if [ "$DNS_PREFLIGHT_BAD" = "1" ]; then
+      warn "Часть доменов пока не указывает на этот сервер (см. выше). Можно продолжить — просто эти сертификаты не выпустятся сейчас, скрипт подхватит их при повторном запуске."
+    fi
+  fi
+
+  if ask_yes_no "Ставить страницу-заглушку (decoy) для self-steal?" "1"; then
+    INSTALL_DECOY=1
+  else
+    INSTALL_DECOY=0
+    warn "Заглушка не будет установлена — self-steal всё равно настроится (TLS-листенер на 127.0.0.1:8081 нужен для Reality), но отдавать будет только базовую пустую страницу, а не оформленный decoy."
+  fi
+
   if ask_yes_no "Использовать Hysteria2 на этой ноде?" "1"; then
     USE_HY2=1
   else
     USE_HY2=0
   fi
-  if ask_yes_no "Ставить BBR (BBR3)?" "1"; then
+  if ask_yes_no "Ставить BBR?" "1"; then
     USE_BBR=1
   else
     USE_BBR=0
@@ -73,7 +108,7 @@ fi
 
 FAIL_LOG=()
 run_step() {
-  local title="$1"; shift
+  local title="${1:-step}"; shift
   step "$title"
   if "$@"; then
     ok "$title — готово"
@@ -180,7 +215,8 @@ if [ "$ROLE" = "1" ]; then
       SRC="$(mktemp)"; curl -fsSL "${RAW}/scripts/haproxy-setup.sh" -o "$SRC"
     fi
     DOMAIN_TCP="$DOMAIN_TCP" DOMAIN_GRPC="$DOMAIN_GRPC" DOMAIN_XHTTP="$DOMAIN_XHTTP" \
-    DOMAIN_HY2="$DOMAIN_HY2" USE_HY2="$USE_HY2" NONINTERACTIVE=1 \
+    DOMAIN_HY2="$DOMAIN_HY2" USE_HY2="$USE_HY2" INSTALL_DECOY="$INSTALL_DECOY" \
+    NONINTERACTIVE=1 \
       bash "$SRC"
   }
   run_step "Nginx (self-steal) + HAProxy + Certbot" do_nginx_haproxy

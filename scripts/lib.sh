@@ -20,7 +20,7 @@ step()  { echo -e "\n${C_B}==>${C_RESET} $*"; }
 # Numbered yes/no prompt. Usage: if ask_yes_no "Продолжить?" "1"; then ...
 # Second arg = default numeric choice (1=yes,2=no) used if ENTER pressed.
 ask_yes_no() {
-  local prompt="$1" default="${2:-1}" ans
+  local prompt="${1:-}" default="${2:-1}" ans
   while true; do
     read -r -p "$(echo -e "${C_Y}?${C_RESET} ${prompt} [1-Да / 2-Нет] (по умолчанию ${default}): ")" ans
     ans="${ans:-$default}"
@@ -33,7 +33,7 @@ ask_yes_no() {
 }
 
 ask_value() {
-  local prompt="$1" default="$2" ans
+  local prompt="${1:-}" default="${2:-}" ans
   read -r -p "$(echo -e "${C_Y}?${C_RESET} ${prompt}$( [ -n "$default" ] && echo " [$default]" ): ")" ans
   echo "${ans:-$default}"
 }
@@ -112,7 +112,8 @@ ensure_no_ssh_socket() {
 }
 
 wait_for_port() {
-  local port="$1" tries=0
+  local port="${1:-}" tries=0
+  [ -z "$port" ] && return 1
   while [ $tries -lt 10 ]; do
     if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
       return 0
@@ -126,7 +127,8 @@ wait_for_port() {
 # Delete every numbered ufw rule matching a grep pattern, highest number first
 # (fixes the padded-number bug: `[ 4]` etc, and avoids shifting numbers mid-loop).
 ufw_delete_matching() {
-  local pattern="$1" nums n
+  local pattern="${1:-}" nums n
+  [ -z "$pattern" ] && return 0
   nums=$(ufw status numbered 2>/dev/null | grep -E "$pattern" \
         | sed -E 's/^\[[[:space:]]*([0-9]+)\].*/\1/' | sort -rn || true)
   for n in $nums; do
@@ -144,7 +146,8 @@ get_real_ssh_port() {
 # поднят и обслуживает соединения. Здесь проверяем и юнит, и что порт слушает
 # именно процесс sshd (а не socket-заглушка).
 ssh_is_really_up() {
-  local port="$1" unit_ok=0 u
+  local port="${1:-}" unit_ok=0 u
+  [ -z "$port" ] && return 1
   for u in ssh sshd; do
     systemctl is-active --quiet "${u}.service" 2>/dev/null && unit_ok=1 && break
   done
@@ -156,7 +159,11 @@ ssh_is_really_up() {
 # (не restart — если он уже мёртв, restart иногда ведёт себя иначе, чем start),
 # и если порт всё равно не поднялся — сообщает явно, что чинить руками.
 ssh_selfheal() {
-  local port="$1" unit
+  local port="${1:-}" unit
+  if [ -z "$port" ]; then
+    port="$(get_real_ssh_port)"
+    port="${port:-22}"
+  fi
   ensure_no_ssh_socket
   unit="$(detect_ssh_unit)"
   if ssh_is_really_up "$port"; then
@@ -194,7 +201,8 @@ get_public_ip() {
 
 # Usage: dns_points_here <domain> <public_ip>  → 0 if match, 1 otherwise.
 dns_points_here() {
-  local domain="$1" pubip="$2" resolved
+  local domain="${1:-}" pubip="${2:-}" resolved
+  [ -z "$domain" ] && return 1
   resolved=$(dig +short A "$domain" 2>/dev/null | tail -1)
   if [ -z "$resolved" ]; then
     resolved=$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -1)
@@ -204,6 +212,8 @@ dns_points_here() {
 
 # ---- сертификат существует и не протух -------------------------------------
 cert_is_valid() {
-  local domain="$1" cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+  local domain="${1:-}" cert
+  [ -z "$domain" ] && return 1
+  cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
   [ -f "$cert" ] && openssl x509 -checkend 86400 -noout -in "$cert" &>/dev/null
 }

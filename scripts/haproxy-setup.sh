@@ -18,6 +18,9 @@ if [ "$NONINTERACTIVE" != "1" ]; then
   DOMAIN_XHTTP=$(ask_value "Домен для VLESS XHTTP" "")
   DOMAIN_HY2=$(ask_value "Домен для Hysteria2" "")
   if ask_yes_no "Использовать Hysteria2?" "1"; then USE_HY2=1; else USE_HY2=0; fi
+  if ask_yes_no "Ставить страницу-заглушку (decoy) для self-steal?" "1"; then INSTALL_DECOY=1; else INSTALL_DECOY=0; fi
+else
+  INSTALL_DECOY="${INSTALL_DECOY:-1}"
 fi
 
 DECOY_ROOT="/var/www/decoy"
@@ -26,7 +29,7 @@ step "Установка Nginx / HAProxy / Certbot"
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx haproxy certbot unzip dnsutils 2>&1 | tail -5 || true
 
 confirm_overwrite() {
-  local f="$1"
+  local f="${1:-}"
   if [ -f "$f" ]; then
     if [ "$NONINTERACTIVE" = "1" ]; then return 0; fi
     ask_yes_no "Файл $f уже существует, перезаписать?" "1"
@@ -39,7 +42,13 @@ confirm_overwrite() {
 step "Страница-заглушка"
 mkdir -p "$DECOY_ROOT"
 DECOY_MARKER="${DECOY_ROOT}/.dorik-installed"
-if [ -f "$DECOY_MARKER" ] && [ -f "${DECOY_ROOT}/index.html" ] && [ "$NONINTERACTIVE" = "1" ]; then
+if [ "${INSTALL_DECOY:-1}" != "1" ]; then
+  warn "Установка decoy-страницы отключена по выбору — self-steal будет отдавать только базовую пустую страницу."
+  [ -f "${DECOY_ROOT}/index.html" ] || cat > "${DECOY_ROOT}/index.html" <<'HTML'
+<!DOCTYPE html><html><head><title>It works</title></head>
+<body><h1>It works!</h1></body></html>
+HTML
+elif [ -f "$DECOY_MARKER" ] && [ -f "${DECOY_ROOT}/index.html" ] && [ "$NONINTERACTIVE" = "1" ]; then
   ok "Заглушка уже установлена ($(cat "$DECOY_MARKER")) — повторная загрузка не нужна, пропускаю."
 elif [ ! -f "${DECOY_ROOT}/index.html" ] || confirm_overwrite "${DECOY_ROOT}/index.html"; then
   MANIFEST_URL="https://raw.githubusercontent.com/KimHarada/Remnawave-autoinstall-scriots/main/decoys/manifest.txt"
