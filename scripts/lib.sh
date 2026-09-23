@@ -3,6 +3,13 @@
 # Safe to `set -euo pipefail` in callers; every risky pipeline here is
 # guarded with `|| true` where a non-zero exit is expected/normal.
 
+# needrestart НЕ должен сам решать перезапускать службы (в т.ч. sshd) в фоне
+# после apt install/upgrade — экспортируем это сразу при подключении lib.sh,
+# чтобы это действовало во ВСЕХ скриптах тулкита, а не только там, где вызван
+# apt_upgrade_smart (haproxy-setup.sh тоже делает apt-get install напрямую).
+export NEEDRESTART_MODE=l
+export NEEDRESTART_SUSPEND=1
+
 C_RESET="\e[0m"; C_G="\e[32m"; C_Y="\e[33m"; C_R="\e[31m"; C_B="\e[36m"
 info()  { echo -e "${C_B}[i]${C_RESET} $*"; }
 ok()    { echo -e "${C_G}[✓]${C_RESET} $*"; }
@@ -54,12 +61,44 @@ apt_upgrade_smart() {
 }
 
 # ---- ssh.socket vs ssh.service ---------------------------------------------
+# LoadState-проверка надёжнее grep по list-unit-files: формат вывода
+# list-unit-files (колонки/пробелы) отличается между версиями systemd и
+# однажды дал ложный результат — "sshd" вместо реального "ssh", и
+# systemctl restart падал с "Unit sshd.service not found."
 detect_ssh_unit() {
+  local u
+  for u in ssh sshd; do
+    if [ "$(systemctl show -p LoadState --value "${u}.service" 2>/dev/null)" = "loaded" ]; then
+      echo "$u"
+      return 0
+    fi
+  done
+  # ничего не нашли штатным способом — последняя попытка через list-unit-files
   if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
     echo "ssh"
   else
-    echo "sshd"
+    echo "ssh"  # ssh.service — норма для Debian/Ubuntu, sshd.service — для RHEL/CentOS
   fi
+}
+
+# Перезапускает SSH-службу, определяя юнит заново и подстраховываясь
+# альтернативным именем, если определение всё равно ошиблось.
+restart_ssh_service() {
+  local unit alt out
+  unit="$(detect_ssh_unit)"
+  out=$(systemctl restart "${unit}.service" 2>&1)
+  if [ $? -ne 0 ]; then
+    warn "systemctl restart ${unit}.service не сработал (${out}), пробую альтернативное имя."
+    alt="sshd"; [ "$unit" = "sshd" ] && alt="ssh"
+    if systemctl restart "${alt}.service" 2>&1; then
+      unit="$alt"
+    else
+      err "Не удалось перезапустить ни ${unit}.service, ни ${alt}.service."
+      return 1
+    fi
+  fi
+  echo "$unit"
+  return 0
 }
 
 ensure_no_ssh_socket() {
@@ -97,6 +136,50 @@ ufw_delete_matching() {
 
 get_real_ssh_port() {
   ss -tlnp 2>/dev/null | grep sshd | grep -oE ':[0-9]+' | head -1 | tr -d ':'
+}
+
+# ---- настоящая проверка живого SSH -----------------------------------------
+# wait_for_port проверяет только "что-то слушает порт" — этим "что-то" может
+# быть ssh.socket, который слушает, но не гарантирует, что sshd реально
+# поднят и обслуживает соединения. Здесь проверяем и юнит, и что порт слушает
+# именно процесс sshd (а не socket-заглушка).
+ssh_is_really_up() {
+  local port="$1" unit_ok=0 u
+  for u in ssh sshd; do
+    systemctl is-active --quiet "${u}.service" 2>/dev/null && unit_ok=1 && break
+  done
+  [ "$unit_ok" = "1" ] || return 1
+  ss -tlnp 2>/dev/null | grep ":${port} " | grep -q sshd
+}
+
+# Самовосстановление: убирает ssh.socket с дороги, стартует сервис явно
+# (не restart — если он уже мёртв, restart иногда ведёт себя иначе, чем start),
+# и если порт всё равно не поднялся — сообщает явно, что чинить руками.
+ssh_selfheal() {
+  local port="$1" unit
+  ensure_no_ssh_socket
+  unit="$(detect_ssh_unit)"
+  if ssh_is_really_up "$port"; then
+    ok "SSH (${unit}.service) на порту ${port}: реально работает."
+    return 0
+  fi
+  warn "SSH на порту ${port} не отвечает как положено — пробую поднять явно (systemctl start ${unit}.service)."
+  systemctl start "${unit}.service" 2>&1 || true
+  sleep 1
+  if ssh_is_really_up "$port"; then
+    ok "SSH (${unit}.service) поднят и работает на порту ${port}."
+    return 0
+  fi
+  local alt="sshd"; [ "$unit" = "sshd" ] && alt="ssh"
+  warn "${unit}.service не поднялся, пробую альтернативный юнит ${alt}.service."
+  systemctl start "${alt}.service" 2>&1 || true
+  sleep 1
+  if ssh_is_really_up "$port"; then
+    ok "SSH (${alt}.service) поднят и работает на порту ${port}."
+    return 0
+  fi
+  err "SSH НЕ поднимается на порту ${port} ни под одним именем юнита. Требуется ручное вмешательство: journalctl -u ssh.service -n 50, sshd -t."
+  return 1
 }
 
 # ---- DNS preflight ---------------------------------------------------------

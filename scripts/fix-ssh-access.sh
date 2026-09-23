@@ -42,16 +42,18 @@ if ! sshd -t 2>/dev/null; then
   esac
 fi
 
-ensure_no_ssh_socket
-
 systemctl status "${UNIT}" --no-pager -l 2>&1 | tail -20 || true
-systemctl restart "${UNIT}" 2>&1 || true
 
-PORTS=$(ss -tlnp 2>/dev/null | grep sshd | grep -oE ':[0-9]+' | tr -d ':' | sort -u)
-if [ -z "$PORTS" ]; then
-  err "SSH не слушает ни один порт после перезапуска. Проверьте journalctl -u ${UNIT}."
+CONFIGURED_PORT=$(grep -oE '^Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config | tail -1 | grep -oE '[0-9]+')
+CONFIGURED_PORT="${CONFIGURED_PORT:-22}"
+
+if ! ssh_selfheal "$CONFIGURED_PORT"; then
+  err "Не удалось поднять SSH на порту ${CONFIGURED_PORT} автоматически."
+  err "Проверьте вручную: journalctl -u ssh.service -n 50 --no-pager; sshd -t"
   exit 1
 fi
+
+PORTS=$(ss -tlnp 2>/dev/null | grep sshd | grep -oE ':[0-9]+' | tr -d ':' | sort -u)
 for p in $PORTS; do
   ufw allow "${p}/tcp" comment "SSH recovered" &>/dev/null || true
   ok "Порт ${p} открыт в ufw и слушается."
