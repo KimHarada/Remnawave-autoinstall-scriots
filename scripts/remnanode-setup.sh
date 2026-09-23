@@ -1,382 +1,118 @@
-#!/bin/bash
-set -euo pipefail
-
-# ============================================================
-#  remnanode-setup — установка и настройка ноды Remnawave
-#  Явно спрашивает про Hysteria2, сам прописывает volumes.
-# ============================================================
-
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-log()  { echo -e "${GREEN}[+]${NC} $1"; }
-warn() { echo -e "${YELLOW}[!]${NC} $1"; }
-err()  { echo -e "${RED}[x]${NC} $1"; }
-info() { echo -e "${BLUE}[i]${NC} $1"; }
-
-ask_yes_no() {
-    local prompt="$1"
-    local default="${2:-no}"
-    local def_label
-    if [[ "$default" == "yes" ]]; then
-        def_label="по умолчанию — 1"
-    else
-        def_label="по умолчанию — 2"
-    fi
-    echo "$prompt"
-    echo "  1) Да"
-    echo "  2) Нет"
-    read -rp "Выбор [${def_label}]: " CHOICE_NUM
-    if [[ -z "$CHOICE_NUM" ]]; then
-        CHOICE_NUM=$([[ "$default" == "yes" ]] && echo 1 || echo 2)
-    fi
-    [[ "$CHOICE_NUM" == "1" ]]
+#!/usr/bin/env bash
+# Устанавливает remnanode (Docker). Если NONINTERACTIVE=1 — берёт параметры
+# из переменных окружения (NODE_PORT, USE_HY2) и не задаёт вопросов,
+# т.к. это вызвано из full-setup.sh, где всё уже спрошено один раз.
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib.sh" 2>/dev/null || {
+  RAW="https://raw.githubusercontent.com/KimHarada/Remnawave-autoinstall-scriots/main"
+  t=$(mktemp); curl -fsSL "${RAW}/scripts/lib.sh" -o "$t"; source "$t"
 }
+require_root
 
-if [[ $EUID -ne 0 ]]; then
-    err "Запускать нужно от root."
-    exit 1
+NONINTERACTIVE="${NONINTERACTIVE:-0}"
+
+if ! command -v docker &>/dev/null; then
+  step "Установка Docker"
+  curl -fsSL https://get.docker.com | sh
 fi
 
-echo "============================================================"
-echo " remnanode — установка и настройка"
-echo "============================================================"
-echo
-
-# ------------------------------------------------------------
-# 0. Полное обновление системы (Ubuntu/Debian)
-# ------------------------------------------------------------
-log "Проверяем обновления системы..."
-export DEBIAN_FRONTEND=noninteractive
-apt update -qq
-UPGRADABLE_COUNT=$(apt list --upgradable 2>/dev/null | grep -c upgradable || true)
-if (( UPGRADABLE_COUNT == 0 )); then
-    info "Система уже полностью обновлена — пропускаем apt upgrade."
+INSTALL_DIR="/opt/remnanode"
+if [ "$NONINTERACTIVE" != "1" ]; then
+  INSTALL_DIR=$(ask_value "Директория установки" "/opt/remnanode")
+  NODE_PORT=$(ask_value "NODE_PORT" "2222")
+  SECRET_KEY_RAW=$(ask_value "SECRET_KEY (из панели)" "")
+  if ask_yes_no "Будем использовать Hysteria2 на этой ноде?" "1"; then USE_HY2=1; else USE_HY2=0; fi
 else
-    info "Найдено пакетов для обновления: ${UPGRADABLE_COUNT}. Обновляем..."
-    apt upgrade -y -qq
-    apt full-upgrade -y -qq
-    apt autoremove -y -qq
-    apt autoclean -qq
-    log "Система обновлена."
+  SECRET_KEY_RAW="${SECRET_KEY:-}"
+  NODE_PORT="${NODE_PORT:-2222}"
+  USE_HY2="${USE_HY2:-0}"
+  if [ -z "$SECRET_KEY_RAW" ]; then
+    SECRET_KEY_RAW=$(ask_value "SECRET_KEY (из панели)" "")
+  fi
 fi
 
-if [[ -f /var/run/reboot-required ]]; then
-    warn "Обновление ядра/системы требует перезагрузки. Продолжаем установку, но"
-    warn "рекомендуем перезагрузить сервер после завершения всех шагов."
-fi
-echo
+# Убираем случайные кавычки/переводы строк — частая причина "Invalid SECRET_KEY payload"
+SECRET_KEY=$(echo -n "$SECRET_KEY_RAW" | sed -E 's/^"+//; s/"+$//' | tr -d '\r\n')
 
-# ------------------------------------------------------------
-# 1. Docker + Compose plugin
-# ------------------------------------------------------------
-if command -v docker >/dev/null 2>&1; then
-    info "Docker уже установлен ($(docker --version))."
-else
-    log "Docker не найден — устанавливаем..."
-    if ! curl -fsSL https://get.docker.com | sh; then
-        err "Не удалось установить Docker."
-        exit 1
-    fi
-    systemctl enable --now docker >/dev/null 2>&1 || true
-    log "Docker установлен."
-fi
-
-if ! docker compose version >/dev/null 2>&1; then
-    err "Плагин 'docker compose' недоступен даже после установки Docker."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# 2. Каталог установки
-# ------------------------------------------------------------
-echo
-read -rp "Каталог для remnanode (Enter — /opt/remnanode): " INSTALL_DIR
-INSTALL_DIR=${INSTALL_DIR:-/opt/remnanode}
 mkdir -p "$INSTALL_DIR"
-COMPOSE_FILE="${INSTALL_DIR}/docker-compose.yml"
-
-REINSTALL=true
-if [[ -f "$COMPOSE_FILE" ]] && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^remnanode$'; then
-    warn "Найдена существующая установка remnanode в ${INSTALL_DIR}."
-    if ask_yes_no "Пропустить установку и просто проверить/дочинить volumes?" "yes"; then
-        REINSTALL=false
-        info "Пропускаем пересоздание — работаем с существующим compose-файлом."
-    fi
-fi
-
-# ------------------------------------------------------------
-# 3. NODE_PORT и SECRET_KEY
-# ------------------------------------------------------------
-echo
-EXISTING_NODE_PORT=""
-EXISTING_SECRET_KEY=""
-if [[ -f "$COMPOSE_FILE" ]]; then
-    EXISTING_NODE_PORT=$(grep -oE 'NODE_PORT=[0-9]+' "$COMPOSE_FILE" | head -n1 | cut -d= -f2 || true)
-    EXISTING_SECRET_KEY=$(grep -oE 'SECRET_KEY=.*' "$COMPOSE_FILE" | head -n1 | cut -d= -f2- || true)
-fi
-
-read -rp "NODE_PORT (Enter — ${EXISTING_NODE_PORT:-3001}): " NODE_PORT
-NODE_PORT=${NODE_PORT:-${EXISTING_NODE_PORT:-3001}}
-if ! [[ "$NODE_PORT" =~ ^[0-9]+$ ]] || (( NODE_PORT < 1 || NODE_PORT > 65535 )); then
-    err "Некорректный NODE_PORT: ${NODE_PORT}"
-    exit 1
-fi
-
-if [[ -n "$EXISTING_SECRET_KEY" ]]; then
-    info "Найден существующий SECRET_KEY в конфиге."
-    if ! ask_yes_no "Оставить текущий SECRET_KEY?" "yes"; then
-        EXISTING_SECRET_KEY=""
-    fi
-fi
-
-if [[ -z "$EXISTING_SECRET_KEY" ]]; then
-    echo
-    echo "Вставьте SECRET_KEY из панели Remnawave (Nodes → нода → Secret Key)."
-    read -rp "SECRET_KEY: " SECRET_KEY_INPUT
-else
-    SECRET_KEY_INPUT="$EXISTING_SECRET_KEY"
-fi
-
-# Автоматически убираем случайно вставленные кавычки/переносы —
-# частая причина 'Invalid SECRET_KEY payload'.
-SECRET_KEY_CLEAN=$(echo "$SECRET_KEY_INPUT" | sed -E 's/^"+//; s/"+$//' | tr -d '\r\n')
-if [[ -z "$SECRET_KEY_CLEAN" ]]; then
-    err "SECRET_KEY пустой — без него нода не запустится."
-    exit 1
-fi
-if [[ "$SECRET_KEY_INPUT" != "$SECRET_KEY_CLEAN" ]]; then
-    warn "Обнаружены и убраны лишние кавычки/пробелы вокруг SECRET_KEY."
-fi
-
-# ------------------------------------------------------------
-# 4. Явный вопрос про Hysteria2
-# ------------------------------------------------------------
-echo
-USE_HYSTERIA=false
-if ask_yes_no "Будем использовать Hysteria2 на этой ноде?" "yes"; then
-    USE_HYSTERIA=true
-fi
-
-HYSTERIA_CERT_DIR=""
-if [[ "$USE_HYSTERIA" == "true" ]]; then
-    log "Ищем существующие сертификаты Let's Encrypt для Hysteria2..."
-
-    CERT_DOMAINS=()
-    if [[ -d /etc/letsencrypt/live ]]; then
-        while IFS= read -r -d '' dir; do
-            domain=$(basename "$dir")
-            if [[ "$domain" != "README" && -f "${dir}/fullchain.pem" && -f "${dir}/privkey.pem" ]]; then
-                CERT_DOMAINS+=("$domain")
-            fi
-        done < <(find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
-    fi
-
-    if (( ${#CERT_DOMAINS[@]} == 0 )); then
-        warn "Сертификаты Let's Encrypt не найдены в /etc/letsencrypt/live/."
-        warn "Сначала выпустите сертификат (пункт 'Только Nginx + self-steal'), затем перезапустите этот шаг."
-        if ! ask_yes_no "Продолжить БЕЗ сертификата для Hysteria2 (только VLESS-протоколы)?" "no"; then
-            err "Остановлено. Настройте сертификат и запустите заново."
-            exit 1
-        fi
-    elif (( ${#CERT_DOMAINS[@]} == 1 )); then
-        HYSTERIA_CERT_DIR="${CERT_DOMAINS[0]}"
-        info "Найден сертификат: ${HYSTERIA_CERT_DIR}"
-    else
-        echo "Найдено несколько сертификатов:"
-        idx=1
-        for d in "${CERT_DOMAINS[@]}"; do
-            echo "  ${idx}) ${d}"
-            ((idx++))
-        done
-        echo "  0) Не использовать"
-        read -rp "Выберите номер: " CERT_CHOICE
-        if [[ "$CERT_CHOICE" == "0" ]]; then
-            HYSTERIA_CERT_DIR=""
-        elif [[ "$CERT_CHOICE" =~ ^[0-9]+$ ]] && (( CERT_CHOICE >= 1 && CERT_CHOICE <= ${#CERT_DOMAINS[@]} )); then
-            HYSTERIA_CERT_DIR="${CERT_DOMAINS[$((CERT_CHOICE-1))]}"
-        fi
-    fi
-
-    if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
-        CERT_FULLCHAIN="/etc/letsencrypt/live/${HYSTERIA_CERT_DIR}/fullchain.pem"
-        CERT_PRIVKEY="/etc/letsencrypt/live/${HYSTERIA_CERT_DIR}/privkey.pem"
-        if [[ ! -f "$CERT_FULLCHAIN" || ! -f "$CERT_PRIVKEY" ]]; then
-            err "Файлы сертификата не найдены. Отменяем монтирование."
-            HYSTERIA_CERT_DIR=""
-        fi
-    fi
-else
-    info "Hysteria2 использоваться не будет — volumes под сертификат не добавляем."
-fi
-
-# ------------------------------------------------------------
-# 5. Собираем docker-compose.yml
-# ------------------------------------------------------------
-if [[ "$REINSTALL" == "true" ]]; then
-    echo
-    log "Собираем docker-compose.yml..."
-
-    if [[ -f "$COMPOSE_FILE" ]]; then
-        cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak.$(date +%s)"
-        info "Бэкап текущего compose-файла создан."
-    fi
-
-    {
-        echo "services:"
-        echo "  remnanode:"
-        echo "    container_name: remnanode"
-        echo "    hostname: remnanode"
-        echo "    image: remnawave/node:latest"
-        echo "    network_mode: host"
-        echo "    restart: always"
-        echo "    cap_add:"
-        echo "      - NET_ADMIN"
-        echo "    ulimits:"
-        echo "      nofile:"
-        echo "        soft: 1048576"
-        echo "        hard: 1048576"
-        echo "    environment:"
-        echo "      - NODE_PORT=${NODE_PORT}"
-        echo "      - SECRET_KEY=${SECRET_KEY_CLEAN}"
-        echo "    volumes:"
-        echo "      - /var/log/remnanode:/var/log/remnanode"
-        if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
-            echo "      - ${CERT_FULLCHAIN}:/etc/hysteria/fullchain.pem:ro"
-            echo "      - ${CERT_PRIVKEY}:/etc/hysteria/privkey.pem:ro"
-        fi
-    } > "$COMPOSE_FILE"
-
-    log "docker-compose.yml записан: ${COMPOSE_FILE}"
-    if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
-        log "Volumes для Hysteria2 добавлены автоматически (домен: ${HYSTERIA_CERT_DIR})."
-    fi
-
-    if ! docker compose -f "$COMPOSE_FILE" config >/dev/null 2>/tmp/compose_err; then
-        err "docker-compose.yml содержит ошибки синтаксиса:"
-        cat /tmp/compose_err
-        exit 1
-    fi
-    log "Синтаксис docker-compose.yml корректен."
-else
-    # Не пересоздаём файл, но если пользователь хочет Hysteria2, а volumes
-    # ещё не прописаны — дописываем их в существующий файл.
-    if [[ "$USE_HYSTERIA" == "true" && -n "$HYSTERIA_CERT_DIR" ]]; then
-        if grep -q "/etc/hysteria/fullchain.pem" "$COMPOSE_FILE" 2>/dev/null; then
-            info "Volumes для Hysteria2 уже прописаны в существующем compose-файле."
-        else
-            log "Дописываем volumes для Hysteria2 в существующий compose-файл..."
-            cp "$COMPOSE_FILE" "${COMPOSE_FILE}.bak.$(date +%s)"
-            if grep -q "^\s*volumes:" "$COMPOSE_FILE"; then
-                sed -i "/^\s*volumes:/a\\      - ${CERT_FULLCHAIN}:/etc/hysteria/fullchain.pem:ro\\n      - ${CERT_PRIVKEY}:/etc/hysteria/privkey.pem:ro" "$COMPOSE_FILE"
-            else
-                {
-                    echo "    volumes:"
-                    echo "      - /var/log/remnanode:/var/log/remnanode"
-                    echo "      - ${CERT_FULLCHAIN}:/etc/hysteria/fullchain.pem:ro"
-                    echo "      - ${CERT_PRIVKEY}:/etc/hysteria/privkey.pem:ro"
-                } >> "$COMPOSE_FILE"
-            fi
-            if ! docker compose -f "$COMPOSE_FILE" config >/dev/null 2>/tmp/compose_err2; then
-                err "Ошибка синтаксиса после правки:"
-                cat /tmp/compose_err2
-                cp "${COMPOSE_FILE}.bak."* "$COMPOSE_FILE"
-                exit 1
-            fi
-            log "Volumes дописаны."
-        fi
-    fi
-fi
-
-# ------------------------------------------------------------
-# 6. Запуск
-# ------------------------------------------------------------
-echo
-log "Запускаем remnanode..."
-mkdir -p /var/log/remnanode
-
 cd "$INSTALL_DIR"
-docker compose down >/dev/null 2>&1 || true
+
+CERT_LINE=""
+VOLUME_LINES=""
+if [ "$USE_HY2" = "1" ]; then
+  step "Поиск существующего сертификата Let's Encrypt для Hysteria2"
+  mapfile -t CERTS < <(find /etc/letsencrypt/live -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+  CERT_DOMAIN=""
+  if [ "${#CERTS[@]}" -eq 1 ]; then
+    CERT_DOMAIN=$(basename "${CERTS[0]}")
+  elif [ "${#CERTS[@]}" -gt 1 ]; then
+    if [ "$NONINTERACTIVE" = "1" ]; then
+      CERT_DOMAIN=$(basename "${CERTS[0]}")
+    else
+      echo "Найдено несколько сертификатов:"
+      select d in "${CERTS[@]##*/}"; do CERT_DOMAIN="$d"; break; done
+    fi
+  fi
+  if [ -z "$CERT_DOMAIN" ]; then
+    warn "Сертификат не найден автоматически — Hysteria2 volume не будет добавлен, добавьте вручную позже."
+    USE_HY2=0
+  else
+    ok "Использую сертификат: ${CERT_DOMAIN}"
+    VOLUME_LINES="      - /etc/letsencrypt/live/${CERT_DOMAIN}/fullchain.pem:/etc/hysteria/fullchain.pem:ro
+      - /etc/letsencrypt/live/${CERT_DOMAIN}/privkey.pem:/etc/hysteria/privkey.pem:ro"
+  fi
+fi
+
+cat > docker-compose.yml <<EOF
+services:
+  remnanode:
+    image: remnawave/node:latest
+    container_name: remnanode
+    hostname: remnanode
+    restart: always
+    network_mode: host
+    environment:
+      - SECRET_KEY=${SECRET_KEY}
+EOF
+
+if [ -n "$VOLUME_LINES" ]; then
+  cat >> docker-compose.yml <<EOF
+    volumes:
+${VOLUME_LINES}
+EOF
+fi
+
+step "Проверка docker-compose.yml"
+if ! docker compose config &>/dev/null; then
+  err "docker-compose.yml не валиден, останавливаюсь."
+  exit 1
+fi
+ok "Конфигурация валидна."
+
+step "Запуск remnanode"
 docker compose up -d
 
-# ------------------------------------------------------------
-# 7. Проверки после запуска
-# ------------------------------------------------------------
-echo
-log "Проверяем, что контейнер поднялся..."
-
-wait_for_container_running() {
-    local tries=20
-    local i=0
-    while (( i < tries )); do
-        if docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | grep -q '^remnanode.*Up'; then
-            return 0
-        fi
-        sleep 1
-        ((i++))
-    done
-    return 1
-}
-
-if wait_for_container_running; then
-    log "Контейнер remnanode запущен."
+sleep 3
+if docker compose ps | grep -q "Up"; then
+  ok "Контейнер запущен."
 else
-    err "Контейнер remnanode не поднялся за отведённое время. Логи:"
-    docker logs remnanode --tail 50 2>&1 || true
-    exit 1
+  err "Контейнер не поднялся, смотрите: docker compose logs"
+  exit 1
 fi
 
-echo
-log "Проверяем логи на успешный старт XRay Core (до 15 секунд)..."
-XRAY_OK=false
-for i in $(seq 1 15); do
-    if docker logs remnanode 2>&1 | grep -q "XRay Core.*is up and running"; then
-        XRAY_OK=true
-        break
-    fi
-    sleep 1
-done
-
-if [[ "$XRAY_OK" == "true" ]]; then
-    log "XRay Core успешно запущен внутри контейнера."
-else
-    warn "Не удалось подтвердить старт XRay Core за 15 секунд — панель могла ещё не запушить конфиг."
-    docker logs remnanode --tail 30 2>&1 || true
-fi
-
-echo
-log "Проверяем, что NODE_PORT (${NODE_PORT}) слушается..."
-sleep 1
 if ss -tlnp 2>/dev/null | grep -q ":${NODE_PORT} "; then
-    log "Порт ${NODE_PORT} подтверждён слушающим."
+  ok "Порт ноды ${NODE_PORT} слушает."
 else
-    err "Порт ${NODE_PORT} НЕ слушается! Логи:"
-    docker logs remnanode --tail 50 2>&1 || true
+  warn "Порт ${NODE_PORT} не слушается — проверьте конфигурацию в панели."
 fi
 
-if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
-    echo
-    log "Проверяем сертификаты внутри контейнера..."
-    if docker exec remnanode test -f /etc/hysteria/fullchain.pem 2>/dev/null && \
-       docker exec remnanode test -f /etc/hysteria/privkey.pem 2>/dev/null; then
-        log "Сертификаты на месте (/etc/hysteria/fullchain.pem, privkey.pem)."
-    else
-        err "Сертификаты НЕ найдены внутри контейнера! Volumes не примонтировались."
-    fi
+if [ "$USE_HY2" = "1" ]; then
+  if docker exec remnanode test -f /etc/hysteria/fullchain.pem 2>/dev/null; then
+    ok "Сертификат Hysteria2 виден внутри контейнера."
+  else
+    warn "Сертификат Hysteria2 не найден внутри контейнера — проверьте volumes."
+  fi
 fi
 
-echo
-echo "============================================================"
-log "Готово!"
-echo "  Каталог:        ${INSTALL_DIR}"
-echo "  NODE_PORT:      ${NODE_PORT}"
-if [[ -n "$HYSTERIA_CERT_DIR" ]]; then
-echo "  Hysteria2 cert: ${HYSTERIA_CERT_DIR} (примонтирован)"
-else
-echo "  Hysteria2:      не настроен"
-fi
-echo "  Логи:           docker logs remnanode -f"
-echo "============================================================"
+ok "Remnanode установлен."
