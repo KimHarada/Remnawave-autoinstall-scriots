@@ -14,7 +14,12 @@ NONINTERACTIVE="${NONINTERACTIVE:-0}"
 
 if ! command -v docker &>/dev/null; then
   step "Установка Docker"
+  wait_for_apt_lock
   curl -fsSL https://get.docker.com | sh
+  if ! command -v docker &>/dev/null; then
+    err "Docker не установился (apt всё ещё занят/недоступен) — дальше этот скрипт работать не будет."
+    exit 1
+  fi
 fi
 
 INSTALL_DIR="/opt/remnanode"

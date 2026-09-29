@@ -184,9 +184,11 @@ do_protect_common() {
   fi
 
   if ! apt list --installed 2>/dev/null | grep -q '^fail2ban'; then
+    wait_for_apt_lock
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fail2ban || true
   fi
-  cat > /etc/fail2ban/jail.local <<EOF
+  if [ -d /etc/fail2ban ]; then
+    cat > /etc/fail2ban/jail.local <<EOF
 [sshd]
 enabled = true
 port    = ${NEW_SSH_PORT}
@@ -194,12 +196,25 @@ bantime = 1d
 findtime = 1h
 maxretry = 3
 EOF
-  systemctl restart fail2ban 2>&1 || true
-  systemctl enable fail2ban &>/dev/null || true
+    systemctl restart fail2ban 2>&1 || true
+    systemctl enable fail2ban &>/dev/null || true
+  else
+    err "fail2ban не установился (apt всё ещё не работает?) — jail.local не пишу, пропускаю."
+  fi
 
   timedatectl set-timezone Asia/Irkutsk 2>&1 || true
 
-  ( crontab -l 2>/dev/null | grep -v 'shutdown -r now' ; echo "0 4 * * * /sbin/shutdown -r now" ) | crontab -
+  if ! command -v crontab &>/dev/null; then
+    info "crontab не найден — ставлю пакет cron."
+    wait_for_apt_lock
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cron || true
+    systemctl enable --now cron &>/dev/null || true
+  fi
+  if command -v crontab &>/dev/null; then
+    ( crontab -l 2>/dev/null | grep -v 'shutdown -r now' ; echo "0 4 * * * /sbin/shutdown -r now" ) | crontab -
+  else
+    err "crontab всё ещё недоступен — ежедневный ребут в 4:00 не настроен."
+  fi
 }
 run_step "Firewall/fail2ban/таймзона/крон" do_protect_common
 

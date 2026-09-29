@@ -32,6 +32,7 @@ modprobe tcp_bbr 2>/dev/null || true
 if [ ! -f "/lib/modules/$(uname -r)/kernel/net/ipv4/tcp_bbr.ko" ] && \
    [ ! -f "/lib/modules/$(uname -r)/kernel/net/ipv4/tcp_bbr.ko.zst" ]; then
   info "Модуль tcp_bbr не найден в текущем ядре, пробую поставить linux-modules-extra."
+  wait_for_apt_lock
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "linux-modules-extra-$(uname -r)" 2>&1 | tail -5 || true
   modprobe tcp_bbr 2>/dev/null || true
 fi

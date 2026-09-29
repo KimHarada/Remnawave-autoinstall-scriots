@@ -45,9 +45,36 @@ require_root() {
   fi
 }
 
+# ---- ждём/освобождаем apt lock --------------------------------------------
+# На свежем VPS cloud-init часто запускает unattended-upgrades сразу после
+# первого старта, и он держит /var/lib/dpkg/lock-frontend несколько минут.
+# Все apt-get в этом тулките раньше падали с "Could not get lock" и это
+# ТИХО проглатывалось (|| true) — в итоге ничего не устанавливалось вообще,
+# а скрипт рапортовал "готово". Теперь перед каждым apt-get явно ждём, а
+# если висит слишком долго — глушим unattended-upgrades принудительно.
+wait_for_apt_lock() {
+  local tries=0
+  while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>/dev/null | grep -q .; do
+    if [ "$tries" -eq 0 ]; then
+      warn "apt занят другим процессом (обычно unattended-upgrades) — жду освобождения..."
+    fi
+    tries=$((tries+1))
+    if [ "$tries" -ge 60 ]; then
+      warn "apt всё ещё занят после ~2 минут ожидания — останавливаю unattended-upgrades принудительно."
+      systemctl stop unattended-upgrades 2>/dev/null || true
+      systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+      pkill -9 -f unattended-upgr 2>/dev/null || true
+      sleep 2
+      break
+    fi
+    sleep 2
+  done
+}
+
 # ---- apt upgrade with skip-if-nothing-to-do -------------------------------
 apt_upgrade_smart() {
   step "Проверка обновлений пакетов"
+  wait_for_apt_lock
   apt-get update -qq || true
   local cnt
   cnt=$(apt list --upgradable 2>/dev/null | grep -vc '^Listing' || true)
@@ -55,6 +82,7 @@ apt_upgrade_smart() {
     ok "Пакеты уже актуальны, апгрейд не требуется."
   else
     info "Найдено обновлений: ${cnt}. Обновляю..."
+    wait_for_apt_lock
     DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq || true
     ok "Пакеты обновлены."
   fi

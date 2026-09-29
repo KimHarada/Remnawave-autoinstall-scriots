@@ -26,7 +26,11 @@ fi
 DECOY_ROOT="/var/www/decoy"
 
 step "Установка Nginx / HAProxy / Certbot"
+wait_for_apt_lock
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx haproxy certbot unzip dnsutils 2>&1 | tail -5 || true
+if ! command -v nginx &>/dev/null || ! command -v certbot &>/dev/null; then
+  err "nginx/haproxy/certbot не установились (apt всё ещё занят или недоступен) — дальше этот шаг работать не будет. Проверьте: apt-get update; apt-get install nginx haproxy certbot unzip dnsutils"
+fi
 
 confirm_overwrite() {
   local f="${1:-}"
@@ -61,6 +65,7 @@ elif [ ! -f "${DECOY_ROOT}/index.html" ] || confirm_overwrite "${DECOY_ROOT}/ind
   fi
   if ! command -v unzip &>/dev/null; then
     warn "unzip не установлен — ставлю."
+    wait_for_apt_lock
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip 2>&1 | tail -3 || true
   fi
   if [ -n "$PICK" ]; then
