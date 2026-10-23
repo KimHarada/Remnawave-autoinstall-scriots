@@ -17,6 +17,7 @@ source "${SCRIPT_DIR}/lib.sh" 2>/dev/null || {
 } || { echo "Не удалось загрузить lib.sh" >&2; exit 1; }
 _dorik_source state.sh
 _dorik_source doctor.sh
+_dorik_source preflight.sh
 
 require_root
 require_apt_os
@@ -51,11 +52,25 @@ echo "  1) Полноценная нода (Nginx self-steal + HAProxy + BBR + R
 echo "  2) Только сервер панели (жёсткий firewall: SSH+80+443, без ноды)"
 ROLE=$(ask_valid "Выбор" "${ROLE:-1}" is_valid_choice12) || exit 1
 
+# Роль известна — проверяем окружение до остальных вопросов, чтобы не гонять
+# пользователя по вопросам, если установка всё равно невозможна.
+if [ "$ROLE" = "1" ]; then
+  preflight_run --docker --certs --ports "80 443" || exit 1
+else
+  preflight_run || exit 1
+fi
+
 CUR_SSH_PORT=$(get_real_ssh_port)
 CUR_SSH_PORT=${CUR_SSH_PORT:-$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')}
 CUR_SSH_PORT=${CUR_SSH_PORT:-22}
 info "Текущий SSH порт: ${CUR_SSH_PORT}"
 NEW_SSH_PORT=$(ask_valid "Новый SSH порт (Enter — оставить как есть)" "${NEW_SSH_PORT:-$CUR_SSH_PORT}" is_valid_port) || exit 1
+# 80/443 заняты под certbot/HAProxy — SSH на них посадить нельзя.
+while [ "$NEW_SSH_PORT" = "80" ] || [ "$NEW_SSH_PORT" = "443" ]; do
+  err "Порт ${NEW_SSH_PORT} нужен под HTTPS/сертификаты — выберите другой порт для SSH."
+  [ "${ASSUME_YES:-0}" = "1" ] && exit 1
+  NEW_SSH_PORT=$(ask_valid "Новый SSH порт" "" is_valid_port) || exit 1
+done
 
 if [ "$ROLE" = "1" ]; then
   DOMAIN_TCP=$(ask_valid "Домен для VLESS REALITY TCP (обязателен)" "${DOMAIN_TCP:-}" is_valid_domain) || exit 1
@@ -102,7 +117,18 @@ if [ "$ROLE" = "1" ]; then
   fi
   if ask_yes_no "Ставить BBR и сетевую оптимизацию?" "1"; then USE_BBR=1; else USE_BBR=0; fi
 
-  NODE_PORT=$(ask_valid "Порт remnanode (для связи с панелью)" "${NODE_PORT:-$DEFAULT_NODE_PORT}" is_valid_port) || exit 1
+  # При повторном запуске порт предлагаем тот, что уже настроен в compose ноды.
+  EXISTING_NODE_PORT=""
+  [ -f "$NODE_DIR/docker-compose.yml" ] && \
+    EXISTING_NODE_PORT=$(grep -oE 'NODE_PORT=[0-9]+' "$NODE_DIR/docker-compose.yml" | head -1 | cut -d= -f2)
+  NODE_PORT=$(ask_valid "Порт remnanode (для связи с панелью)" "${NODE_PORT:-${EXISTING_NODE_PORT:-$DEFAULT_NODE_PORT}}" is_valid_port) || exit 1
+  # Порт ноды не должен совпадать с SSH, 80 и 443: иначе один из сервисов не поднимется,
+  # а проверка «порт слушает» ошибочно сочтёт успехом чужой процесс.
+  while [ "$NODE_PORT" = "$NEW_SSH_PORT" ] || [ "$NODE_PORT" = "80" ] || [ "$NODE_PORT" = "443" ]; do
+    err "Порт ноды ${NODE_PORT} уже занят под SSH/HTTPS — выберите другой."
+    [ "${ASSUME_YES:-0}" = "1" ] && exit 1
+    NODE_PORT=$(ask_valid "Порт remnanode" "" is_valid_port) || exit 1
+  done
   OPEN_NODE_PORT=0
   if ask_yes_no "Открыть порт ${NODE_PORT} для панели в firewall сейчас?" "1"; then
     OPEN_NODE_PORT=1
@@ -136,6 +162,24 @@ else
   ENABLE_REBOOT=0
 fi
 
+# ---- план выполнения: что именно сейчас будет сделано ------------------------
+yn() { [ "$1" = "1" ] && echo "да" || echo "нет"; }
+echo
+box_top "План выполнения"
+box_row "Роль:               $([ "$ROLE" = "1" ] && echo "нода" || echo "сервер панели (только защита)")"
+if [ "$NEW_SSH_PORT" != "$CUR_SSH_PORT" ]; then
+  box_row "SSH-порт:           ${CUR_SSH_PORT} → ${C_BOLD}${NEW_SSH_PORT}${C_RESET}"
+else
+  box_row "SSH-порт:           ${NEW_SSH_PORT} (без изменений)"
+fi
+if [ "$ROLE" = "1" ]; then
+  box_wrap "Домены:           " "${DOMAIN_TCP}${DOMAIN_GRPC:+ ${DOMAIN_GRPC}}${DOMAIN_XHTTP:+ ${DOMAIN_XHTTP}}${DOMAIN_HY2:+ ${DOMAIN_HY2}}"
+  box_row "Порт ноды:          ${NODE_PORT}$([ "$OPEN_NODE_PORT" = "1" ] && echo " (открыт$([ -n "$PANEL_IP" ] && echo " только для ${PANEL_IP}"))" || echo " (в firewall не открывается)")"
+  box_row "Hysteria2:          $(yn "$USE_HY2")    Заглушка: $(yn "$INSTALL_DECOY")    BBR: $(yn "$USE_BBR")"
+fi
+box_row "Ребут в 04:00:      $(yn "$ENABLE_REBOOT")    Часовой пояс: ${DORIK_TZ}"
+box_bottom
+
 echo
 warn "Все вопросы заданы. Дальше скрипт выполнит все шаги подряд БЕЗ остановок."
 if [ "$NEW_SSH_PORT" != "$CUR_SSH_PORT" ]; then
@@ -152,9 +196,9 @@ fi
 FAIL_LOG=()
 STEP_NO=0
 if [ "$ROLE" = "1" ]; then
-  TOTAL_STEPS=5; [ "$USE_BBR" = "1" ] && TOTAL_STEPS=6
+  TOTAL_STEPS=6; [ "$USE_BBR" = "1" ] && TOTAL_STEPS=7
 else
-  TOTAL_STEPS=3
+  TOTAL_STEPS=4
 fi
 
 # run_step "Название" функция_этапа [функция_проверки]
@@ -225,9 +269,10 @@ do_protect_common() {
       ufw allow 443/tcp comment "HTTPS TCP" &>/dev/null || true
       [ "$USE_HY2" = "1" ] && { ufw allow 443/udp comment "Hysteria2" &>/dev/null || true; }
       if [ "$OPEN_NODE_PORT" = "1" ]; then
-        # Старое правило «для всех» (от прошлого запуска) свело бы на нет
-        # ограничение по IP панели — убираем перед добавлением нового.
-        ufw_close_port "${NODE_PORT}"
+        # Прежние правила «Node panel» (от прошлого запуска — другой порт, другой IP или
+        # «для всех») убираем: иначе смена порта оставит дыру, а старое правило «для
+        # всех» сведёт на нет ограничение по IP панели.
+        ufw_delete_matching 'Node panel'
         if [ -n "$PANEL_IP" ]; then
           ufw allow from "$PANEL_IP" to any port "${NODE_PORT}" proto tcp comment "Node panel" &>/dev/null || true
         else
@@ -244,9 +289,7 @@ do_protect_common() {
 
   # fail2ban: backend=systemd обязателен на Ubuntu 24.04/Debian 12 — там нет
   # /var/log/auth.log, и без него jail sshd не стартует вовсе.
-  if ! command -v fail2ban-client &>/dev/null; then
-    apt_install fail2ban || { err "fail2ban не установился."; rc=1; }
-  fi
+  install_fail2ban || { err "fail2ban не установился."; rc=1; }
   if [ -d /etc/fail2ban ]; then
     cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
@@ -327,6 +370,24 @@ fi
 # тоже дёргают apt — перепроверяем SSH ещё раз в самом конце.
 do_final_ssh() { ssh_selfheal "${NEW_SSH_PORT}"; }
 run_step "Финальная проверка SSH" do_final_ssh
+
+# Последний этап — независимая перепроверка всего сервера тем же «врачом»:
+# если после установки что-то не так, это видно сразу, а не при первой проблеме.
+do_final_audit() {
+  doctor_scan
+  show_dashboard
+  # Осознанный отказ пользователя (BBR) замечанием не считаем.
+  local id left=()
+  for id in "${ISSUE_IDS[@]}"; do
+    [ "$id" = "net_tuning" ] && [ "${USE_BBR:-0}" != "1" ] && continue
+    left+=("$id")
+  done
+  [ "${#left[@]}" -eq 0 ] && return 0
+  for id in "${left[@]}"; do err "${ISSUE_TXT[$id]}"; done
+  warn "Исправить автоматически: меню → «Проверка и исправление проблем»."
+  return 1
+}
+run_step "Итоговая перепроверка сервера" do_final_audit
 
 # ---------------------------------------------------------------------------
 # Итог

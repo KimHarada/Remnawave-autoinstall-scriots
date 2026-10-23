@@ -196,6 +196,9 @@ _chk() {  # _chk <0|1 (0=ок)> <ok-текст> <fail-текст>
   if [ "$1" -eq 0 ]; then ok "$2"; else err "$3"; VERIFY_FAIL=$((VERIFY_FAIL+1)); fi
 }
 _ufw_allows() { ufw status 2>/dev/null | grep -qE "^$1[[:space:]]+ALLOW"; }
+# Порт открыт для ВСЕХ (Anywhere), а не только для одного IP: правило «from 1.2.3.4»
+# проходило бы за открытый порт, хотя SSH/HTTPS для остального мира закрыты.
+_ufw_open()   { ufw status 2>/dev/null | grep -E "^$1[[:space:]]+ALLOW" | grep -q 'Anywhere'; }
 
 verify_apt() {
   VERIFY_FAIL=0
@@ -212,6 +215,8 @@ verify_ssh() {  # verify_ssh <порт>
   ssh_is_really_up "$port" || ssh_ok_via_socket "$port"; _chk $? "sshd отвечает на порту ${port}" "sshd не обслуживает порт ${port}"
   if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
     _ufw_allows "${port}(/tcp)?"; _chk $? "ufw: SSH-порт ${port} разрешён" "ufw: SSH-порт ${port} НЕ разрешён — доступ может пропасть!"
+    # Ограничение SSH по IP — осознанный выбор администратора, поэтому лишь предупреждаем.
+    _ufw_open "${port}(/tcp)?" || warn "ufw: SSH-порт ${port} открыт не для всех, а только для отдельного IP"
   fi
   return "$VERIFY_FAIL"
 }
@@ -221,11 +226,11 @@ verify_firewall() {  # verify_firewall <ssh_port> <роль 1|2> <hy2 0|1> <node
   local ssh="$1" role="$2" hy2="$3" nport="$4" reboot="$5"
   ufw status 2>/dev/null | grep -q '^Status: active'; _chk $? "ufw: активен" "ufw: не активен"
   ufw status verbose 2>/dev/null | grep -q 'deny (incoming)'; _chk $? "ufw: входящие закрыты по умолчанию" "ufw: политика входящих не deny"
-  _ufw_allows "${ssh}/tcp"; _chk $? "ufw: SSH ${ssh}/tcp открыт" "ufw: нет правила для SSH ${ssh}/tcp"
-  _ufw_allows "443/tcp"; _chk $? "ufw: 443/tcp открыт" "ufw: нет правила для 443/tcp"
-  _ufw_allows "80/tcp"; _chk $? "ufw: 80/tcp открыт" "ufw: нет правила для 80/tcp"
+  _ufw_open "${ssh}/tcp"; _chk $? "ufw: SSH ${ssh}/tcp открыт для всех" "ufw: SSH ${ssh}/tcp не открыт для всех (нет правила или оно только для одного IP)"
+  _ufw_open "443/tcp"; _chk $? "ufw: 443/tcp открыт" "ufw: нет правила для 443/tcp"
+  _ufw_open "80/tcp"; _chk $? "ufw: 80/tcp открыт" "ufw: нет правила для 80/tcp"
   if [ "$role" = "1" ]; then
-    [ "$hy2" != "1" ] || { _ufw_allows "443/udp"; _chk $? "ufw: 443/udp открыт (Hysteria2)" "ufw: нет правила для 443/udp"; }
+    [ "$hy2" != "1" ] || { _ufw_open "443/udp"; _chk $? "ufw: 443/udp открыт (Hysteria2)" "ufw: нет правила для 443/udp"; }
     [ -z "$nport" ] || { _ufw_allows "${nport}/tcp"; _chk $? "ufw: порт ноды ${nport} открыт" "ufw: нет правила для порта ноды ${nport}"; }
   fi
   fail2ban-client status sshd &>/dev/null; _chk $? "fail2ban: jail sshd работает" "fail2ban: jail sshd не работает"

@@ -19,6 +19,7 @@ source "${SCRIPT_DIR}/lib.sh" 2>/dev/null || {
   t=$(mktemp); curl -fsSL --retry 3 "${RAW}/scripts/lib.sh" -o "$t" && source "$t"
 } || { echo "Не удалось загрузить lib.sh" >&2; exit 1; }
 _dorik_source state.sh
+_dorik_source preflight.sh
 require_root
 require_apt_os
 
@@ -84,7 +85,12 @@ ensure_cert() {  # ensure_cert <домен>
     --non-interactive --agree-tos "${acct[@]}" -d "$d" \
     --pre-hook "systemctl stop nginx" --post-hook "systemctl start nginx" || true
   systemctl start nginx &>/dev/null || true
-  cert_is_valid "$d"
+  cert_is_valid "$d" || return 1
+  # Пробное продление (staging): убеждаемся, что автопродление через ~60 дней сработает.
+  spin_run "Проверка автопродления для ${d} (dry-run)" certbot renew --dry-run --cert-name "$d" \
+    || warn "Автопродление для ${d} может не сработать — проверьте, что порт 80 открыт и DNS верный."
+  systemctl start nginx &>/dev/null || true
+  return 0
 }
 
 nginx_proxy_headers() {
@@ -244,6 +250,9 @@ panel_install() {
     warn "Панель уже установлена в ${PANEL_DIR}. Для обновления выберите «Обновить панель»."
     return 0
   fi
+  # Панель тяжелее ноды: PostgreSQL + Valkey + backend — от 2 ГБ памяти и 10 ГБ диска.
+  preflight_run --docker --certs --ports "80 443" --allow nginx --ram-mb 2048 --disk-gb 10 || return 1
+  # Для панели строже, чем в предполётной проверке: 443 не должен занимать и HAProxy ноды.
   check_ports_free || return 1
 
   # local X="$X": значение из окружения (режим без вопросов) используется как ответ по умолчанию.

@@ -210,7 +210,10 @@ ensure_base_packages() {
     warn "Общая установка не прошла — ставлю по одному."
     local p failed=()
     for p in "${BASE_PACKAGES[@]}"; do
-      apt_install "$p" || failed+=("$p")
+      apt_install "$p" && continue
+      # В новых Debian dnsutils переименован в bind9-dnsutils.
+      if [ "$p" = "dnsutils" ] && apt_install bind9-dnsutils; then continue; fi
+      failed+=("$p")
     done
     if [ "${#failed[@]}" -gt 0 ]; then
       err "Не установились: ${failed[*]}"
@@ -219,6 +222,14 @@ ensure_base_packages() {
   fi
   systemctl enable --now cron &>/dev/null || true
   ok "Базовые пакеты на месте."
+}
+
+# fail2ban с backend=systemd (на Ubuntu 24.04+/Debian 12 нет auth.log) требует
+# python3-systemd — на Debian он не всегда тянется как зависимость.
+install_fail2ban() {
+  command -v fail2ban-client &>/dev/null || { apt_install fail2ban || return 1; }
+  dpkg -s python3-systemd &>/dev/null || apt_install python3-systemd || warn "python3-systemd не установился — backend=systemd у fail2ban может не заработать."
+  return 0
 }
 
 # ---- обновление пакетов -----------------------------------------------------

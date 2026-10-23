@@ -55,7 +55,17 @@ fi
 
 PORTS=$(ss -tlnp 2>/dev/null | grep sshd | grep -oE ':[0-9]+' | tr -d ':' | sort -u)
 for p in $PORTS; do
-  ufw allow "${p}/tcp" comment "SSH recovered" &>/dev/null || true
-  ok "Порт ${p} открыт в ufw и слушается."
+  command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q '^Status: active' && \
+    ufw allow "${p}/tcp" comment "SSH" &>/dev/null
+  ok "Порт ${p}: sshd слушает."
 done
-ok "SSH-доступ восстановлен."
+
+# Итоговая проверка: порт из конфига реально обслуживает sshd и разрешён в firewall.
+_dorik_source state.sh
+step "Проверка результата"
+if verify_ssh "$CONFIGURED_PORT"; then
+  ok "SSH-доступ восстановлен: порт ${CONFIGURED_PORT}."
+else
+  err "Часть проверок не прошла (см. выше). Проверьте: journalctl -u ssh.service -n 50 --no-pager; sshd -t"
+  exit 1
+fi

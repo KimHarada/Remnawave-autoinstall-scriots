@@ -55,7 +55,8 @@ PORT="$(node_port)"
 wait_node() {
   local _
   for _ in $(seq 1 15); do
-    container_running remnanode && ss -tln 2>/dev/null | grep -qE "[:.]${PORT}[[:space:]]" && return 0
+    container_running remnanode && \
+      ss -tlnp 2>/dev/null | grep -E "[:.]${PORT}[[:space:]]" | grep -vqE 'sshd|nginx|haproxy' && return 0
     sleep 2
   done
   return 1

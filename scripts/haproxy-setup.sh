@@ -156,6 +156,7 @@ else
   CERTBOT_ACCOUNT=(--register-unsafely-without-email)
 fi
 declare -A SEEN
+ISSUED=()
 for d in "${ALL_DOMAINS[@]}"; do
   [ -z "$d" ] && continue
   [ -n "${SEEN[$d]:-}" ] && continue
@@ -165,9 +166,12 @@ for d in "${ALL_DOMAINS[@]}"; do
   elif [ "${DNS_OK[$d]:-1}" = "0" ]; then
     warn "Пропускаю certbot для $d — DNS не указывает на этот сервер (см. выше)."
   else
-    spin_run "Выпуск сертификата для $d" certbot certonly --standalone --preferred-challenges http \
-      --non-interactive --agree-tos "${CERTBOT_ACCOUNT[@]}" -d "$d" \
-      || warn "certbot: сертификат для $d не выпущен (см. лог выше)."
+    if spin_run "Выпуск сертификата для $d" certbot certonly --standalone --preferred-challenges http \
+         --non-interactive --agree-tos "${CERTBOT_ACCOUNT[@]}" -d "$d"; then
+      ISSUED+=("$d")
+    else
+      warn "certbot: сертификат для $d не выпущен (см. лог выше)."
+    fi
   fi
 done
 systemctl start nginx 2>&1 || true
@@ -306,6 +310,25 @@ CHECK_FAIL=0
 
 if systemctl is-active --quiet nginx; then ok "nginx: активен"; else err "nginx: НЕ активен"; CHECK_FAIL=1; fi
 if systemctl is-active --quiet haproxy; then ok "haproxy: активен"; else err "haproxy: НЕ активен"; CHECK_FAIL=1; fi
+
+if ss -tlnp 2>/dev/null | grep -E '[:.]443[[:space:]]' | grep -q haproxy; then
+  ok "haproxy: слушает 443/tcp"
+else
+  err "haproxy: НЕ слушает 443/tcp — клиенты не смогут подключиться"; CHECK_FAIL=1
+fi
+if haproxy -c -f /etc/haproxy/haproxy.cfg &>/dev/null; then
+  ok "haproxy: конфигурация валидна"
+else
+  err "haproxy: действующая конфигурация невалидна"; CHECK_FAIL=1
+fi
+
+# Автопродление: пробный прогон certbot (staging) для только что выпущенных
+# сертификатов — убеждаемся, что продление через 60 дней сработает само.
+for d in "${ISSUED[@]}"; do
+  if spin_run "Проверка автопродления для ${d} (dry-run)" certbot renew --dry-run --cert-name "$d"; then :; else
+    err "автопродление для ${d} не пройдёт — проверьте порт 80 и DNS"; CHECK_FAIL=1
+  fi
+done
 
 DECOY_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "https://127.0.0.1:8081" 2>/dev/null || echo "000")
 if [ -z "$STEAL_CERT_DOMAIN" ]; then

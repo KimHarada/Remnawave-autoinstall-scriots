@@ -21,7 +21,12 @@ fi
 
 declare -ga ISSUE_IDS=()
 declare -gA ISSUE_TXT=()
-_issue() { ISSUE_IDS+=("$1"); ISSUE_TXT["$1"]="$2"; }
+# DORIK_IGNORE="time_sync,net_tuning" — не считать перечисленные замечания проблемами.
+_issue() {
+  case ",${DORIK_IGNORE:-}," in *",$1,"*) return 0 ;; esac
+  [ -n "${ISSUE_TXT[$1]:-}" ] && return 0   # одно замечание — одна запись
+  ISSUE_IDS+=("$1"); ISSUE_TXT["$1"]="$2"
+}
 
 # ---- поиск проблем -----------------------------------------------------------
 doctor_scan() {
@@ -107,11 +112,58 @@ doctor_scan() {
   if [ -e /etc/nginx/sites-enabled/default ] && [ -e /etc/nginx/sites-enabled/decoy ]; then
     _issue nginx_default "включён стандартный сайт nginx — занимает порт 80 и мешает выпуску сертификатов"
   fi
+  # Настроенные, но остановленные службы: нода/панель без них недоступны.
+  if [ -e /etc/nginx/sites-enabled/decoy ] || compgen -G "/etc/nginx/sites-enabled/remnawave-*" >/dev/null; then
+    svc_active nginx || _issue web_down "nginx настроен, но остановлен"
+  fi
+  if svc_exists haproxy && [ -f /etc/haproxy/haproxy.cfg ] && grep -q 'fe_443' /etc/haproxy/haproxy.cfg; then
+    svc_active haproxy || _issue web_down "HAProxy настроен, но остановлен — клиенты не подключатся"
+  fi
 
   # панель
   if [ -f "$PANEL_DIR/.env" ]; then
     if [ "$(stat -c '%a' "$PANEL_DIR/.env" 2>/dev/null)" != "600" ]; then
       _issue panel_env "файл $PANEL_DIR/.env с секретами доступен не только root"
+    fi
+  fi
+
+  # время: неверные часы ломают TLS, apt и продление сертификатов
+  if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = "no" ]; then
+    _issue time_sync "системное время не синхронизируется (NTP) — ломает TLS и сертификаты"
+  fi
+
+  # сертификаты, которым осталось меньше 14 дней (продление не сработало)
+  local cf end d days
+  for cf in /etc/letsencrypt/live/*/fullchain.pem; do
+    [ -f "$cf" ] || continue
+    end="$(openssl x509 -enddate -noout -in "$cf" 2>/dev/null | cut -d= -f2)"
+    d="$(date -d "$end" +%s 2>/dev/null)" || continue
+    days=$(( (d - $(date +%s)) / 86400 ))
+    if [ "$days" -lt 14 ]; then
+      _issue cert_expiring "сертификат $(basename "$(dirname "$cf")") истекает через ${days} дн. — автопродление не сработало"
+      break
+    fi
+  done
+
+  # Docker и контейнеры
+  if [ -f "$NODE_DIR/docker-compose.yml" ] || [ -f "$PANEL_DIR/docker-compose.yml" ]; then
+    if ! have docker || ! svc_active docker; then
+      _issue docker_down "Docker не установлен или не запущен, а нода/панель его используют"
+    else
+      if [ -f "$NODE_DIR/docker-compose.yml" ]; then
+        local ns; ns="$(container_state remnanode)"
+        if [ "$ns" != "running" ] && [ "$ns" != "restarting" ]; then
+          _issue node_down "контейнер remnanode не запущен (состояние: ${ns:-нет})"
+        fi
+      fi
+      if [ -f "$PANEL_DIR/docker-compose.yml" ]; then
+        local c bad=0
+        for c in remnawave remnawave-db remnawave-redis; do container_running "$c" || bad=1; done
+        [ "$bad" = 1 ] && _issue panel_down "контейнеры панели Remnawave запущены не все"
+      fi
+      if [ -f "$SUB_DIR/docker-compose.yml" ] && ! container_running remnawave-subscription-page; then
+        _issue sub_down "контейнер страницы подписки не запущен"
+      fi
     fi
   fi
   return 0
@@ -137,7 +189,15 @@ fix_ufw_off() {
   if [ -f "$NODE_DIR/docker-compose.yml" ]; then
     local np; np="$(grep -oE 'NODE_PORT=[0-9]+' "$NODE_DIR/docker-compose.yml" | head -1 | cut -d= -f2)"
     ufw allow 443/udp comment "Hysteria2" &>/dev/null
-    [ -n "$np" ] && ufw allow "${np}/tcp" comment "Node panel" &>/dev/null && info "открыты 443/udp и порт ноды ${np}/tcp"
+    # Правило порта ноды уже могло быть (в т.ч. ограниченное IP панели) — при выключенном
+    # ufw `status` его не показывает, а `show added` показывает. Не затираем его открытым.
+    if [ -n "$np" ]; then
+      if ufw show added 2>/dev/null | grep -qE "[ /]${np}(/tcp| proto|\$)"; then
+        info "правило для порта ноды ${np} уже есть — оставляю как есть"
+      else
+        ufw allow "${np}/tcp" comment "Node panel" &>/dev/null && info "открыт порт ноды ${np}/tcp"
+      fi
+    fi
   fi
   ufw --force enable &>/dev/null
 }
@@ -152,7 +212,7 @@ fix_ufw_stale() {
 }
 
 fix_f2b() {
-  have fail2ban-client || apt_install fail2ban || return 1
+  install_fail2ban || return 1
   local p; p="$(get_real_ssh_port)"; p="${p:-$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')}"; p="${p:-22}"
   cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
@@ -193,6 +253,29 @@ fix_net_tuning() { local src; src="$(get_script bbr-install.sh)" || return 1; NO
 fix_nginx_default() { rm -f /etc/nginx/sites-enabled/default; nginx -t &>/dev/null && systemctl reload nginx; }
 
 fix_panel_env() { chmod 600 "$PANEL_DIR/.env"; }
+
+fix_time_sync() { timedatectl set-ntp true; }
+
+fix_web_down() {
+  local rc=0
+  if [ -e /etc/nginx/sites-enabled/decoy ] || compgen -G "/etc/nginx/sites-enabled/remnawave-*" >/dev/null; then
+    nginx -t &>/dev/null && systemctl restart nginx || rc=1
+  fi
+  if svc_exists haproxy && grep -q 'fe_443' /etc/haproxy/haproxy.cfg 2>/dev/null; then
+    haproxy -c -f /etc/haproxy/haproxy.cfg &>/dev/null && systemctl restart haproxy || rc=1
+  fi
+  return $rc
+}
+
+fix_cert_expiring() { certbot renew; }
+
+fix_docker_down() {
+  if have docker; then systemctl enable --now docker; else ensure_docker; fi
+}
+
+fix_node_down()  { (cd "$NODE_DIR" && docker compose up -d); }
+fix_panel_down() { (cd "$PANEL_DIR" && docker compose up -d); }
+fix_sub_down()   { (cd "$SUB_DIR" && docker compose up -d); }
 
 fix_haproxy_cfg() {
   if [ "${ASSUME_YES:-0}" = "1" ]; then warn "требуется ввод доменов — запустите вручную: «Только Nginx+HAProxy»"; return 1; fi

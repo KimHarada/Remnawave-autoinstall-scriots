@@ -78,25 +78,52 @@ cat > /etc/systemd/system.conf.d/99-dorik-limits.conf <<'EOF'
 DefaultLimitNOFILE=65535:1048576
 EOF
 
-BAD=0
 for f in /etc/sysctl.d/99-bbr.conf /etc/sysctl.d/99-dorik-net.conf; do
   # Ядро/контейнер может не знать отдельных ключей — это не повод падать,
-  # но показываем, какие именно не применились.
-  OUT=$(sysctl -p "$f" 2>&1 >/dev/null) || true
-  if [ -n "$OUT" ]; then
-    warn "$(basename "$f"): часть параметров не применилась:"
-    echo "$OUT" | head -n 5 >&2
-    BAD=1
-  fi
+  # ниже каждый параметр проверяется по фактическому значению.
+  sysctl -p "$f" &>/dev/null || true
+done
+
+# ---- проверка: фактические значения, а не «команда не упала» ---------------------
+step "Проверка результата"
+declare -A EXPECT=(
+  [net.core.default_qdisc]=fq
+  [net.ipv4.tcp_congestion_control]=bbr
+  [net.core.somaxconn]=65535
+  [net.core.netdev_max_backlog]=16384
+  [net.core.rmem_max]=33554432
+  [net.core.wmem_max]=33554432
+  [net.ipv4.tcp_fastopen]=3
+  [net.ipv4.tcp_slow_start_after_idle]=0
+  [net.ipv4.tcp_mtu_probing]=1
+  [net.ipv4.ip_local_port_range]="10240 65535"
+  [fs.file-max]=2097152
+)
+applied=0; total=${#EXPECT[@]}; mismatched=()
+for k in "${!EXPECT[@]}"; do
+  cur="$(sysctl -n "$k" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/ $//')"
+  if [ "$cur" = "${EXPECT[$k]}" ]; then applied=$((applied+1)); else mismatched+=("${k}=${cur:-нет} (ожидалось ${EXPECT[$k]})"); fi
 done
 
 FINAL=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
 QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
+RC=0
 if [[ "$FINAL" == bbr* ]]; then
   ok "BBR активен: congestion_control=${FINAL}, qdisc=${QDISC}"
 else
-  err "Не удалось включить BBR (сейчас: ${FINAL})."
-  exit 1
+  err "Не удалось включить BBR (сейчас: ${FINAL}). Проверьте: modprobe tcp_bbr; uname -r"
+  RC=1
 fi
-[ "$BAD" = "0" ] && ok "Сетевые параметры применены."
-exit 0
+if [ "$applied" -eq "$total" ]; then
+  ok "Сетевые параметры применены: ${applied} из ${total}"
+else
+  warn "Применено ${applied} из ${total} параметров — не совпали:"
+  for k in "${mismatched[@]}"; do echo -e "      ${C_Y}•${C_RESET} $k" >&2; done
+  virt="$(systemd-detect-virt -c 2>/dev/null || true)"
+  [ -n "$virt" ] && [ "$virt" != "none" ] && warn "Сервер в контейнере (${virt}) — часть параметров ядра хостер не разрешает менять."
+fi
+# Сохранение после перезагрузки (на сервере с ежедневным ребутом это критично).
+[ -f /etc/modules-load.d/dorik-bbr.conf ] && [ -f /etc/sysctl.d/99-bbr.conf ] && [ -f /etc/sysctl.d/99-dorik-net.conf ]
+if [ $? -eq 0 ]; then ok "Настройки сохранены в /etc/sysctl.d и подхватятся после перезагрузки."
+else err "Файлы настроек не записались — после перезагрузки BBR пропадёт."; RC=1; fi
+exit "$RC"

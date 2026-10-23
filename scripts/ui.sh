@@ -141,11 +141,24 @@ box_row() {  # box_row <текст>
 }
 
 # box_wrap <маркер> <текст> — длинный текст с переносом по словам внутри рамки.
+# Перенос свой, на bash: GNU fold считает байты, и кириллица переносилась бы вдвое раньше.
 box_wrap() {
-  local mark="$1" text="$2" line first=1
-  while IFS= read -r line; do
-    if [ "$first" -eq 1 ]; then box_row "${mark} ${line}"; first=0; else box_row "  ${line}"; fi
-  done < <(printf '%s\n' "$text" | fold -s -w $((UI_W - 8)))
+  local mark="$1" text="$2" line="" word first=1 max=$(( UI_W - 8 ))
+  local -a words
+  read -ra words <<<"$text"
+  for word in "${words[@]}"; do
+    if [ -z "$line" ]; then
+      line="$word"
+    elif [ $(( ${#line} + 1 + ${#word} )) -le "$max" ]; then
+      line+=" $word"
+    else
+      if [ "$first" -eq 1 ]; then box_row "${mark} ${line}"; first=0; else box_row "  ${line}"; fi
+      line="$word"
+    fi
+  done
+  if [ -n "$line" ]; then
+    if [ "$first" -eq 1 ]; then box_row "${mark} ${line}"; else box_row "  ${line}"; fi
+  fi
 }
 
 # Строка состояния: dot_row <ok|warn|bad|off> <название> <детали>

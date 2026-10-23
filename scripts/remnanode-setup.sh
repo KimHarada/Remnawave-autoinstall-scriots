@@ -63,6 +63,17 @@ if [ -z "$SECRET_KEY" ]; then
   err "SECRET_KEY пуст — возьмите его в панели Remnawave (Nodes -> Add node) и запустите снова."
   exit 1
 fi
+# Ключ из панели — base64 от JSON. Если это не так, нода сразу упадёт с
+# «SECRET_KEY contains invalid JSON» и уйдёт в цикл перезапусков. Формат может
+# измениться в будущих версиях Remnawave, поэтому в автоматическом режиме это
+# только предупреждение, а в интерактивном — вопрос.
+if ! printf '%s' "$SECRET_KEY" | base64 -d 2>/dev/null | head -c 1 | grep -q '{'; then
+  warn "SECRET_KEY не похож на ключ из панели (ожидается base64 от JSON). Скопируйте его целиком: Ноды → Добавить ноду."
+  if [ "$NONINTERACTIVE" != "1" ] && ! ask_yes_no "Всё равно использовать этот ключ?" "2"; then
+    err "Отменено: проверьте SECRET_KEY."
+    exit 1
+  fi
+fi
 if ! is_valid_port "$NODE_PORT"; then
   err "NODE_PORT '${NODE_PORT}' некорректен."
   exit 1
@@ -184,7 +195,8 @@ CHECK_FAIL=0
 wait_node_port() {
   local _
   for _ in $(seq 1 10); do
-    ss -tln 2>/dev/null | grep -qE "[:.]${NODE_PORT}[[:space:]]" && return 0
+    # порт должен держать процесс ноды, а не sshd/nginx/haproxy, которые тоже «слушают»
+    ss -tlnp 2>/dev/null | grep -E "[:.]${NODE_PORT}[[:space:]]" | grep -vqE 'sshd|nginx|haproxy' && return 0
     sleep 2
   done
   return 1
