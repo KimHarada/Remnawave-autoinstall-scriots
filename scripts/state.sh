@@ -167,6 +167,22 @@ st_cron() {
   fi
 }
 
+st_ports() {
+  if ! declare -F scan_listeners &>/dev/null; then _st off "—"; return; fi
+  scan_listeners
+  local ex dk bl i open="" seen=" "
+  ex="$(count_state exposed)"; dk="$(count_state docker)"; bl="$(count_state blocked)"
+  for i in "${!L_STATE[@]}"; do
+    [ "${L_STATE[$i]}" = "expected" ] || continue
+    case "$seen" in *" ${L_PORT[$i]}/${L_PROTO[$i]} "*) continue ;; esac
+    seen+="${L_PORT[$i]}/${L_PROTO[$i]} "
+    open+="${open:+, }${L_PORT[$i]}/${L_PROTO[$i]}"
+  done
+  if [ "$ex" -gt 0 ]; then _st bad "лишних открытых портов: ${ex} — пункт «Укрепление сервера»"
+  elif [ "$dk" -gt 0 ]; then _st bad "Docker открывает порты в обход ufw (${dk})"
+  else _st ok "снаружи только нужное: ${open:-—}"; fi
+}
+
 st_issues() {
   if ! declare -F doctor_scan &>/dev/null; then _st off "—"; return; fi
   doctor_scan
@@ -179,7 +195,7 @@ show_dashboard() {
   box_top "Состояние сервера"
   for entry in \
     "Система:st_system" "SSH:st_ssh" "Firewall (ufw):st_ufw" "fail2ban:st_f2b" \
-    "BBR:st_bbr" "Nginx/HAProxy:st_web" "Сертификаты:st_certs" "Docker:st_docker" \
+    "Открытые порты:st_ports" "BBR:st_bbr" "Nginx/HAProxy:st_web" "Сертификаты:st_certs" "Docker:st_docker" \
     "Нода Remnanode:st_node" "Панель Remnawave:st_panel" "Страница подп.:st_sub" \
     "Расписание:st_cron" "Проверка:st_issues"; do
     label="${entry%%:*}"; fn="${entry##*:}"

@@ -16,6 +16,7 @@ source "${SCRIPT_DIR}/lib.sh" 2>/dev/null || {
   LIBTMP="$(mktemp)"; curl -fsSL --retry 3 "${RAW}/scripts/lib.sh" -o "$LIBTMP" && source "$LIBTMP"
 } || { echo "Не удалось загрузить lib.sh" >&2; exit 1; }
 _dorik_source state.sh
+_dorik_source harden.sh
 _dorik_source doctor.sh
 _dorik_source preflight.sh
 
@@ -40,7 +41,9 @@ ensure_base_packages || warn "Базовые пакеты установилис
 # ---------------------------------------------------------------------------
 step "Что уже установлено"
 show_dashboard
-doctor_run || true
+# Укрепление (порты, ядро, SSH) предложим отдельным вопросом ниже — здесь чиним только
+# последствия старых версий, чтобы отказ пользователя в вопросе не был обойдён заранее.
+DORIK_IGNORE="${DORIK_IGNORE:+${DORIK_IGNORE},}ports_exposed,hardening_missing,ufw_ipv6" doctor_run || true
 
 # ---------------------------------------------------------------------------
 # ШАГ 1. Сбор параметров (никаких вопросов после этого блока)
@@ -162,6 +165,26 @@ else
   ENABLE_REBOOT=0
 fi
 
+# Закрытие лишних портов и укрепление: firewall без лишних правил, отключение ненужных
+# служб, защита ядра и SSH, автообновления безопасности.
+SSH_PW_OFF=0
+if ask_yes_no "Закрыть все лишние порты и укрепить систему (рекомендуется)?" "1"; then
+  DO_HARDEN=1
+  # Вход по паролю отключаем только при наличии ключей и только по явному согласию.
+  if [ "$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2}')" = "no" ]; then
+    info "Вход по паролю в SSH уже отключён — останется отключённым."
+    SSH_PW_OFF=1
+  elif _has_ssh_keys; then
+    if [ "${ASSUME_YES:-0}" = "1" ]; then
+      SSH_PW_OFF="${SSH_DISABLE_PASSWORD:-0}"
+    elif ask_yes_no "Отключить вход по паролю в SSH (только по ключу)? Убедитесь, что вход по ключу у вас работает" "2"; then
+      SSH_PW_OFF=1
+    fi
+  fi
+else
+  DO_HARDEN=0
+fi
+
 # ---- план выполнения: что именно сейчас будет сделано ------------------------
 yn() { [ "$1" = "1" ] && echo "да" || echo "нет"; }
 echo
@@ -178,6 +201,7 @@ if [ "$ROLE" = "1" ]; then
   box_row "Hysteria2:          $(yn "$USE_HY2")    Заглушка: $(yn "$INSTALL_DECOY")    BBR: $(yn "$USE_BBR")"
 fi
 box_row "Ребут в 04:00:      $(yn "$ENABLE_REBOOT")    Часовой пояс: ${DORIK_TZ}"
+box_row "Укрепление:         $(yn "$DO_HARDEN")    Вход по паролю SSH выключить: $(yn "$SSH_PW_OFF")"
 box_bottom
 
 echo
@@ -200,6 +224,7 @@ if [ "$ROLE" = "1" ]; then
 else
   TOTAL_STEPS=4
 fi
+[ "$DO_HARDEN" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
 
 # run_step "Название" функция_этапа [функция_проверки]
 run_step() {
@@ -364,6 +389,23 @@ if [ "$ROLE" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Закрытие лишних портов и укрепление (после установки сервисов — тогда известно,
+# какие порты действительно нужны)
+# ---------------------------------------------------------------------------
+if [ "$DO_HARDEN" = "1" ]; then
+  # Нужные порты объявляем один раз на весь запуск: их используют и сам этап укрепления,
+  # и итоговая перепроверка — иначе она «критиковала» бы результат, не зная выбранной роли.
+  HARDEN_EXPECT="${NEW_SSH_PORT}/tcp 80/tcp 443/tcp"
+  if [ "$ROLE" = "1" ]; then
+    [ "$USE_HY2" = "1" ] && HARDEN_EXPECT+=" 443/udp"
+    [ "$OPEN_NODE_PORT" = "1" ] && HARDEN_EXPECT+=" ${NODE_PORT}/tcp"
+  fi
+  export HARDEN_EXPECT
+  do_harden() { SSH_DISABLE_PASSWORD="$SSH_PW_OFF" harden_run; }
+  run_step "Закрытие лишних портов и укрепление" do_harden
+fi
+
+# ---------------------------------------------------------------------------
 # Финальная страховочная проверка SSH
 # ---------------------------------------------------------------------------
 # Промежуточные шаги (apt install nginx/haproxy/certbot, docker install)
@@ -380,6 +422,7 @@ do_final_audit() {
   local id left=()
   for id in "${ISSUE_IDS[@]}"; do
     [ "$id" = "net_tuning" ] && [ "${USE_BBR:-0}" != "1" ] && continue
+    case "$id" in ports_exposed|hardening_missing|ufw_ipv6) [ "${DO_HARDEN:-0}" != "1" ] && continue ;; esac
     left+=("$id")
   done
   [ "${#left[@]}" -eq 0 ] && return 0

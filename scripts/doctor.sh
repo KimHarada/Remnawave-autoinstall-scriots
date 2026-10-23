@@ -14,6 +14,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     t=$(mktemp); curl -fsSL --retry 3 "${RAW}/scripts/lib.sh" -o "$t" && source "$t"
   } || { echo "Не удалось загрузить lib.sh" >&2; exit 1; }
   _dorik_source state.sh
+  _dorik_source harden.sh
   _standalone=1
 else
   _standalone=0
@@ -166,6 +167,22 @@ doctor_scan() {
       fi
     fi
   fi
+
+  # открытые порты и укрепление (модуль harden.sh)
+  if declare -F scan_listeners &>/dev/null; then
+    local ex dk
+    scan_listeners
+    ex="$(count_state exposed)"; dk="$(count_state docker)"
+    [ "$ex" -gt 0 ] && _issue ports_exposed "наружу открыто лишних портов: ${ex} — их нужно закрыть"
+    [ "$dk" -gt 0 ] && _issue docker_public "Docker публикует порты на все интерфейсы в обход ufw: $(docker_public_ports | head -3 | tr '\n' ';') — перепубликуйте на 127.0.0.1"
+    if have ufw && grep -qE '^IPV6=no' /etc/default/ufw 2>/dev/null; then
+      _issue ufw_ipv6 "ufw не фильтрует IPv6 (IPV6=no) — по IPv6 сервер открыт целиком"
+    fi
+    if [ ! -f /etc/sysctl.d/98-dorik-hardening.conf ] || [ ! -f /etc/ssh/sshd_config.d/00-dorik-hardening.conf ] \
+       || ! grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
+      _issue hardening_missing "не применено укрепление системы (ядро, SSH, автообновления безопасности)"
+    fi
+  fi
   return 0
 }
 
@@ -255,6 +272,12 @@ fix_nginx_default() { rm -f /etc/nginx/sites-enabled/default; nginx -t &>/dev/nu
 fix_panel_env() { chmod 600 "$PANEL_DIR/.env"; }
 
 fix_time_sync() { timedatectl set-ntp true; }
+
+# Исправления из harden.sh выполняются внутри спиннера без терминала — вопросы
+# задавать некому, поэтому ASSUME_YES=1 (пользователь уже согласился на исправление).
+fix_ports_exposed()     { ( ASSUME_YES=1; harden_firewall; harden_services ); }
+fix_ufw_ipv6()          { sed -i -E 's/^IPV6=no/IPV6=yes/' /etc/default/ufw && ufw reload; }
+fix_hardening_missing() { ( ASSUME_YES=1; harden_sysctl; harden_ssh; harden_updates ); }
 
 fix_web_down() {
   local rc=0
