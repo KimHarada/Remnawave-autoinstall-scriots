@@ -75,13 +75,19 @@ elif [ ! -f "${DECOY_ROOT}/index.html" ] || confirm_overwrite "${DECOY_ROOT}/ind
   WORK="$(mktemp -d)"
   PICK=""
   DECOY_INSTALLED=0
+  CANDIDATES=()
   if curl -fsSL --retry 3 "${RAW}/decoys/manifest.txt" -o "$WORK/manifest.txt" 2>/dev/null && [ -s "$WORK/manifest.txt" ]; then
     # tr убирает \r (Windows-перевод строки) и пробелы — иначе имя файла
     # получается с мусором на конце и curl за zip-архивом падает с 404.
-    PICK=$(head -1 "$WORK/manifest.txt" | tr -d '\r' | xargs)
+    # shuf: на каждом сервере заглушка своя случайная, а не одна и та же везде.
+    mapfile -t CANDIDATES < <(tr -d '\r' < "$WORK/manifest.txt" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -E '\.zip$' | shuf)
   fi
-  if [ -n "$PICK" ]; then
+  # DECOY_NAME=имя.zip — принудительно выбрать конкретную заглушку
+  [ -n "${DECOY_NAME:-}" ] && CANDIDATES=("$DECOY_NAME")
+  # Берём первую в случайном порядке, которая реально скачалась и распаковалась.
+  for PICK in "${CANDIDATES[@]}"; do
     ZIP_URL="${RAW}/decoys/${PICK}"
+    rm -rf "$WORK/unzip" "$WORK/decoy.zip"
     if curl -fsSL --retry 3 "$ZIP_URL" -o "$WORK/decoy.zip" 2>/dev/null && [ -s "$WORK/decoy.zip" ]; then
       mkdir -p "$WORK/unzip"
       if unzip -oq "$WORK/decoy.zip" -d "$WORK/unzip" 2>"$WORK/unzip_err.log"; then
@@ -103,11 +109,11 @@ elif [ ! -f "${DECOY_ROOT}/index.html" ] || confirm_overwrite "${DECOY_ROOT}/ind
         warn "Не удалось распаковать ${PICK}: $(head -1 "$WORK/unzip_err.log" 2>/dev/null)"
       fi
     else
-      warn "Не удалось скачать ${ZIP_URL} (проверьте, что файл ещё есть в decoys/ репозитория)."
+      warn "Не удалось скачать ${ZIP_URL} — пробую другую заглушку."
     fi
-  else
-    warn "manifest.txt пуст или недоступен — decoys/ в репозитории может быть пустой."
-  fi
+    [ "$DECOY_INSTALLED" = "1" ] && break
+  done
+  [ "${#CANDIDATES[@]}" -eq 0 ] && warn "manifest.txt пуст или недоступен — decoys/ в репозитории может быть пустой."
   rm -rf "$WORK"
   if [ "$DECOY_INSTALLED" != "1" ] && [ ! -f "${DECOY_ROOT}/index.html" ]; then
     write_basic_decoy
