@@ -15,13 +15,21 @@ DORIK_RAW="${DORIK_RAW:-https://raw.githubusercontent.com/KimHarada/Remnawave-au
 DORIK_TZ="${DORIK_TZ:-Asia/Irkutsk}"
 DEFAULT_NODE_PORT="3001"
 
-C_RESET="\e[0m"; C_G="\e[32m"; C_Y="\e[33m"; C_R="\e[31m"; C_B="\e[36m"
-info()  { echo -e "${C_B}[i]${C_RESET} $*"; }
-ok()    { echo -e "${C_G}[✓]${C_RESET} $*"; }
-# warn/err — в stderr, чтобы не попадали в результат $(...) вызывающего кода.
-warn()  { echo -e "${C_Y}[!]${C_RESET} $*" >&2; }
-err()   { echo -e "${C_R}[✗]${C_RESET} $*" >&2; }
-step()  { echo -e "\n${C_B}==>${C_RESET} $*"; }
+DORIK_VERSION="2.0"
+
+# Оформление (цвета, рамки, спиннер, прогресс) лежит рядом, в ui.sh.
+_dorik_source() {  # _dorik_source <файл рядом с lib.sh>
+  local d t
+  d="$(dirname "${BASH_SOURCE[0]}")"
+  if [ -f "${d}/$1" ]; then
+    # shellcheck disable=SC1090
+    . "${d}/$1"
+  else
+    t="$(mktemp)"
+    curl -fsSL --retry 3 "${DORIK_RAW}/scripts/$1" -o "$t" && . "$t"
+  fi
+}
+_dorik_source ui.sh
 
 # ---- ввод ------------------------------------------------------------------
 # ASSUME_YES=1 — режим без вопросов (cloud-init / автоматический запуск):
@@ -187,8 +195,8 @@ apt_run() {
   return "$rc"
 }
 
-apt_update()  { apt_run update --allow-releaseinfo-change; }
-apt_install() { apt_run install "$@"; }
+apt_update()  { spin_run "Обновление списков пакетов" apt_run update --allow-releaseinfo-change; }
+apt_install() { spin_run "Установка пакетов: $*" apt_run install "$@"; }
 
 # Базовый набор для любого этапа: на минимальном образе Ubuntu часть этого нет
 # (ufw, dnsutils, psmisc, cron) — и раньше шаги молча «ставились» впустую.
@@ -222,13 +230,9 @@ apt_upgrade_smart() {
   if [ "${cnt:-0}" -eq 0 ]; then
     ok "Пакеты уже актуальны, апгрейд не требуется."
   else
-    info "Найдено обновлений: ${cnt}. Обновляю (может занять несколько минут)..."
-    if apt_run full-upgrade; then
-      apt_run autoremove --purge || true
-      ok "Пакеты обновлены."
-    else
-      return 1
-    fi
+    info "Найдено обновлений: ${cnt}. Это может занять несколько минут."
+    spin_run "Обновление ${cnt} пакетов" apt_run full-upgrade || return 1
+    spin_run "Очистка ненужных пакетов" apt_run autoremove --purge || true
   fi
   if [ -f /var/run/reboot-required ]; then
     warn "После обновления нужна перезагрузка (ядро/библиотеки) — см. итог в конце."
@@ -468,6 +472,55 @@ cert_is_valid() {
   [ -z "$domain" ] && return 1
   cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
   [ -f "$cert" ] && openssl x509 -checkend 86400 -noout -in "$cert" &>/dev/null
+}
+
+# ---- Docker -------------------------------------------------------------------
+install_docker() { curl -fsSL --retry 3 https://get.docker.com | sh; }
+
+# Ставит Docker (официальный get.docker.com) с повторами и проверяет compose-плагин.
+ensure_docker() {
+  local attempt
+  if ! command -v docker &>/dev/null; then
+    step "Установка Docker"
+    apt_update || true
+    apt_install curl ca-certificates || true
+    for attempt in 1 2 3; do
+      wait_for_apt_lock
+      spin_run "Установка Docker (get.docker.com)" install_docker && break
+      warn "Установка Docker не удалась (попытка ${attempt}/3), повторяю..."
+      fix_dpkg_state
+      sleep 10
+    done
+    if ! command -v docker &>/dev/null; then
+      err "Docker не установился."
+      return 1
+    fi
+  fi
+  systemctl enable --now docker &>/dev/null || true
+  if ! docker compose version &>/dev/null; then
+    apt_install docker-compose-plugin || true
+    if ! docker compose version &>/dev/null; then
+      err "docker compose недоступен — установите docker-compose-plugin вручную."
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Хук продления. Сертификаты Hysteria2/Xray монтируются в контейнер как
+# symlink'и на конкретный файл в archive/ — после продления контейнер видит
+# старый файл, пока его не пересоздать. Без хука через ~60 дней TLS протухает.
+install_renew_hook() {
+  install -d /etc/letsencrypt/renewal-hooks/deploy
+  cat > /etc/letsencrypt/renewal-hooks/deploy/dorik-reload.sh <<'HOOK'
+#!/bin/sh
+systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+if [ -f /opt/remnanode/docker-compose.yml ] && grep -q '/etc/letsencrypt/live' /opt/remnanode/docker-compose.yml \
+   && command -v docker >/dev/null 2>&1; then
+  (cd /opt/remnanode && docker compose up -d --force-recreate) >/dev/null 2>&1 || true
+fi
+HOOK
+  chmod +x /etc/letsencrypt/renewal-hooks/deploy/dorik-reload.sh
 }
 
 # ---- доступ к соседним скриптам ----------------------------------------------

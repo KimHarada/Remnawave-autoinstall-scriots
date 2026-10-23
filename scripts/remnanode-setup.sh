@@ -8,6 +8,7 @@ RAW="${DORIK_RAW:-https://raw.githubusercontent.com/KimHarada/Remnawave-autoinst
 source "${SCRIPT_DIR}/lib.sh" 2>/dev/null || {
   t=$(mktemp); curl -fsSL --retry 3 "${RAW}/scripts/lib.sh" -o "$t" && source "$t"
 } || { echo "Не удалось загрузить lib.sh" >&2; exit 1; }
+_dorik_source state.sh
 require_root
 require_apt_os
 
@@ -15,31 +16,7 @@ NONINTERACTIVE="${NONINTERACTIVE:-${ASSUME_YES:-0}}"
 [ "$NONINTERACTIVE" != "1" ] && ensure_tty
 
 # ---- Docker -----------------------------------------------------------------
-if ! command -v docker &>/dev/null; then
-  step "Установка Docker"
-  apt_update || true
-  apt_install curl ca-certificates || true
-  for attempt in 1 2 3; do
-    wait_for_apt_lock
-    curl -fsSL --retry 3 https://get.docker.com | sh && break
-    warn "Установка Docker не удалась (попытка ${attempt}/3), повторяю..."
-    fix_dpkg_state
-    sleep 10
-  done
-  if ! command -v docker &>/dev/null; then
-    err "Docker не установился — дальше этот скрипт работать не будет."
-    exit 1
-  fi
-fi
-systemctl enable --now docker &>/dev/null || true
-if ! docker compose version &>/dev/null; then
-  step "Установка docker compose plugin"
-  apt_install docker-compose-plugin || true
-  if ! docker compose version &>/dev/null; then
-    err "docker compose недоступен — установите docker-compose-plugin вручную."
-    exit 1
-  fi
-fi
+ensure_docker || exit 1
 
 INSTALL_DIR="/opt/remnanode"
 if [ "$NONINTERACTIVE" != "1" ]; then
@@ -187,8 +164,9 @@ else
     ok "Конфигурация изменилась (например, добавился/пропал Hysteria2 volume) — пересоздаю контейнер."
   fi
   step "Запуск remnanode"
-  docker compose pull -q || warn "docker compose pull не удался — пробую запустить с тем, что есть."
-  docker compose up -d --force-recreate || { err "docker compose up не удался, смотрите: docker compose logs"; exit 1; }
+  spin_run "Загрузка образа remnawave/node" docker compose pull || warn "pull не удался — пробую запустить с тем, что есть."
+  spin_run "Запуск контейнера remnanode" docker compose up -d --force-recreate \
+    || { err "docker compose up не удался, смотрите: docker compose logs"; exit 1; }
 fi
 
 sleep 3
@@ -203,11 +181,16 @@ step "Итоговая проверка"
 CHECK_FAIL=0
 
 # Нода слушает порт не мгновенно — даём ей до 20 секунд.
+wait_node_port() {
+  local _
+  for _ in $(seq 1 10); do
+    ss -tln 2>/dev/null | grep -qE "[:.]${NODE_PORT}[[:space:]]" && return 0
+    sleep 2
+  done
+  return 1
+}
 LISTEN_OK=0
-for _ in $(seq 1 10); do
-  if ss -tln 2>/dev/null | grep -qE "[:.]${NODE_PORT}[[:space:]]"; then LISTEN_OK=1; break; fi
-  sleep 2
-done
+spin_run "Ожидание порта ноды ${NODE_PORT}" wait_node_port 2>/dev/null && LISTEN_OK=1
 if [ "$LISTEN_OK" = "1" ]; then
   ok "Порт ноды ${NODE_PORT}: слушает"
 else

@@ -155,7 +155,6 @@ if [ -n "${LE_EMAIL:-}" ]; then
 else
   CERTBOT_ACCOUNT=(--register-unsafely-without-email)
 fi
-CERT_LOG="$(mktemp)"
 declare -A SEEN
 for d in "${ALL_DOMAINS[@]}"; do
   [ -z "$d" ] && continue
@@ -166,31 +165,15 @@ for d in "${ALL_DOMAINS[@]}"; do
   elif [ "${DNS_OK[$d]:-1}" = "0" ]; then
     warn "Пропускаю certbot для $d — DNS не указывает на этот сервер (см. выше)."
   else
-    if certbot certonly --standalone --preferred-challenges http --non-interactive --agree-tos \
-         "${CERTBOT_ACCOUNT[@]}" -d "$d" >"$CERT_LOG" 2>&1; then
-      ok "Сертификат для $d выпущен."
-    else
-      warn "certbot: не удалось выпустить для $d:"
-      tail -n 6 "$CERT_LOG" >&2
-    fi
+    spin_run "Выпуск сертификата для $d" certbot certonly --standalone --preferred-challenges http \
+      --non-interactive --agree-tos "${CERTBOT_ACCOUNT[@]}" -d "$d" \
+      || warn "certbot: сертификат для $d не выпущен (см. лог выше)."
   fi
 done
-rm -f "$CERT_LOG"
 systemctl start nginx 2>&1 || true
 
-# Хук продления. Сертификаты Hysteria2/Xray монтируются в контейнер как
-# symlink'и на конкретный файл в archive/ — после продления контейнер видит
-# старый файл, пока его не пересоздать. Без этого через ~60 дней TLS протухает.
-install -d /etc/letsencrypt/renewal-hooks/deploy
-cat > /etc/letsencrypt/renewal-hooks/deploy/dorik-reload.sh <<'HOOK'
-#!/bin/sh
-systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
-if [ -f /opt/remnanode/docker-compose.yml ] && grep -q '/etc/letsencrypt/live' /opt/remnanode/docker-compose.yml \
-   && command -v docker >/dev/null 2>&1; then
-  (cd /opt/remnanode && docker compose up -d --force-recreate) >/dev/null 2>&1 || true
-fi
-HOOK
-chmod +x /etc/letsencrypt/renewal-hooks/deploy/dorik-reload.sh
+# Хук продления (см. install_renew_hook в lib.sh): перезапуск nginx и remnanode.
+install_renew_hook
 
 # ---- nginx (self-steal, локальный decoy на 8081) --------------------------
 # ВАЖНО: Reality "ворует" сертификат у target-сервера через реальный TLS-

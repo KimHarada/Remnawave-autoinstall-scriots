@@ -4,8 +4,13 @@
 #
 #   bash <(curl -fsSL https://raw.githubusercontent.com/KimHarada/Remnawave-autoinstall-scriots/main/menu.sh)
 #
-# Параметры:  --full  сразу полная настройка (без меню)
-#             --bbr   только BBR + сетевая оптимизация
+# Параметры (запуск без меню):
+#   --full           полная настройка сервера (нода или панель)
+#   --doctor         проверка и исправление последствий старых версий
+#   --update-node    обновить ноду          --bbr   BBR + сетевая оптимизация
+#   --panel-install  установить панель      --panel-update  обновить панель
+#   --sub            страница подписки      --sub-update    обновить страницу
+#   --status         показать состояние сервера
 # Без вопросов (cloud-init):  ASSUME_YES=1 DOMAIN_TCP=... SECRET_KEY=... bash menu.sh --full
 set -uo pipefail
 
@@ -18,7 +23,7 @@ DORIK_RAW="${DORIK_RAW:-https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/
 TARBALL_URL="${DORIK_TARBALL_URL:-https://github.com/${GH_USER}/${GH_REPO}/archive/refs/heads/${GH_BRANCH}.tar.gz}"
 export DORIK_RAW
 
-die() { echo -e "\e[31m[✗]\e[0m $*" >&2; exit 1; }
+die() { echo -e "\e[31m✖\e[0m $*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Запустите от root: sudo -i, затем повторите команду."
 command -v apt-get >/dev/null 2>&1 || die "Нужна Ubuntu/Debian (apt-get не найден)."
@@ -30,19 +35,20 @@ download_repo() {
   local tmp f
   tmp="$(mktemp -d)" || return 1
   if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
-    echo "[i] Ставлю curl/tar..."
+    echo "• Ставлю curl/tar..."
     DEBIAN_FRONTEND=noninteractive apt-get update -qq -o DPkg::Lock::Timeout=120 >/dev/null 2>&1 || true
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o DPkg::Lock::Timeout=120 curl ca-certificates tar gzip >/dev/null 2>&1 || true
   fi
-  echo "[i] Скачиваю тулкит (${GH_USER}/${GH_REPO}@${GH_BRANCH})..."
+  echo "• Скачиваю тулкит (${GH_USER}/${GH_REPO}@${GH_BRANCH})..."
   if curl -fsSL --retry 3 --retry-delay 2 "$TARBALL_URL" \
      | tar -xz --strip-components=1 -C "$tmp" 2>/dev/null && [ -f "$tmp/scripts/lib.sh" ]; then
     :
   else
     # запасной путь: по одному файлу из raw
-    echo "[!] Архив не скачался — пробую по файлам."
+    echo "▲ Архив не скачался — пробую по файлам."
     rm -rf "$tmp"; tmp="$(mktemp -d)"; mkdir -p "$tmp/scripts"
-    for f in lib.sh full-setup.sh bbr-install.sh haproxy-setup.sh remnanode-setup.sh fix-ssh-access.sh; do
+    for f in lib.sh ui.sh state.sh doctor.sh full-setup.sh bbr-install.sh haproxy-setup.sh \
+             remnanode-setup.sh node-update.sh panel-install.sh fix-ssh-access.sh; do
       curl -fsSL --retry 3 "${DORIK_RAW}/scripts/${f}" -o "$tmp/scripts/${f}" || { rm -rf "$tmp"; return 1; }
     done
   fi
@@ -68,7 +74,10 @@ fi
 SCRIPT_DIR="$SCRIPTS_DIR"
 # shellcheck disable=SC1091
 source "${SCRIPTS_DIR}/lib.sh" || die "Не удалось загрузить lib.sh"
-ensure_tty
+# shellcheck disable=SC1091
+source "${SCRIPTS_DIR}/state.sh"
+# shellcheck disable=SC1091
+source "${SCRIPTS_DIR}/doctor.sh"
 
 run_script() {
   local name="${1:?script name}"; shift
@@ -81,54 +90,77 @@ run_script() {
   fi
 }
 
-banner() {
-  echo -e "${C_B}"
-  cat <<'EOF'
- ____   ___  ____  ___ _  __
-|  _ \ / _ \|  _ \|_ _| |/ /
-| | | | | | | |_) || || ' /
-| |_| | |_| |  _ < | || . \
-|____/ \___/|_| \_\___|_|\_\
-EOF
-  echo -e "${C_RESET}"
+pause() {
+  [ "${ASSUME_YES:-0}" = "1" ] && return 0
+  echo
+  read -r -p "$(echo -e "${C_DIM}Enter — вернуться в меню${C_RESET} ")" _ <"$(prompt_input)" || true
 }
 
+# ---- запуск без меню ----------------------------------------------------------
 case "${1:-}" in
-  --full) run_script "full-setup.sh"; exit $? ;;
-  --bbr)  run_script "bbr-install.sh"; exit $? ;;
+  --full)          run_script full-setup.sh; exit $? ;;
+  --bbr)           run_script bbr-install.sh; exit $? ;;
+  --doctor)        run_script doctor.sh; exit $? ;;
+  --update-node)   run_script node-update.sh; exit $? ;;
+  --panel-install) run_script panel-install.sh install; exit $? ;;
+  --panel-update)  run_script panel-install.sh update; exit $? ;;
+  --sub)           run_script panel-install.sh sub; exit $? ;;
+  --sub-update)    run_script panel-install.sh sub-update; exit $? ;;
+  --status)        banner; show_dashboard; exit 0 ;;
+  "") ;;
+  *) die "Неизвестный параметр: $1 (см. заголовок menu.sh)" ;;
 esac
 
-while true; do
-  [ "${ASSUME_YES:-0}" = "1" ] || clear
-  banner
-  echo "  1) Полная настройка (нода + защита сервера, одним шагом)"
-  echo "  2) Дополнительно (точечные операции)"
-  echo "  0) Выход"
-  echo
-  read -r -p "Выбор: " CH <"$(prompt_input)" || exit 0
+ensure_tty
 
-  case "$CH" in
-    1)
-      run_script "full-setup.sh"
-      exit $?
-      ;;
-    2)
-      clear
-      echo "Дополнительно:"
-      echo "  1) Восстановить SSH-доступ (экстренно)"
-      echo "  2) Только BBR + сетевая оптимизация"
-      echo "  3) Только Nginx+HAProxy (на уже настроенную ноду)"
-      echo "  4) Только Remnanode"
-      echo "  9) Назад"
-      read -r -p "Выбор: " CH2 <"$(prompt_input)" || exit 0
-      case "$CH2" in
-        1) run_script "fix-ssh-access.sh"; exit $? ;;
-        2) run_script "bbr-install.sh"; exit $? ;;
-        3) run_script "haproxy-setup.sh"; exit $? ;;
-        4) run_script "remnanode-setup.sh"; exit $? ;;
-        *) continue ;;
-      esac
-      ;;
-    0|*) exit 0 ;;
-  esac
-done
+main_menu() {
+  local ch
+  while true; do
+    [ "$UI_TTY" = "1" ] && clear
+    banner
+    show_dashboard
+    echo
+    box_top "Главное меню"
+    box_row "${C_B}1${C_RESET}  Полная настройка сервера ${C_DIM}(нода или панель)${C_RESET}"
+    box_row "${C_B}2${C_RESET}  Панель Remnawave ${C_DIM}· подписка · обновление${C_RESET}"
+    box_row "${C_B}3${C_RESET}  Обновить ноду"
+    box_row "${C_B}4${C_RESET}  Проверка и исправление проблем"
+    box_row "${C_B}5${C_RESET}  Дополнительно"
+    box_row "${C_B}0${C_RESET}  Выход"
+    box_bottom
+    read -r -p "$(echo -e "${C_Y}›${C_RESET} Выбор: ")" ch <"$(prompt_input)" || exit 0
+    case "$ch" in
+      1) run_script full-setup.sh; pause ;;
+      2) run_script panel-install.sh ;;
+      3) run_script node-update.sh; pause ;;
+      4) run_script doctor.sh; pause ;;
+      5) advanced_menu ;;
+      0|q|Q) exit 0 ;;
+      *) ;;
+    esac
+  done
+}
+
+advanced_menu() {
+  local ch
+  while true; do
+    echo
+    box_top "Дополнительно"
+    box_row "${C_B}1${C_RESET}  Восстановить SSH-доступ ${C_DIM}(экстренно)${C_RESET}"
+    box_row "${C_B}2${C_RESET}  Только BBR + сетевая оптимизация"
+    box_row "${C_B}3${C_RESET}  Только Nginx + HAProxy ${C_DIM}(на готовую ноду)${C_RESET}"
+    box_row "${C_B}4${C_RESET}  Только Remnanode"
+    box_row "${C_B}9${C_RESET}  Назад"
+    box_bottom
+    read -r -p "$(echo -e "${C_Y}›${C_RESET} Выбор: ")" ch <"$(prompt_input)" || return 0
+    case "$ch" in
+      1) run_script fix-ssh-access.sh; pause ;;
+      2) run_script bbr-install.sh; pause ;;
+      3) run_script haproxy-setup.sh; pause ;;
+      4) run_script remnanode-setup.sh; pause ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+main_menu

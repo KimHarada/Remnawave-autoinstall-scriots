@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# DORIK toolkit — единая точка входа для настройки сервера.
-# Сначала ставит базовые пакеты, затем собирает ВСЕ параметры один раз и
-# выполняет весь пайплайн без вопросов:
+# DORIK toolkit — полная настройка сервера (нода или сервер панели).
+# Сначала определяет, что уже установлено, и предлагает исправить последствия
+# старых версий; затем собирает ВСЕ параметры один раз и выполняет пайплайн без
+# вопросов. После каждого этапа — проверка результата:
 #   обновление пакетов -> SSH -> firewall/fail2ban -> (нода: nginx+haproxy+bbr+remnanode)
 #
 # Без вопросов (cloud-init): ASSUME_YES=1 и параметры в переменных окружения,
@@ -14,21 +15,31 @@ RAW="${DORIK_RAW:-https://raw.githubusercontent.com/KimHarada/Remnawave-autoinst
 source "${SCRIPT_DIR}/lib.sh" 2>/dev/null || {
   LIBTMP="$(mktemp)"; curl -fsSL --retry 3 "${RAW}/scripts/lib.sh" -o "$LIBTMP" && source "$LIBTMP"
 } || { echo "Не удалось загрузить lib.sh" >&2; exit 1; }
+_dorik_source state.sh
+_dorik_source doctor.sh
 
 require_root
 require_apt_os
 ensure_tty
 
-echo -e "${C_B}=========================================================${C_RESET}"
-echo -e "${C_B}  DORIK — единая настройка сервера${C_RESET}"
-echo -e "${C_B}  Сейчас зададим все вопросы, потом всё пройдёт само,${C_RESET}"
-echo -e "${C_B}  без остановок и конфликтов.${C_RESET}"
-echo -e "${C_B}=========================================================${C_RESET}"
+banner
+box_top "Полная настройка сервера"
+box_row "Сначала посмотрим, что уже установлено, затем зададим все"
+box_row "вопросы ОДИН раз — после этого всё пройдёт само."
+box_row "${C_DIM}Подробный лог: ${DORIK_LOG}${C_RESET}"
+box_bottom
 
 # ---------------------------------------------------------------------------
 # ШАГ 0. Базовые пакеты (нужны уже для вопросов: dig, curl, ufw, cron)
 # ---------------------------------------------------------------------------
 ensure_base_packages || warn "Базовые пакеты установились не полностью — часть проверок может не работать."
+
+# ---------------------------------------------------------------------------
+# ШАГ 0.5. Что уже есть на сервере + исправление последствий старых версий
+# ---------------------------------------------------------------------------
+step "Что уже установлено"
+show_dashboard
+doctor_run || true
 
 # ---------------------------------------------------------------------------
 # ШАГ 1. Сбор параметров (никаких вопросов после этого блока)
@@ -41,6 +52,7 @@ echo "  2) Только сервер панели (жёсткий firewall: SSH+
 ROLE=$(ask_valid "Выбор" "${ROLE:-1}" is_valid_choice12) || exit 1
 
 CUR_SSH_PORT=$(get_real_ssh_port)
+CUR_SSH_PORT=${CUR_SSH_PORT:-$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')}
 CUR_SSH_PORT=${CUR_SSH_PORT:-22}
 info "Текущий SSH порт: ${CUR_SSH_PORT}"
 NEW_SSH_PORT=$(ask_valid "Новый SSH порт (Enter — оставить как есть)" "${NEW_SSH_PORT:-$CUR_SSH_PORT}" is_valid_port) || exit 1
@@ -99,8 +111,8 @@ if [ "$ROLE" = "1" ]; then
 
   # SECRET_KEY: если нода уже ставилась, ключ можно не вводить заново.
   OLD_KEY=""
-  [ -f /opt/remnanode/docker-compose.yml ] && \
-    OLD_KEY=$(grep -oE 'SECRET_KEY=.*' /opt/remnanode/docker-compose.yml | head -1 | sed 's/SECRET_KEY=//')
+  [ -f "$NODE_DIR/docker-compose.yml" ] && \
+    OLD_KEY=$(grep -oE 'SECRET_KEY=.*' "$NODE_DIR/docker-compose.yml" | head -1 | sed 's/SECRET_KEY=//')
   while true; do
     if [ -n "$OLD_KEY" ]; then
       SECRET_KEY=$(ask_value "SECRET_KEY ноды (Enter — оставить текущий)" "${SECRET_KEY:-}")
@@ -114,7 +126,7 @@ if [ "$ROLE" = "1" ]; then
     [ "${ASSUME_YES:-0}" = "1" ] && exit 1
   done
 else
-  USE_HY2=0; USE_BBR=0; OPEN_NODE_PORT=0
+  USE_HY2=0; USE_BBR=0; OPEN_NODE_PORT=0; NODE_PORT=""
   PANEL_IP=$(ask_valid "IP панели (если нужно ограничить доступ, Enter — пропустить)" "${PANEL_IP:-}" is_valid_ip 1) || exit 1
 fi
 
@@ -134,25 +146,45 @@ if ! ask_yes_no "Начать выполнение сейчас?" "1"; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Пайплайн: этапы с общим прогрессом и проверкой результата
+# ---------------------------------------------------------------------------
 FAIL_LOG=()
+STEP_NO=0
+if [ "$ROLE" = "1" ]; then
+  TOTAL_STEPS=5; [ "$USE_BBR" = "1" ] && TOTAL_STEPS=6
+else
+  TOTAL_STEPS=3
+fi
+
+# run_step "Название" функция_этапа [функция_проверки]
 run_step() {
-  local title="${1:-step}"; shift
-  step "$title"
-  if "$@"; then
-    ok "$title — готово"
+  local title="${1:-step}" fn="$2" vfn="${3:-}" failed=0
+  STEP_NO=$((STEP_NO+1))
+  step_n "$STEP_NO" "$TOTAL_STEPS" "$title"
+  export DORIK_NESTED=1
+  "$fn" || failed=1
+  export DORIK_NESTED=0
+  if [ -n "$vfn" ]; then
+    echo -e "  ${C_DIM}── проверка результата ──${C_RESET}"
+    "$vfn" || failed=1
+  fi
+  if [ "$failed" -eq 0 ]; then
+    ok "${C_BOLD}${title}${C_RESET} — выполнено и проверено"
   else
-    err "$title — ОШИБКА (продолжаю дальше, см. итог в конце)"
+    err "${title} — ОШИБКА (продолжаю дальше, см. итог в конце)"
     FAIL_LOG+=("$title")
   fi
 }
 
 # ---------------------------------------------------------------------------
-# ШАГ A. Обновление пакетов
+# ЭТАП. Обновление пакетов
 # ---------------------------------------------------------------------------
-run_step "Обновление пакетов" apt_upgrade_smart
+do_apt() { apt_upgrade_smart; }
+run_step "Обновление пакетов" do_apt verify_apt
 
 # ---------------------------------------------------------------------------
-# ШАГ B. SSH (безопасная миграция порта)
+# ЭТАП. SSH (безопасная миграция порта) + firewall + fail2ban + таймзона + ребут
 # ---------------------------------------------------------------------------
 do_ssh_harden() {
   if [ "${NEW_SSH_PORT}" = "${CUR_SSH_PORT}" ]; then
@@ -176,11 +208,7 @@ do_ssh_harden() {
     return 1
   fi
 }
-run_step "Настройка SSH" do_ssh_harden
 
-# ---------------------------------------------------------------------------
-# ШАГ C. Firewall + fail2ban + таймзона + ребут по расписанию
-# ---------------------------------------------------------------------------
 do_protect_common() {
   local rc=0
   if ! command -v ufw &>/dev/null; then
@@ -252,7 +280,15 @@ EOF
   fi
   return $rc
 }
-run_step "Firewall/fail2ban/таймзона/ребут" do_protect_common
+
+do_ssh_and_protect() { do_ssh_harden; local a=$?; do_protect_common; local b=$?; return $((a|b)); }
+vf_ssh_and_protect() {
+  local rc=0
+  verify_ssh "$NEW_SSH_PORT" || rc=1
+  verify_firewall "$NEW_SSH_PORT" "$ROLE" "$USE_HY2" "$([ "$OPEN_NODE_PORT" = "1" ] && echo "$NODE_PORT")" "$ENABLE_REBOOT" || rc=1
+  return $rc
+}
+run_step "SSH, firewall, fail2ban, расписание" do_ssh_and_protect vf_ssh_and_protect
 
 # ---------------------------------------------------------------------------
 # Дальше — только для роли "нода"
@@ -265,7 +301,7 @@ if [ "$ROLE" = "1" ]; then
     DOMAIN_HY2="$DOMAIN_HY2" USE_HY2="$USE_HY2" INSTALL_DECOY="$INSTALL_DECOY" \
     NONINTERACTIVE=1 bash "$src"
   }
-  run_step "Nginx (self-steal) + HAProxy + Certbot" do_nginx_haproxy
+  run_step "Nginx (self-steal) + HAProxy + сертификаты" do_nginx_haproxy
 
   if [ "$USE_BBR" = "1" ]; then
     do_bbr() {
@@ -280,7 +316,7 @@ if [ "$ROLE" = "1" ]; then
     NODE_PORT="$NODE_PORT" USE_HY2="$USE_HY2" SECRET_KEY="$SECRET_KEY" \
       DOMAIN_HY2="$DOMAIN_HY2" NONINTERACTIVE=1 bash "$src"
   }
-  run_step "Установка Remnanode (+ автопривязка Hysteria2 volume)" do_remnanode
+  run_step "Remnanode (Docker + Hysteria2)" do_remnanode
 
 fi
 
@@ -289,24 +325,31 @@ fi
 # ---------------------------------------------------------------------------
 # Промежуточные шаги (apt install nginx/haproxy/certbot, docker install)
 # тоже дёргают apt — перепроверяем SSH ещё раз в самом конце.
-run_step "Финальная проверка SSH" ssh_selfheal "${NEW_SSH_PORT}"
+do_final_ssh() { ssh_selfheal "${NEW_SSH_PORT}"; }
+run_step "Финальная проверка SSH" do_final_ssh
 
 # ---------------------------------------------------------------------------
 # Итог
 # ---------------------------------------------------------------------------
 echo
-echo -e "${C_B}=========================================================${C_RESET}"
 if [ "${#FAIL_LOG[@]}" -eq 0 ]; then
-  ok "Готово. Все шаги выполнены без ошибок."
+  box_top "Готово"
+  box_row "${C_G}✔${C_RESET} Все этапы выполнены и проверены без ошибок."
 else
-  warn "Готово, но с ошибками на шагах:"
-  for f in "${FAIL_LOG[@]}"; do echo "   - $f" >&2; done
-  warn "Проверьте вывод выше по этим шагам. Скрипт можно запустить повторно — он идемпотентен."
+  box_top "Готово, но есть замечания"
+  for f in "${FAIL_LOG[@]}"; do box_row "${C_R}✖${C_RESET} ${f}"; done
+  box_row "${C_DIM}Скрипт идемпотентен — можно запустить повторно.${C_RESET}"
 fi
-echo -e "SSH порт: ${NEW_SSH_PORT}"
+box_sep
+box_row "SSH-порт:        ${C_BOLD}${NEW_SSH_PORT}${C_RESET}"
+if [ "$ROLE" = "1" ]; then
+  box_row "Нода:            ${DOMAIN_TCP}${DOMAIN_GRPC:+, ${DOMAIN_GRPC}}"
+  box_wrap "${C_DIM}→${C_RESET}" "Дальше: в панели Remnawave добавьте ноду (адрес сервера, порт ${NODE_PORT})."
+fi
 if [ -f /var/run/reboot-required ]; then
-  warn "Нужна перезагрузка для применения обновлений ядра: reboot"
+  box_row "${C_Y}▲ Нужна перезагрузка для обновлений ядра: reboot${C_RESET}"
 fi
-echo -e "${C_B}=========================================================${C_RESET}"
+box_row "${C_DIM}Лог: ${DORIK_LOG}${C_RESET}"
+box_bottom
 
 [ "${#FAIL_LOG[@]}" -eq 0 ]
