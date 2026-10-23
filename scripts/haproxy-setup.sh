@@ -4,32 +4,46 @@
 # (вызов из full-setup.sh), вопросов не задаём.
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RAW="${DORIK_RAW:-https://raw.githubusercontent.com/KimHarada/Remnawave-autoinstall-scriots/main}"
 source "${SCRIPT_DIR}/lib.sh" 2>/dev/null || {
-  RAW="https://raw.githubusercontent.com/KimHarada/Remnawave-autoinstall-scriots/main"
-  t=$(mktemp); curl -fsSL "${RAW}/scripts/lib.sh" -o "$t"; source "$t"
-}
+  t=$(mktemp); curl -fsSL --retry 3 "${RAW}/scripts/lib.sh" -o "$t" && source "$t"
+} || { echo "Не удалось загрузить lib.sh" >&2; exit 1; }
 require_root
+require_apt_os
 
-NONINTERACTIVE="${NONINTERACTIVE:-0}"
+NONINTERACTIVE="${NONINTERACTIVE:-${ASSUME_YES:-0}}"
 
 if [ "$NONINTERACTIVE" != "1" ]; then
-  DOMAIN_TCP=$(ask_value "Домен для VLESS REALITY TCP" "")
-  DOMAIN_GRPC=$(ask_value "Домен для VLESS gRPC" "")
-  DOMAIN_XHTTP=$(ask_value "Домен для VLESS XHTTP" "")
-  DOMAIN_HY2=$(ask_value "Домен для Hysteria2" "")
-  if ask_yes_no "Использовать Hysteria2?" "1"; then USE_HY2=1; else USE_HY2=0; fi
+  ensure_tty
+  DOMAIN_TCP=$(ask_valid "Домен для VLESS REALITY TCP (обязателен)" "${DOMAIN_TCP:-}" is_valid_domain) || exit 1
+  DOMAIN_GRPC=$(ask_valid "Домен для VLESS gRPC (Enter — не использовать)" "${DOMAIN_GRPC:-}" is_valid_domain 1) || exit 1
+  DOMAIN_XHTTP=$(ask_valid "Домен для VLESS XHTTP (Enter — не использовать)" "${DOMAIN_XHTTP:-}" is_valid_domain 1) || exit 1
+  DOMAIN_HY2=$(ask_valid "Домен для Hysteria2 (Enter — не использовать)" "${DOMAIN_HY2:-}" is_valid_domain 1) || exit 1
+  USE_HY2=0
+  if [ -n "$DOMAIN_HY2" ] && ask_yes_no "Использовать Hysteria2?" "1"; then USE_HY2=1; fi
   if ask_yes_no "Ставить страницу-заглушку (decoy) для self-steal?" "1"; then INSTALL_DECOY=1; else INSTALL_DECOY=0; fi
 else
   INSTALL_DECOY="${INSTALL_DECOY:-1}"
+  DOMAIN_TCP="${DOMAIN_TCP:-}"; DOMAIN_GRPC="${DOMAIN_GRPC:-}"
+  DOMAIN_XHTTP="${DOMAIN_XHTTP:-}"; DOMAIN_HY2="${DOMAIN_HY2:-}"
+  USE_HY2="${USE_HY2:-0}"
+fi
+DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"
+
+if [ -z "$DOMAIN_TCP" ]; then
+  err "DOMAIN_TCP не задан — это домен по умолчанию для HAProxy (REALITY TCP)."
+  exit 1
 fi
 
 DECOY_ROOT="/var/www/decoy"
+ALL_DOMAINS=("$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2")
 
 step "Установка Nginx / HAProxy / Certbot"
-wait_for_apt_lock
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx haproxy certbot unzip dnsutils 2>&1 | tail -5 || true
-if ! command -v nginx &>/dev/null || ! command -v certbot &>/dev/null; then
-  err "nginx/haproxy/certbot не установились (apt всё ещё занят или недоступен) — дальше этот шаг работать не будет. Проверьте: apt-get update; apt-get install nginx haproxy certbot unzip dnsutils"
+apt_update || warn "apt update не удался — ставлю из имеющихся списков."
+apt_install nginx haproxy certbot unzip dnsutils curl openssl
+if ! command -v nginx &>/dev/null || ! command -v certbot &>/dev/null || ! command -v haproxy &>/dev/null; then
+  err "nginx/haproxy/certbot не установились — дальше этот шаг работать не будет. Проверьте: apt-get update; apt-get install nginx haproxy certbot unzip dnsutils"
+  exit 1
 fi
 
 confirm_overwrite() {
@@ -46,34 +60,32 @@ confirm_overwrite() {
 step "Страница-заглушка"
 mkdir -p "$DECOY_ROOT"
 DECOY_MARKER="${DECOY_ROOT}/.dorik-installed"
-if [ "${INSTALL_DECOY:-1}" != "1" ]; then
-  warn "Установка decoy-страницы отключена по выбору — self-steal будет отдавать только базовую пустую страницу."
-  [ -f "${DECOY_ROOT}/index.html" ] || cat > "${DECOY_ROOT}/index.html" <<'HTML'
+write_basic_decoy() {
+  cat > "${DECOY_ROOT}/index.html" <<'HTML'
 <!DOCTYPE html><html><head><title>It works</title></head>
 <body><h1>It works!</h1></body></html>
 HTML
+}
+if [ "${INSTALL_DECOY:-1}" != "1" ]; then
+  warn "Установка decoy-страницы отключена по выбору — self-steal будет отдавать только базовую пустую страницу."
+  [ -f "${DECOY_ROOT}/index.html" ] || write_basic_decoy
 elif [ -f "$DECOY_MARKER" ] && [ -f "${DECOY_ROOT}/index.html" ] && [ "$NONINTERACTIVE" = "1" ]; then
   ok "Заглушка уже установлена ($(cat "$DECOY_MARKER")) — повторная загрузка не нужна, пропускаю."
 elif [ ! -f "${DECOY_ROOT}/index.html" ] || confirm_overwrite "${DECOY_ROOT}/index.html"; then
-  MANIFEST_URL="https://raw.githubusercontent.com/KimHarada/Remnawave-autoinstall-scriots/main/decoys/manifest.txt"
+  WORK="$(mktemp -d)"
   PICK=""
   DECOY_INSTALLED=0
-  if curl -fsSL "$MANIFEST_URL" -o /tmp/decoy_manifest.txt 2>/dev/null && [ -s /tmp/decoy_manifest.txt ]; then
+  if curl -fsSL --retry 3 "${RAW}/decoys/manifest.txt" -o "$WORK/manifest.txt" 2>/dev/null && [ -s "$WORK/manifest.txt" ]; then
     # tr убирает \r (Windows-перевод строки) и пробелы — иначе имя файла
     # получается с мусором на конце и curl за zip-архивом падает с 404.
-    PICK=$(head -1 /tmp/decoy_manifest.txt | tr -d '\r' | xargs)
-  fi
-  if ! command -v unzip &>/dev/null; then
-    warn "unzip не установлен — ставлю."
-    wait_for_apt_lock
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unzip 2>&1 | tail -3 || true
+    PICK=$(head -1 "$WORK/manifest.txt" | tr -d '\r' | xargs)
   fi
   if [ -n "$PICK" ]; then
-    ZIP_URL="https://raw.githubusercontent.com/KimHarada/Remnawave-autoinstall-scriots/main/decoys/${PICK}"
-    if curl -fsSL "$ZIP_URL" -o /tmp/decoy.zip 2>/dev/null && [ -s /tmp/decoy.zip ]; then
-      rm -rf /tmp/decoy_unzip && mkdir -p /tmp/decoy_unzip
-      if unzip -oq /tmp/decoy.zip -d /tmp/decoy_unzip 2>/tmp/decoy_unzip_err.log; then
-        SRC_DIR="/tmp/decoy_unzip"
+    ZIP_URL="${RAW}/decoys/${PICK}"
+    if curl -fsSL --retry 3 "$ZIP_URL" -o "$WORK/decoy.zip" 2>/dev/null && [ -s "$WORK/decoy.zip" ]; then
+      mkdir -p "$WORK/unzip"
+      if unzip -oq "$WORK/decoy.zip" -d "$WORK/unzip" 2>"$WORK/unzip_err.log"; then
+        SRC_DIR="$WORK/unzip"
         # если внутри один каталог — используем его
         if [ "$(find "$SRC_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)" = "1" ] && \
            [ "$(find "$SRC_DIR" -mindepth 1 -maxdepth 1 | wc -l)" = "1" ]; then
@@ -88,7 +100,7 @@ elif [ ! -f "${DECOY_ROOT}/index.html" ] || confirm_overwrite "${DECOY_ROOT}/ind
           warn "Архив ${PICK} распаковался пустым."
         fi
       else
-        warn "Не удалось распаковать ${PICK}: $(cat /tmp/decoy_unzip_err.log 2>/dev/null | head -1)"
+        warn "Не удалось распаковать ${PICK}: $(head -1 "$WORK/unzip_err.log" 2>/dev/null)"
       fi
     else
       warn "Не удалось скачать ${ZIP_URL} (проверьте, что файл ещё есть в decoys/ репозитория)."
@@ -96,26 +108,24 @@ elif [ ! -f "${DECOY_ROOT}/index.html" ] || confirm_overwrite "${DECOY_ROOT}/ind
   else
     warn "manifest.txt пуст или недоступен — decoys/ в репозитории может быть пустой."
   fi
+  rm -rf "$WORK"
   if [ "$DECOY_INSTALLED" != "1" ] && [ ! -f "${DECOY_ROOT}/index.html" ]; then
-    cat > "${DECOY_ROOT}/index.html" <<'HTML'
-<!DOCTYPE html><html><head><title>It works</title></head>
-<body><h1>It works!</h1></body></html>
-HTML
+    write_basic_decoy
     warn "Не удалось скачать заглушку из репозитория, поставлена базовая."
   fi
 fi
 
 # ---- DNS preflight ---------------------------------------------------------
 # Certbot проваливается с невнятной ошибкой, если домен ещё не смотрит на
-# этот сервер. Проверяем заранее и явно говорим, если DNS не тот — иначе
-# уходит попытка в лимит Let's Encrypt (5 неудач/час на домен) без пользы.
+# этот сервер. Проверяем заранее — иначе попытка уходит в лимит Let's Encrypt
+# (5 неудач/час на домен) без пользы.
 step "Проверка DNS перед выпуском сертификатов"
 PUB_IP="$(get_public_ip)"
 if [ -z "$PUB_IP" ]; then
   warn "Не удалось определить публичный IP сервера — DNS-проверку пропускаю."
 fi
 declare -A DNS_OK
-for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2"; do
+for d in "${ALL_DOMAINS[@]}"; do
   [ -z "$d" ] && continue
   if [ -n "$PUB_IP" ] && ! dns_points_here "$d" "$PUB_IP"; then
     RESOLVED=$(dig +short A "$d" 2>/dev/null | tail -1)
@@ -132,17 +142,49 @@ ufw allow 80/tcp &>/dev/null || true
 # certbot --standalone сам слушает 80-й порт, поэтому nginx на это время
 # нужно остановить, иначе "port 80 already in use".
 systemctl stop nginx 2>&1 || true
-for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2"; do
+# LE_EMAIL — необязательный адрес для уведомлений об истечении. Без него
+# регистрируемся без email (раньше подставлялся несуществующий admin@домен).
+if [ -n "${LE_EMAIL:-}" ]; then
+  CERTBOT_ACCOUNT=(-m "$LE_EMAIL")
+else
+  CERTBOT_ACCOUNT=(--register-unsafely-without-email)
+fi
+CERT_LOG="$(mktemp)"
+declare -A SEEN
+for d in "${ALL_DOMAINS[@]}"; do
   [ -z "$d" ] && continue
+  [ -n "${SEEN[$d]:-}" ] && continue
+  SEEN[$d]=1
   if cert_is_valid "$d"; then
     ok "Сертификат для $d уже есть и валиден — пропускаю."
   elif [ "${DNS_OK[$d]:-1}" = "0" ]; then
     warn "Пропускаю certbot для $d — DNS не указывает на этот сервер (см. выше)."
   else
-    certbot certonly --standalone --non-interactive --agree-tos -m admin@"${d}" -d "$d" 2>&1 | tail -5 || warn "certbot: не удалось выпустить для $d"
+    if certbot certonly --standalone --preferred-challenges http --non-interactive --agree-tos \
+         "${CERTBOT_ACCOUNT[@]}" -d "$d" >"$CERT_LOG" 2>&1; then
+      ok "Сертификат для $d выпущен."
+    else
+      warn "certbot: не удалось выпустить для $d:"
+      tail -n 6 "$CERT_LOG" >&2
+    fi
   fi
 done
+rm -f "$CERT_LOG"
 systemctl start nginx 2>&1 || true
+
+# Хук продления. Сертификаты Hysteria2/Xray монтируются в контейнер как
+# symlink'и на конкретный файл в archive/ — после продления контейнер видит
+# старый файл, пока его не пересоздать. Без этого через ~60 дней TLS протухает.
+install -d /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/dorik-reload.sh <<'HOOK'
+#!/bin/sh
+systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+if [ -f /opt/remnanode/docker-compose.yml ] && grep -q '/etc/letsencrypt/live' /opt/remnanode/docker-compose.yml \
+   && command -v docker >/dev/null 2>&1; then
+  (cd /opt/remnanode && docker compose up -d --force-recreate) >/dev/null 2>&1 || true
+fi
+HOOK
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/dorik-reload.sh
 
 # ---- nginx (self-steal, локальный decoy на 8081) --------------------------
 # ВАЖНО: Reality "ворует" сертификат у target-сервера через реальный TLS-
@@ -153,7 +195,7 @@ step "Настройка Nginx (self-steal)"
 STEAL_CERT_DOMAIN=""
 for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP"; do
   [ -z "$d" ] && continue
-  if [ -d "/etc/letsencrypt/live/${d}" ]; then STEAL_CERT_DOMAIN="$d"; break; fi
+  if cert_is_valid "$d"; then STEAL_CERT_DOMAIN="$d"; break; fi
 done
 
 if [ -z "$STEAL_CERT_DOMAIN" ]; then
@@ -162,6 +204,7 @@ if [ -z "$STEAL_CERT_DOMAIN" ]; then
 server {
     listen 127.0.0.1:8081;
     server_name _;
+    server_tokens off;
     root ${DECOY_ROOT};
     index index.html;
     location / { try_files \$uri \$uri/ =404; }
@@ -173,6 +216,7 @@ else
 server {
     listen 127.0.0.1:8081 ssl;
     server_name ${STEAL_CERT_DOMAIN};
+    server_tokens off;
     ssl_certificate /etc/letsencrypt/live/${STEAL_CERT_DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${STEAL_CERT_DOMAIN}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -187,23 +231,32 @@ rm -f /etc/nginx/sites-enabled/default
 sed -i 's/worker_connections .*/worker_connections 16384;/' /etc/nginx/nginx.conf || true
 grep -q "large_client_header_buffers" /etc/nginx/nginx.conf || \
   sed -i '/http {/a \    large_client_header_buffers 8 64k;' /etc/nginx/nginx.conf
-nginx -t 2>&1 || { err "Ошибка конфигурации nginx"; exit 1; }
+if ! nginx -t 2>&1; then
+  err "Ошибка конфигурации nginx"
+  exit 1
+fi
+systemctl enable nginx &>/dev/null || true
 systemctl restart nginx
 ok "Nginx настроен."
 
 # ---- haproxy (SNI passthrough) --------------------------------------------
+# Конфиг пишем во временный файл, проверяем, и только потом ставим на место
+# (со старой копией рядом) — раньше он перезаписывался ДО проверки.
+# ACL и backend'ы создаются только для заданных доменов: пустой домен давал
+# невалидное `req.ssl_sni -i ` и HAProxy не стартовал.
 step "Настройка HAProxy"
-HY2_LINE=""
-[ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ] && HY2_LINE="# Hysteria2 обслуживается напрямую Xray на 443/udp"
-
-cat > /etc/haproxy/haproxy.cfg <<EOF
+HAP_NEW="$(mktemp)"
+{
+cat <<'EOF'
 global
     log /dev/log local0
-    maxconn 8192
+    maxconn 16384
 
 defaults
     log global
     mode tcp
+    option clitcpka
+    option srvtcpka
     timeout connect 5s
     timeout client 1h
     timeout server 1h
@@ -212,34 +265,53 @@ frontend fe_443
     bind *:443
     tcp-request inspect-delay 5s
     tcp-request content accept if { req.ssl_hello_type 1 }
-    use_backend be_grpc if { req.ssl_sni -i ${DOMAIN_GRPC} }
-    use_backend be_xhttp if { req.ssl_sni -i ${DOMAIN_XHTTP} }
+EOF
+[ -n "$DOMAIN_GRPC" ]  && [ "$DOMAIN_GRPC"  != "$DOMAIN_TCP" ] && echo "    use_backend be_grpc if { req.ssl_sni -i ${DOMAIN_GRPC} }"
+[ -n "$DOMAIN_XHTTP" ] && [ "$DOMAIN_XHTTP" != "$DOMAIN_TCP" ] && echo "    use_backend be_xhttp if { req.ssl_sni -i ${DOMAIN_XHTTP} }"
+cat <<'EOF'
     default_backend be_tcp
 
 backend be_tcp
     server tcp1 127.0.0.1:56789
-
-backend be_grpc
-    server grpc1 127.0.0.1:56790
-
-backend be_xhttp
-    server xhttp1 127.0.0.1:56791
 EOF
+if [ -n "$DOMAIN_GRPC" ] && [ "$DOMAIN_GRPC" != "$DOMAIN_TCP" ]; then
+  printf '\nbackend be_grpc\n    server grpc1 127.0.0.1:56790\n'
+fi
+if [ -n "$DOMAIN_XHTTP" ] && [ "$DOMAIN_XHTTP" != "$DOMAIN_TCP" ]; then
+  printf '\nbackend be_xhttp\n    server xhttp1 127.0.0.1:56791\n'
+fi
+if [ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ]; then
+  printf '\n# Hysteria2 обслуживается напрямую Xray на 443/udp, HAProxy его не касается\n'
+fi
+} > "$HAP_NEW"
 
-if haproxy -c -f /etc/haproxy/haproxy.cfg &>/dev/null; then
+if haproxy -c -f "$HAP_NEW" >/tmp/dorik_haproxy_check 2>&1; then
+  [ -f /etc/haproxy/haproxy.cfg ] && cp -f /etc/haproxy/haproxy.cfg "/etc/haproxy/haproxy.cfg.bak.$(date +%s)"
+  install -m 644 "$HAP_NEW" /etc/haproxy/haproxy.cfg
+  systemctl enable haproxy &>/dev/null || true
   systemctl restart haproxy
   ok "HAProxy настроен и перезапущен."
 else
-  err "Ошибка конфигурации HAProxy, старая конфигурация сохранена."
+  err "Новый конфиг HAProxy не прошёл проверку, старый оставлен без изменений:"
+  head -n 10 /tmp/dorik_haproxy_check >&2
 fi
+rm -f "$HAP_NEW"
 
 # ---- certbot автопродление --------------------------------------------------
+# Пакет certbot уже приносит certbot.timer; отдельная запись в crontab root
+# (как делали раньше) только дублировала его — убираем.
 systemctl enable --now certbot.timer &>/dev/null || true
-( crontab -l 2>/dev/null | grep -v 'certbot renew' ; echo "0 3 * * * /usr/bin/certbot renew --quiet" ) | crontab -
+if command -v crontab &>/dev/null && crontab -l 2>/dev/null | grep -q 'certbot renew'; then
+  crontab -l 2>/dev/null | grep -v 'certbot renew' | crontab - || true
+fi
+if ! systemctl is-enabled --quiet certbot.timer 2>/dev/null && [ ! -f /etc/cron.d/certbot ]; then
+  echo "0 3 * * * root /usr/bin/certbot renew --quiet" > /etc/cron.d/dorik-certbot
+  chmod 644 /etc/cron.d/dorik-certbot
+fi
 
 # ---- итоговая самопроверка -------------------------------------------------
-# Именно эти три вещи ломались раньше молча — теперь явно печатаем pass/fail,
-# чтобы при повторном запуске сразу было видно, что реально не работает.
+# Явно печатаем pass/fail, чтобы при повторном запуске сразу было видно,
+# что реально не работает.
 step "Итоговая проверка"
 CHECK_FAIL=0
 
@@ -247,14 +319,17 @@ if systemctl is-active --quiet nginx; then ok "nginx: активен"; else err 
 if systemctl is-active --quiet haproxy; then ok "haproxy: активен"; else err "haproxy: НЕ активен"; CHECK_FAIL=1; fi
 
 DECOY_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "https://127.0.0.1:8081" 2>/dev/null || echo "000")
+if [ -z "$STEAL_CERT_DOMAIN" ]; then
+  DECOY_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:8081" 2>/dev/null || echo "000")
+fi
 if [ "$DECOY_CODE" = "200" ]; then
-  ok "decoy (TLS self-steal, 127.0.0.1:8081): отвечает 200"
+  ok "decoy (self-steal, 127.0.0.1:8081): отвечает 200"
 else
-  err "decoy (TLS self-steal, 127.0.0.1:8081): код ${DECOY_CODE} (ожидался 200) — Reality fallback не будет работать корректно"
+  err "decoy (self-steal, 127.0.0.1:8081): код ${DECOY_CODE} (ожидался 200) — Reality fallback не будет работать корректно"
   CHECK_FAIL=1
 fi
 
-for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2"; do
+for d in "${ALL_DOMAINS[@]}"; do
   [ -z "$d" ] && continue
   if cert_is_valid "$d"; then
     ok "сертификат ${d}: валиден"
@@ -266,6 +341,7 @@ done
 
 if [ "$CHECK_FAIL" = "1" ]; then
   warn "haproxy-setup.sh завершён С ПРЕДУПРЕЖДЕНИЯМИ — см. пункты выше с [✗]."
+  exit 1
 else
   ok "haproxy-setup.sh завершён, все проверки пройдены."
 fi

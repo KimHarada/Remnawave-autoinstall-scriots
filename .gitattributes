@@ -1,0 +1,6 @@
+# Скрипты запускаются на Linux — окончания строк только LF, иначе bash падает
+# на "\r: command not found", даже если файл правили на Windows.
+*.sh  text eol=lf
+*.txt text eol=lf
+*.md  text eol=lf
+*.zip binary
