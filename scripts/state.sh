@@ -88,10 +88,17 @@ st_web() {
   svc_exists haproxy && h=1
   if [ "$n$h" = "00" ]; then _st off "не установлены"; return; fi
   if { [ "$n" = 0 ] || svc_active nginx; } && { [ "$h" = 0 ] || svc_active haproxy; }; then
-    local decoy="" names=""
+    local decoy="" names="" total uniq
     [ "$n" = 1 ] && names="nginx"
     [ "$h" = 1 ] && names="${names:+$names + }haproxy"
-    [ -f /var/www/decoy/.dorik-installed ] && decoy=" · заглушка: $(sed 's/\.zip$//' /var/www/decoy/.dorik-installed)"
+    if [ -s /etc/dorik/decoys.conf ]; then
+      total="$(wc -l < /etc/dorik/decoys.conf)"
+      uniq="$(cut -d'|' -f4 /etc/dorik/decoys.conf | sort -u | wc -l)"
+      if [ "$total" -gt 1 ] && [ "$uniq" -lt "$total" ]; then decoy=" · заглушки: есть одинаковые!"
+      else decoy=" · заглушек: ${total}$([ "$total" -gt 1 ] && echo " (разные)")"; fi
+    elif [ -f /var/www/decoy/.dorik-installed ]; then
+      decoy=" · одна общая заглушка (старый формат)"
+    fi
     _st ok "${names}${decoy}"
   else
     _st bad "служба остановлена (nginx/haproxy)"

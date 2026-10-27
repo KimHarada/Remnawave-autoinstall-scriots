@@ -48,7 +48,7 @@ download_repo() {
     # запасной путь: по одному файлу из raw
     echo "▲ Архив не скачался — пробую по файлам."
     rm -rf "$tmp"; tmp="$(mktemp -d)"; mkdir -p "$tmp/scripts"
-    for f in lib.sh ui.sh state.sh harden.sh doctor.sh preflight.sh full-setup.sh bbr-install.sh haproxy-setup.sh \
+    for f in lib.sh ui.sh state.sh harden.sh decoys.sh doctor.sh preflight.sh full-setup.sh bbr-install.sh haproxy-setup.sh \
              remnanode-setup.sh node-update.sh panel-install.sh fix-ssh-access.sh; do
       curl -fsSL --retry 3 "${DORIK_RAW}/scripts/${f}" -o "$tmp/scripts/${f}" || { rm -rf "$tmp"; return 1; }
     done

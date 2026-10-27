@@ -110,11 +110,16 @@ doctor_scan() {
   if have haproxy && [ -f /etc/haproxy/haproxy.cfg ] && ! haproxy -c -f /etc/haproxy/haproxy.cfg &>/dev/null; then
     _issue haproxy_cfg "конфиг HAProxy невалиден — перенастройте через «Только Nginx+HAProxy»"
   fi
-  if [ -e /etc/nginx/sites-enabled/default ] && [ -e /etc/nginx/sites-enabled/decoy ]; then
+  if [ -e /etc/nginx/sites-enabled/default ] && { [ -e /etc/nginx/sites-enabled/decoy ] || compgen -G "/etc/nginx/sites-enabled/decoy-*" >/dev/null; }; then
     _issue nginx_default "включён стандартный сайт nginx — занимает порт 80 и мешает выпуску сертификатов"
   fi
+  # Старый формат: одна заглушка на все протоколы (чужой сертификат на gRPC/XHTTP-доменах, одинаковые страницы)
+  if [ -e /etc/nginx/sites-enabled/decoy ] && [ ! -s /etc/dorik/decoys.conf ]; then
+    _issue decoy_legacy "одна общая заглушка на все протоколы (старый формат) — нужна отдельная и разная для каждого"
+  fi
   # Настроенные, но остановленные службы: нода/панель без них недоступны.
-  if [ -e /etc/nginx/sites-enabled/decoy ] || compgen -G "/etc/nginx/sites-enabled/remnawave-*" >/dev/null; then
+  if [ -e /etc/nginx/sites-enabled/decoy ] || compgen -G "/etc/nginx/sites-enabled/decoy-*" >/dev/null \
+     || compgen -G "/etc/nginx/sites-enabled/remnawave-*" >/dev/null; then
     svc_active nginx || _issue web_down "nginx настроен, но остановлен"
   fi
   if svc_exists haproxy && [ -f /etc/haproxy/haproxy.cfg ] && grep -q 'fe_443' /etc/haproxy/haproxy.cfg; then
@@ -279,9 +284,25 @@ fix_ports_exposed()     { ( ASSUME_YES=1; harden_firewall; harden_services ); }
 fix_ufw_ipv6()          { sed -i -E 's/^IPV6=no/IPV6=yes/' /etc/default/ufw && ufw reload; }
 fix_hardening_missing() { ( ASSUME_YES=1; harden_sysctl; harden_ssh; harden_updates ); }
 
+# Миграция со старого формата: домены восстанавливаем из того, что уже настроено (nginx-сайт
+# старой заглушки, HAProxy, compose ноды), и перезапускаем haproxy-setup — он поставит разные заглушки.
+fix_decoy_legacy() {
+  local old=/etc/nginx/sites-available/decoy src dtcp dgrpc dxhttp dhy2 cfg=/etc/haproxy/haproxy.cfg
+  # значение директивы server_name (работает и для сайта в одну строку, и для многострочного)
+  dtcp="$(grep -oE 'server_name[[:space:]]+[^;[:space:]]+' "$old" 2>/dev/null | awk '$2!="_"{print $2; exit}')"
+  dgrpc="$(grep -oE 'be_grpc if \{ req.ssl_sni -i [^ ]+' "$cfg" 2>/dev/null | awk '{print $NF}')"
+  dxhttp="$(grep -oE 'be_xhttp if \{ req.ssl_sni -i [^ ]+' "$cfg" 2>/dev/null | awk '{print $NF}')"
+  dhy2="$(grep -oE '/etc/letsencrypt/live/[^/]+/fullchain.pem:/etc/hysteria' "$NODE_DIR/docker-compose.yml" 2>/dev/null | head -1 | sed -E 's#.*live/([^/]+)/fullchain.*#\1#')"
+  [ -n "$dtcp" ] || { echo "Не удалось определить домен REALITY TCP из старой заглушки — запустите «Только Nginx+HAProxy» вручную."; return 1; }
+  src="$(get_script haproxy-setup.sh)" || return 1
+  NONINTERACTIVE=1 INSTALL_DECOY=1 DOMAIN_TCP="$dtcp" DOMAIN_GRPC="$dgrpc" DOMAIN_XHTTP="$dxhttp" \
+    DOMAIN_HY2="$dhy2" USE_HY2="$([ -n "$dhy2" ] && echo 1 || echo 0)" bash "$src"
+}
+
 fix_web_down() {
   local rc=0
-  if [ -e /etc/nginx/sites-enabled/decoy ] || compgen -G "/etc/nginx/sites-enabled/remnawave-*" >/dev/null; then
+  if [ -e /etc/nginx/sites-enabled/decoy ] || compgen -G "/etc/nginx/sites-enabled/decoy-*" >/dev/null \
+     || compgen -G "/etc/nginx/sites-enabled/remnawave-*" >/dev/null; then
     nginx -t &>/dev/null && systemctl restart nginx || rc=1
   fi
   if svc_exists haproxy && grep -q 'fe_443' /etc/haproxy/haproxy.cfg 2>/dev/null; then

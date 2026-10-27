@@ -21,7 +21,7 @@ if [ "$NONINTERACTIVE" != "1" ]; then
   DOMAIN_HY2=$(ask_valid "Домен для Hysteria2 (Enter — не использовать)" "${DOMAIN_HY2:-}" is_valid_domain 1) || exit 1
   USE_HY2=0
   if [ -n "$DOMAIN_HY2" ] && ask_yes_no "Использовать Hysteria2?" "1"; then USE_HY2=1; fi
-  if ask_yes_no "Ставить страницу-заглушку (decoy) для self-steal?" "1"; then INSTALL_DECOY=1; else INSTALL_DECOY=0; fi
+  if ask_yes_no "Ставить красивые страницы-заглушки (своя, разная для каждого протокола)?" "1"; then INSTALL_DECOY=1; else INSTALL_DECOY=0; fi
 else
   INSTALL_DECOY="${INSTALL_DECOY:-1}"
   DOMAIN_TCP="${DOMAIN_TCP:-}"; DOMAIN_GRPC="${DOMAIN_GRPC:-}"
@@ -35,7 +35,7 @@ if [ -z "$DOMAIN_TCP" ]; then
   exit 1
 fi
 
-DECOY_ROOT="/var/www/decoy"
+_dorik_source decoys.sh
 ALL_DOMAINS=("$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2")
 
 step "Установка Nginx / HAProxy / Certbot"
@@ -46,80 +46,12 @@ if ! command -v nginx &>/dev/null || ! command -v certbot &>/dev/null || ! comma
   exit 1
 fi
 
-confirm_overwrite() {
-  local f="${1:-}"
-  if [ -f "$f" ]; then
-    if [ "$NONINTERACTIVE" = "1" ]; then return 0; fi
-    ask_yes_no "Файл $f уже существует, перезаписать?" "1"
-    return $?
-  fi
-  return 0
-}
-
-# ---- decoy page -----------------------------------------------------------
-step "Страница-заглушка"
-mkdir -p "$DECOY_ROOT"
-DECOY_MARKER="${DECOY_ROOT}/.dorik-installed"
-write_basic_decoy() {
-  cat > "${DECOY_ROOT}/index.html" <<'HTML'
-<!DOCTYPE html><html><head><title>It works</title></head>
-<body><h1>It works!</h1></body></html>
-HTML
-}
-if [ "${INSTALL_DECOY:-1}" != "1" ]; then
-  warn "Установка decoy-страницы отключена по выбору — self-steal будет отдавать только базовую пустую страницу."
-  [ -f "${DECOY_ROOT}/index.html" ] || write_basic_decoy
-elif [ -f "$DECOY_MARKER" ] && [ -f "${DECOY_ROOT}/index.html" ] && [ "$NONINTERACTIVE" = "1" ]; then
-  ok "Заглушка уже установлена ($(cat "$DECOY_MARKER")) — повторная загрузка не нужна, пропускаю."
-elif [ ! -f "${DECOY_ROOT}/index.html" ] || confirm_overwrite "${DECOY_ROOT}/index.html"; then
-  WORK="$(mktemp -d)"
-  PICK=""
-  DECOY_INSTALLED=0
-  CANDIDATES=()
-  if curl -fsSL --retry 3 "${RAW}/decoys/manifest.txt" -o "$WORK/manifest.txt" 2>/dev/null && [ -s "$WORK/manifest.txt" ]; then
-    # tr убирает \r (Windows-перевод строки) и пробелы — иначе имя файла
-    # получается с мусором на конце и curl за zip-архивом падает с 404.
-    # shuf: на каждом сервере заглушка своя случайная, а не одна и та же везде.
-    mapfile -t CANDIDATES < <(tr -d '\r' < "$WORK/manifest.txt" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -E '\.zip$' | shuf)
-  fi
-  # DECOY_NAME=имя.zip — принудительно выбрать конкретную заглушку
-  [ -n "${DECOY_NAME:-}" ] && CANDIDATES=("$DECOY_NAME")
-  # Берём первую в случайном порядке, которая реально скачалась и распаковалась.
-  for PICK in "${CANDIDATES[@]}"; do
-    ZIP_URL="${RAW}/decoys/${PICK}"
-    rm -rf "$WORK/unzip" "$WORK/decoy.zip"
-    if curl -fsSL --retry 3 "$ZIP_URL" -o "$WORK/decoy.zip" 2>/dev/null && [ -s "$WORK/decoy.zip" ]; then
-      mkdir -p "$WORK/unzip"
-      if unzip -oq "$WORK/decoy.zip" -d "$WORK/unzip" 2>"$WORK/unzip_err.log"; then
-        SRC_DIR="$WORK/unzip"
-        # если внутри один каталог — используем его
-        if [ "$(find "$SRC_DIR" -mindepth 1 -maxdepth 1 -type d | wc -l)" = "1" ] && \
-           [ "$(find "$SRC_DIR" -mindepth 1 -maxdepth 1 | wc -l)" = "1" ]; then
-          SRC_DIR="$(find "$SRC_DIR" -mindepth 1 -maxdepth 1 -type d)"
-        fi
-        if [ -n "$(find "$SRC_DIR" -mindepth 1 -maxdepth 1)" ]; then
-          cp -rf "$SRC_DIR"/. "$DECOY_ROOT"/
-          echo "$PICK" > "$DECOY_MARKER"
-          DECOY_INSTALLED=1
-          ok "Заглушка установлена: ${PICK}"
-        else
-          warn "Архив ${PICK} распаковался пустым."
-        fi
-      else
-        warn "Не удалось распаковать ${PICK}: $(head -1 "$WORK/unzip_err.log" 2>/dev/null)"
-      fi
-    else
-      warn "Не удалось скачать ${ZIP_URL} — пробую другую заглушку."
-    fi
-    [ "$DECOY_INSTALLED" = "1" ] && break
-  done
-  [ "${#CANDIDATES[@]}" -eq 0 ] && warn "manifest.txt пуст или недоступен — decoys/ в репозитории может быть пустой."
-  rm -rf "$WORK"
-  if [ "$DECOY_INSTALLED" != "1" ] && [ ! -f "${DECOY_ROOT}/index.html" ]; then
-    write_basic_decoy
-    warn "Не удалось скачать заглушку из репозитория, поставлена базовая."
-  fi
-fi
+# ---- заглушки: по одной на КАЖДЫЙ протокол, все разные ---------------------------------
+# (домен, сертификат, nginx-сайт, порт и страница — свои; подробности в decoys.sh)
+step "Страницы-заглушки (по одной на протокол)"
+mkdir -p "$DECOY_WEB"
+decoys_install
+decoys_write_conf
 
 # ---- DNS preflight ---------------------------------------------------------
 # Certbot проваливается с невнятной ошибкой, если домен ещё не смотрит на
@@ -179,47 +111,11 @@ systemctl start nginx 2>&1 || true
 # Хук продления (см. install_renew_hook в lib.sh): перезапуск nginx и remnanode.
 install_renew_hook
 
-# ---- nginx (self-steal, локальный decoy на 8081) --------------------------
-# ВАЖНО: Reality "ворует" сертификат у target-сервера через реальный TLS-
-# хендшейк. Если target отдаёт голый HTTP без TLS, хендшейк не проходит и
-# весь self-steal fallback ломается (клиент получает TLS-ошибку/пустой ответ).
-# Поэтому decoy ОБЯЗАН слушать SSL с реальным сертификатом одного из доменов.
-step "Настройка Nginx (self-steal)"
-STEAL_CERT_DOMAIN=""
-for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP"; do
-  [ -z "$d" ] && continue
-  if cert_is_valid "$d"; then STEAL_CERT_DOMAIN="$d"; break; fi
-done
-
-if [ -z "$STEAL_CERT_DOMAIN" ]; then
-  err "Нет ни одного выпущенного сертификата — decoy НЕ сможет работать как TLS self-steal target (Reality не получит сертификат для подмены). Проверьте certbot выше."
-  cat > /etc/nginx/sites-available/decoy <<EOF
-server {
-    listen 127.0.0.1:8081;
-    server_name _;
-    server_tokens off;
-    root ${DECOY_ROOT};
-    index index.html;
-    location / { try_files \$uri \$uri/ =404; }
-}
-EOF
-else
-  ok "Decoy будет отдавать TLS с сертификатом ${STEAL_CERT_DOMAIN}."
-  cat > /etc/nginx/sites-available/decoy <<EOF
-server {
-    listen 127.0.0.1:8081 ssl;
-    server_name ${STEAL_CERT_DOMAIN};
-    server_tokens off;
-    ssl_certificate /etc/letsencrypt/live/${STEAL_CERT_DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${STEAL_CERT_DOMAIN}/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    root ${DECOY_ROOT};
-    index index.html;
-    location / { try_files \$uri \$uri/ =404; }
-}
-EOF
-fi
-ln -sf /etc/nginx/sites-available/decoy /etc/nginx/sites-enabled/decoy
+# ---- nginx: отдельная заглушка (и сертификат) на каждый протокол ------------------------
+# Reality «ворует» сертификат у target-сервера реальным TLS-хендшейком, поэтому каждая
+# заглушка слушает TLS с сертификатом СВОЕГО домена (см. decoys.sh).
+step "Настройка Nginx (self-steal: заглушка на каждый протокол)"
+decoys_write_nginx || true   # код > 0 = часть заглушек пока без TLS; предупреждение уже выведено
 rm -f /etc/nginx/sites-enabled/default
 sed -i 's/worker_connections .*/worker_connections 16384;/' /etc/nginx/nginx.conf || true
 grep -q "large_client_header_buffers" /etc/nginx/nginx.conf || \
@@ -330,16 +226,8 @@ for d in "${ISSUED[@]}"; do
   fi
 done
 
-DECOY_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --max-time 5 "https://127.0.0.1:8081" 2>/dev/null || echo "000")
-if [ -z "$STEAL_CERT_DOMAIN" ]; then
-  DECOY_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:8081" 2>/dev/null || echo "000")
-fi
-if [ "$DECOY_CODE" = "200" ]; then
-  ok "decoy (self-steal, 127.0.0.1:8081): отвечает 200"
-else
-  err "decoy (self-steal, 127.0.0.1:8081): код ${DECOY_CODE} (ожидался 200) — Reality fallback не будет работать корректно"
-  CHECK_FAIL=1
-fi
+# Заглушки: каждая отвечает 200, отдаёт сертификат своего домена, и все страницы разные.
+decoys_verify || CHECK_FAIL=1
 
 for d in "${ALL_DOMAINS[@]}"; do
   [ -z "$d" ] && continue
@@ -350,6 +238,9 @@ for d in "${ALL_DOMAINS[@]}"; do
     CHECK_FAIL=1
   fi
 done
+
+echo
+decoys_table
 
 if [ "$CHECK_FAIL" = "1" ]; then
   warn "haproxy-setup.sh завершён С ПРЕДУПРЕЖДЕНИЯМИ — см. пункты выше с [✗]."

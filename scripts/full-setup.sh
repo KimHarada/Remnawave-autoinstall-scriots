@@ -107,11 +107,11 @@ if [ "$ROLE" = "1" ]; then
     fi
   fi
 
-  if ask_yes_no "Ставить страницу-заглушку (decoy) для self-steal?" "1"; then
+  if ask_yes_no "Ставить красивые страницы-заглушки (своя, разная для каждого протокола)?" "1"; then
     INSTALL_DECOY=1
   else
     INSTALL_DECOY=0
-    warn "Заглушка не будет установлена — self-steal всё равно настроится (TLS-листенер на 127.0.0.1:8081 нужен для Reality), но отдавать будет только базовую пустую страницу."
+    warn "Красивые страницы не ставим — self-steal всё равно настроится (у каждого протокола свой TLS-листенер на 127.0.0.1), но отдавать он будет простую страницу (у каждого протокола свою)."
   fi
 
   USE_HY2=0
@@ -198,7 +198,8 @@ fi
 if [ "$ROLE" = "1" ]; then
   box_wrap "Домены:           " "${DOMAIN_TCP}${DOMAIN_GRPC:+ ${DOMAIN_GRPC}}${DOMAIN_XHTTP:+ ${DOMAIN_XHTTP}}${DOMAIN_HY2:+ ${DOMAIN_HY2}}"
   box_row "Порт ноды:          ${NODE_PORT}$([ "$OPEN_NODE_PORT" = "1" ] && echo " (открыт$([ -n "$PANEL_IP" ] && echo " только для ${PANEL_IP}"))" || echo " (в firewall не открывается)")"
-  box_row "Hysteria2:          $(yn "$USE_HY2")    Заглушка: $(yn "$INSTALL_DECOY")    BBR: $(yn "$USE_BBR")"
+  box_row "Hysteria2:          $(yn "$USE_HY2")    Заглушки: $(yn "$INSTALL_DECOY")    BBR: $(yn "$USE_BBR")"
+  box_row "                    ${C_DIM}по одной заглушке на каждый протокол, все разные${C_RESET}"
 fi
 box_row "Ребут в 04:00:      $(yn "$ENABLE_REBOOT")    Часовой пояс: ${DORIK_TZ}"
 box_row "Укрепление:         $(yn "$DO_HARDEN")    Вход по паролю SSH выключить: $(yn "$SSH_PW_OFF")"
