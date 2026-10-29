@@ -187,8 +187,8 @@ doctor_scan() {
        || ! grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
       _issue hardening_missing "не применено укрепление системы (ядро, SSH, автообновления безопасности)"
     elif [ "${SCAN_PROTECT:-1}" = "1" ] && { [ ! -f /etc/fail2ban/jail.d/dorik-portscan.conf ] \
-         || { [ "${ALLOW_PING:-0}" != "1" ] && [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" != "1" ]; }; }; then
-      _issue shield_missing "нет щита от сканеров (скрытие ping, бан перебора портов)"
+         || { [ "${ALLOW_PING:-1}" != "1" ] && [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" != "1" ]; }; }; then
+      _issue shield_missing "нет щита от сканеров (бан перебора портов; ping скрыт только при ALLOW_PING=0)"
     fi
   fi
   return 0

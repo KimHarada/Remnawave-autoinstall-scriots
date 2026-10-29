@@ -391,10 +391,12 @@ EOF
 # Сам открытый порт 443 скрыть нельзя, но сервер не должен отвечать на ping и должен банить тех,
 # кто перебирает закрытые порты (в логе ядра — строки «[UFW BLOCK]»).
 harden_shield() {
-  if [ "${ALLOW_PING:-0}" = "1" ]; then
+  # По умолчанию ping ОСТАВЛЕН: клиенты (Happ, Hiddify, v2rayN...) показывают «пинг» хоста через ICMP,
+  # и сервер без ответа выглядит в списке как нерабочий. Скрыть ping: ALLOW_PING=0.
+  if [ "${ALLOW_PING:-1}" = "1" ]; then
     rm -f /etc/sysctl.d/97-dorik-noping.conf
     sysctl -w net.ipv4.icmp_echo_ignore_all=0 &>/dev/null || true
-    info "ALLOW_PING=1 — сервер отвечает на ping"
+    info "Сервер отвечает на ping (скрыть: ALLOW_PING=0)"
   else
     echo 'net.ipv4.icmp_echo_ignore_all = 1' > /etc/sysctl.d/97-dorik-noping.conf
     sysctl -w net.ipv4.icmp_echo_ignore_all=1 &>/dev/null || warn "ping не отключён (ядро/контейнер не позволяет)"
@@ -423,7 +425,7 @@ ignoreip = ${ign}
 EOF
   systemctl restart fail2ban &>/dev/null || { warn "fail2ban не перезапустился."; return 1; }
   local i; for i in 1 2 3 4 5 6 7 8 9 10; do fail2ban-client status dorik-portscan &>/dev/null && break; sleep 1; done
-  ok "Щит от сканеров: ping скрыт, перебор закрытых портов банится на сутки"
+  ok "Щит от сканеров: перебор закрытых портов банится на сутки$([ "${ALLOW_PING:-1}" = "1" ] || echo ", ping скрыт")"
 }
 
 # ---- Docker: публикации в обход ufw --------------------------------------------------------
@@ -471,7 +473,7 @@ verify_hardening() {
   _chk $? "автообновления безопасности включены" "автообновления безопасности не включены"
   [ -f /etc/modprobe.d/dorik-blacklist.conf ]; _chk $? "неиспользуемые модули ядра заблокированы" "файл блокировки модулей отсутствует"
   if [ "${SCAN_PROTECT:-1}" = "1" ]; then
-    if [ "${ALLOW_PING:-0}" != "1" ]; then
+    if [ "${ALLOW_PING:-1}" != "1" ]; then
       [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" = "1" ]; _chk $? "сервер не отвечает на ping" "ping не отключён"
     fi
     fail2ban-client status dorik-portscan &>/dev/null; _chk $? "fail2ban: защита от сканирования портов активна" "fail2ban: jail dorik-portscan не работает"
