@@ -420,6 +420,12 @@ print_summary() {
 }
 
 # ---- запуск --------------------------------------------------------------------------------------------------------
+_is_panel_addr() {  # домен/IP[:порт][/путь?запрос] с http(s):// или без него
+  local a="${1:-}"
+  [[ "$a" =~ ^https?:// ]] || a="https://${a}"
+  is_valid_url "$a"
+}
+
 profile_collect_params() {
   local px pname
 
@@ -427,7 +433,9 @@ profile_collect_params() {
   RW_TOKEN="${PANEL_API_TOKEN:-${REMNAWAVE_API_TOKEN:-}}"
   local url="${PANEL_URL:-}"
   while true; do
-    url=$(ask_valid "Адрес панели (ссылка для входа; с секретом ?ключ=значение, если включена защита)" "$url" is_valid_url) || return 1
+    info "Пример: panel.example.com   или с секретом: https://panel.example.com/auth/login?ключ=значение"
+    url=$(ask_valid "Адрес панели (домен или ссылка для входа; https:// можно не писать)" "$url" _is_panel_addr) || return 1
+    [[ "$url" =~ ^https?:// ]] || url="https://${url}"
     rw_parse_url "$url" || { err "Не удалось разобрать адрес панели."; [ "${ASSUME_YES:-0}" = "1" ] && return 1; url=""; continue; }
     if [ -z "$RW_TOKEN" ]; then
       info "Токен: панель → Настройки → API-токены → создать."
