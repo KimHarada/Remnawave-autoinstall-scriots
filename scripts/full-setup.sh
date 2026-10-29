@@ -19,6 +19,8 @@ _dorik_source state.sh
 _dorik_source harden.sh
 _dorik_source doctor.sh
 _dorik_source preflight.sh
+_dorik_source decoys.sh
+_dorik_source profile-setup.sh
 
 require_root
 require_apt_os
@@ -76,11 +78,58 @@ while [ "$NEW_SSH_PORT" = "80" ] || [ "$NEW_SSH_PORT" = "443" ]; do
 done
 
 if [ "$ROLE" = "1" ]; then
-  DOMAIN_TCP=$(ask_valid "Домен для VLESS REALITY TCP (обязателен)" "${DOMAIN_TCP:-}" is_valid_domain) || exit 1
-  DOMAIN_GRPC=$(ask_valid "Домен для VLESS gRPC (Enter — не использовать)" "${DOMAIN_GRPC:-}" is_valid_domain 1) || exit 1
-  DOMAIN_XHTTP=$(ask_valid "Домен для VLESS XHTTP (Enter — не использовать)" "${DOMAIN_XHTTP:-}" is_valid_domain 1) || exit 1
-  DOMAIN_HY2=$(ask_valid "Домен для Hysteria2 (Enter — не использовать)" "${DOMAIN_HY2:-}" is_valid_domain 1) || exit 1
-  DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"
+  # ---- домены протоколов -----------------------------------------------------------------------
+  # Вручную (по домену на протокол) либо от ОДНОГО базового домена: остальные сгенерирую сам
+  # (случайные имена — по названию поддомена нельзя угадать протокол; нужна wildcard-запись DNS).
+  # значения из окружения (режим без вопросов) запоминаем до обнуления
+  USE_TG_ENV="${USE_TG:-0}"; USE_HY2_ENV="${USE_HY2:-1}"
+  USE_TG=0; DOMAIN_TG="${DOMAIN_TG:-}"; USE_HY2=0
+  DOMAIN_MODE=2
+  [ -n "${DOMAIN_TCP:-}" ] && DOMAIN_MODE=1
+  echo "Как задать домены протоколов?"
+  echo "  1) Указать каждый домен вручную"
+  echo "  2) Один базовый домен — поддомены для всех протоколов создам сам (нужна DNS-запись *.домен → IP сервера)"
+  DOMAIN_MODE=$(ask_valid "Выбор" "$DOMAIN_MODE" is_valid_choice12) || exit 1
+
+  # домен протокола из прошлой установки (чтобы повторный запуск не менял домены)
+  prev_domain() { [ -s /etc/dorik/decoys.conf ] && awk -F'|' -v p="$1" '$1==p{print $2; exit}' /etc/dorik/decoys.conf; return 0; }
+
+  if [ "$DOMAIN_MODE" = "2" ]; then
+    BASE_DOMAIN=$(ask_valid "Базовый домен (например example.com)" "${BASE_DOMAIN:-}" is_valid_domain) || exit 1
+    BASE_DOMAIN="${BASE_DOMAIN,,}"
+    if ask_yes_no "Использовать Hysteria2 на этой ноде?" "$([ "$USE_HY2_ENV" = "0" ] && echo 2 || echo 1)"; then USE_HY2=1; fi
+    if ask_yes_no "Нужен отдельный хост только для Telegram и ЮKassa?" "$([ "${USE_TG_ENV:-0}" = "1" ] && echo 1 || echo 2)"; then USE_TG=1; fi
+    gen_domain() {  # gen_domain <proto> — прежний домен под этой базой либо новый случайный
+      local d; d="$(prev_domain "$1")"
+      case "$d" in *".${BASE_DOMAIN}") echo "$d" ;; *) echo "$(openssl rand -hex 4).${BASE_DOMAIN}" ;; esac
+    }
+    DOMAIN_TCP="$(gen_domain tcp)"; DOMAIN_GRPC="$(gen_domain grpc)"; DOMAIN_XHTTP="$(gen_domain xhttp)"
+    DOMAIN_HY2=""; [ "$USE_HY2" = "1" ] && DOMAIN_HY2="$(gen_domain hy2)"
+    DOMAIN_TG="";  [ "$USE_TG" = "1" ]  && DOMAIN_TG="$(gen_domain tg)"
+    echo
+    box_top "Домены протоколов"
+    box_row "REALITY TCP   ${DOMAIN_TCP}"
+    box_row "gRPC          ${DOMAIN_GRPC}"
+    box_row "XHTTP         ${DOMAIN_XHTTP}"
+    [ -n "$DOMAIN_HY2" ] && box_row "Hysteria2     ${DOMAIN_HY2}"
+    [ -n "$DOMAIN_TG" ]  && box_row "Telegram      ${DOMAIN_TG}"
+    box_sep
+    box_wrap "${C_DIM}→${C_RESET}" "DNS: создайте A-запись *.${BASE_DOMAIN} на IP этого сервера (или отдельные A-записи на каждый домен выше)."
+    box_bottom
+  else
+    DOMAIN_TCP=$(ask_valid "Домен для VLESS REALITY TCP (обязателен)" "${DOMAIN_TCP:-$(prev_domain tcp)}" is_valid_domain) || exit 1
+    DOMAIN_GRPC=$(ask_valid "Домен для VLESS gRPC (Enter — не использовать)" "${DOMAIN_GRPC:-$(prev_domain grpc)}" is_valid_domain 1) || exit 1
+    DOMAIN_XHTTP=$(ask_valid "Домен для VLESS XHTTP (Enter — не использовать)" "${DOMAIN_XHTTP:-$(prev_domain xhttp)}" is_valid_domain 1) || exit 1
+    DOMAIN_HY2=$(ask_valid "Домен для Hysteria2 (Enter — не использовать)" "${DOMAIN_HY2:-$(prev_domain hy2)}" is_valid_domain 1) || exit 1
+    if [ -n "$DOMAIN_HY2" ] && ask_yes_no "Использовать Hysteria2 на этой ноде?" "1"; then USE_HY2=1; else DOMAIN_HY2=""; fi
+    if ask_yes_no "Нужен отдельный хост только для Telegram и ЮKassa?" "$([ "${USE_TG_ENV:-0}" = "1" ] && echo 1 || echo 2)"; then
+      USE_TG=1
+      DOMAIN_TG=$(ask_valid "Домен для Telegram-хоста" "${DOMAIN_TG:-$(prev_domain tg)}" is_valid_domain) || exit 1
+    else
+      DOMAIN_TG=""
+    fi
+  fi
+  DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"; DOMAIN_TG="${DOMAIN_TG,,}"
 
   # ---- предварительная проверка DNS сразу после ввода доменов --------------
   # Видно сразу, до подтверждения запуска, пока ещё можно поправить A-записи
@@ -92,7 +141,7 @@ if [ "$ROLE" = "1" ]; then
   else
     info "Публичный IP сервера: ${PREFLIGHT_PUB_IP}"
     DNS_PREFLIGHT_BAD=0
-    for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2"; do
+    for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2" "$DOMAIN_TG"; do
       [ -z "$d" ] && continue
       if dns_points_here "$d" "$PREFLIGHT_PUB_IP"; then
         ok "${d}: DNS указывает на этот сервер."
@@ -114,11 +163,21 @@ if [ "$ROLE" = "1" ]; then
     warn "Красивые страницы не ставим — self-steal всё равно настроится (у каждого протокола свой TLS-листенер на 127.0.0.1), но отдавать он будет простую страницу (у каждого протокола свою)."
   fi
 
-  USE_HY2=0
-  if [ -n "$DOMAIN_HY2" ] && ask_yes_no "Использовать Hysteria2 на этой ноде?" "1"; then
-    USE_HY2=1
-  fi
   if ask_yes_no "Ставить BBR и сетевую оптимизацию?" "1"; then USE_BBR=1; else USE_BBR=0; fi
+
+  # ---- профиль и хосты на панели по API -------------------------------------------------------------
+  USE_API=0
+  API_DEFAULT=2; [ -n "${PANEL_URL:-}" ] && API_DEFAULT=1
+  if ask_yes_no "Создать профиль и хосты на панели автоматически по API (и получить SECRET_KEY)?" "$API_DEFAULT"; then
+    USE_API=1
+    profile_collect_params || exit 1     # PROFILE_CREATE_NODE и др. берутся из окружения либо спрашиваются
+    PROFILE_CREATE_NODE="${PROFILE_CREATE_NODE:-0}"
+    PANEL_HOST_HINT="${RW_BASE#*://}"; PANEL_HOST_HINT="${PANEL_HOST_HINT%%[:/]*}"
+    PANEL_IP_HINT="$(getent ahostsv4 "$PANEL_HOST_HINT" 2>/dev/null | awk '{print $1; exit}')"
+    [ -n "$PANEL_IP_HINT" ] && info "Адрес панели ${PANEL_HOST_HINT} → ${PANEL_IP_HINT} (подсказка для ограничения порта ноды; за Cloudflare это будет не ваш сервер)"
+  else
+    PROFILE_CREATE_NODE=0
+  fi
 
   # При повторном запуске порт предлагаем тот, что уже настроен в compose ноды.
   EXISTING_NODE_PORT=""
@@ -138,22 +197,29 @@ if [ "$ROLE" = "1" ]; then
     PANEL_IP=$(ask_valid "IP панели (Enter — открыть порт для всех)" "${PANEL_IP:-}" is_valid_ip 1) || exit 1
   fi
 
-  # SECRET_KEY: если нода уже ставилась, ключ можно не вводить заново.
+  # ---- SECRET_KEY ------------------------------------------------------------------------------------------
   OLD_KEY=""
   [ -f "$NODE_DIR/docker-compose.yml" ] && \
     OLD_KEY=$(grep -oE 'SECRET_KEY=.*' "$NODE_DIR/docker-compose.yml" | head -1 | sed 's/SECRET_KEY=//')
-  while true; do
-    if [ -n "$OLD_KEY" ]; then
-      SECRET_KEY=$(ask_value "SECRET_KEY ноды (Enter — оставить текущий)" "${SECRET_KEY:-}")
-    else
-      SECRET_KEY=$(ask_value "SECRET_KEY ноды (из панели Remnawave, обязателен)" "${SECRET_KEY:-}")
-    fi
-    # Убираем случайные кавычки/переводы строк — частая причина "Invalid SECRET_KEY payload"
-    SECRET_KEY=$(echo -n "$SECRET_KEY" | sed -E 's/^"+//; s/"+$//' | tr -d '\r\n')
-    if [ -n "$SECRET_KEY" ] || [ -n "$OLD_KEY" ]; then break; fi
-    err "SECRET_KEY не может быть пустым."
-    [ "${ASSUME_YES:-0}" = "1" ] && exit 1
-  done
+  if [ "$USE_API" = "1" ]; then
+    # Ключ ноды общий для панели — берём по API, вставлять вручную не нужно.
+    SECRET_KEY="$(fetch_secret_key)" || exit 1
+    [ -n "$SECRET_KEY" ] || { err "Панель не вернула SECRET_KEY."; exit 1; }
+    ok "SECRET_KEY получен от панели по API"
+  else
+    while true; do
+      if [ -n "$OLD_KEY" ]; then
+        SECRET_KEY=$(ask_value "SECRET_KEY ноды (Enter — оставить текущий)" "${SECRET_KEY:-}")
+      else
+        SECRET_KEY=$(ask_value "SECRET_KEY ноды (из панели Remnawave, обязателен)" "${SECRET_KEY:-}")
+      fi
+      # Убираем случайные кавычки/переводы строк — частая причина "Invalid SECRET_KEY payload"
+      SECRET_KEY=$(echo -n "$SECRET_KEY" | sed -E 's/^"+//; s/"+$//' | tr -d '\r\n')
+      if [ -n "$SECRET_KEY" ] || [ -n "$OLD_KEY" ]; then break; fi
+      err "SECRET_KEY не может быть пустым."
+      [ "${ASSUME_YES:-0}" = "1" ] && exit 1
+    done
+  fi
 else
   USE_HY2=0; USE_BBR=0; OPEN_NODE_PORT=0; NODE_PORT=""
   PANEL_IP=$(ask_valid "IP панели (если нужно ограничить доступ, Enter — пропустить)" "${PANEL_IP:-}" is_valid_ip 1) || exit 1
@@ -196,7 +262,13 @@ else
   box_row "SSH-порт:           ${NEW_SSH_PORT} (без изменений)"
 fi
 if [ "$ROLE" = "1" ]; then
-  box_wrap "Домены:           " "${DOMAIN_TCP}${DOMAIN_GRPC:+ ${DOMAIN_GRPC}}${DOMAIN_XHTTP:+ ${DOMAIN_XHTTP}}${DOMAIN_HY2:+ ${DOMAIN_HY2}}"
+  box_wrap "Домены:           " "${DOMAIN_TCP}${DOMAIN_GRPC:+ ${DOMAIN_GRPC}}${DOMAIN_XHTTP:+ ${DOMAIN_XHTTP}}${DOMAIN_HY2:+ ${DOMAIN_HY2}}${DOMAIN_TG:+ ${DOMAIN_TG}}"
+  if [ "$USE_API" = "1" ]; then
+    box_row "Профиль на панели: ${C_BOLD}${PROFILE_NAME}${C_RESET}  ${C_DIM}(хосты + SECRET_KEY по API)${C_RESET}"
+    box_row "                    $([ "$PROFILE_CREATE_NODE" = "1" ] && echo "нода на панели создаётся" || echo "ноду на панели создадите сами")$([ -n "$DOMAIN_TG" ] && echo "; есть Telegram-хост")"
+  else
+    box_row "Профиль на панели: ${C_DIM}нет (конфиг добавите вручную)${C_RESET}"
+  fi
   box_row "Порт ноды:          ${NODE_PORT}$([ "$OPEN_NODE_PORT" = "1" ] && echo " (открыт$([ -n "$PANEL_IP" ] && echo " только для ${PANEL_IP}"))" || echo " (в firewall не открывается)")"
   box_row "Hysteria2:          $(yn "$USE_HY2")    Заглушки: $(yn "$INSTALL_DECOY")    BBR: $(yn "$USE_BBR")"
   box_row "                    ${C_DIM}по одной заглушке на каждый протокол, все разные${C_RESET}"
@@ -226,6 +298,8 @@ else
   TOTAL_STEPS=4
 fi
 [ "$DO_HARDEN" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
+[ "${USE_API:-0}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
+[ "${USE_API:-0}" = "1" ] && [ "${PROFILE_CREATE_NODE:-0}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
 
 # run_step "Название" функция_этапа [функция_проверки]
 run_step() {
@@ -367,8 +441,8 @@ if [ "$ROLE" = "1" ]; then
   do_nginx_haproxy() {
     local src; src="$(get_script haproxy-setup.sh)" || { err "Не удалось получить haproxy-setup.sh"; return 1; }
     DOMAIN_TCP="$DOMAIN_TCP" DOMAIN_GRPC="$DOMAIN_GRPC" DOMAIN_XHTTP="$DOMAIN_XHTTP" \
-    DOMAIN_HY2="$DOMAIN_HY2" USE_HY2="$USE_HY2" INSTALL_DECOY="$INSTALL_DECOY" \
-    NONINTERACTIVE=1 bash "$src"
+    DOMAIN_HY2="$DOMAIN_HY2" USE_HY2="$USE_HY2" DOMAIN_TG="$DOMAIN_TG" USE_TG="$USE_TG" \
+    INSTALL_DECOY="$INSTALL_DECOY" NONINTERACTIVE=1 bash "$src"
   }
   run_step "Nginx (self-steal) + HAProxy + сертификаты" do_nginx_haproxy
 
@@ -380,12 +454,32 @@ if [ "$ROLE" = "1" ]; then
     run_step "BBR + сетевая оптимизация" do_bbr
   fi
 
+  # Профиль и хосты создаём ДО запуска ноды: заглушки и сертификаты уже готовы, а панель,
+  # получив ноду с привязанным профилем, сама подключится к ней, как только та поднимется.
+  if [ "${USE_API:-0}" = "1" ]; then
+    do_profile() { profile_apply; }
+    run_step "Профиль и хосты на панели (API)" do_profile
+  fi
+
   do_remnanode() {
     local src; src="$(get_script remnanode-setup.sh)" || { err "Не удалось получить remnanode-setup.sh"; return 1; }
     NODE_PORT="$NODE_PORT" USE_HY2="$USE_HY2" SECRET_KEY="$SECRET_KEY" \
       DOMAIN_HY2="$DOMAIN_HY2" NONINTERACTIVE=1 bash "$src"
   }
   run_step "Remnanode (Docker + Hysteria2)" do_remnanode
+
+  if [ "${USE_API:-0}" = "1" ] && [ "${PROFILE_CREATE_NODE:-0}" = "1" ]; then
+    do_node_link() {
+      if spin_run "Подключение ноды к панели (до 2 минут)" wait_node_connected 120; then
+        ok "Панель подключилась к ноде, Xray запущен с конфигом профиля"
+        return 0
+      fi
+      err "Панель не подключилась к ноде за 2 минуты."
+      warn "Проверьте: порт ноды ${NODE_PORT} открыт для IP панели; адрес ноды на панели верный; docker logs remnanode --tail 30"
+      return 1
+    }
+    run_step "Подключение ноды к панели" do_node_link
+  fi
 
 fi
 

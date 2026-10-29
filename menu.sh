@@ -7,6 +7,7 @@
 # Параметры (запуск без меню):
 #   --full           полная настройка сервера (нода или панель)
 #   --doctor         проверка и исправление последствий старых версий
+#   --profile        создать профиль и хосты на панели по API
 #   --harden         закрыть лишние порты и укрепить сервер (--ports — только показать порты)
 #   --update-node    обновить ноду          --bbr   BBR + сетевая оптимизация
 #   --panel-install  установить панель      --panel-update  обновить панель
@@ -48,7 +49,7 @@ download_repo() {
     # запасной путь: по одному файлу из raw
     echo "▲ Архив не скачался — пробую по файлам."
     rm -rf "$tmp"; tmp="$(mktemp -d)"; mkdir -p "$tmp/scripts"
-    for f in lib.sh ui.sh state.sh harden.sh decoys.sh doctor.sh preflight.sh full-setup.sh bbr-install.sh haproxy-setup.sh \
+    for f in lib.sh ui.sh state.sh harden.sh decoys.sh profile-setup.sh doctor.sh preflight.sh full-setup.sh bbr-install.sh haproxy-setup.sh \
              remnanode-setup.sh node-update.sh panel-install.sh fix-ssh-access.sh; do
       curl -fsSL --retry 3 "${DORIK_RAW}/scripts/${f}" -o "$tmp/scripts/${f}" || { rm -rf "$tmp"; return 1; }
     done
@@ -104,6 +105,7 @@ case "${1:-}" in
   --full)          run_script full-setup.sh; exit $? ;;
   --bbr)           run_script bbr-install.sh; exit $? ;;
   --doctor)        run_script doctor.sh; exit $? ;;
+  --profile)       run_script profile-setup.sh; exit $? ;;
   --harden)        run_script harden.sh; exit $? ;;
   --ports)         run_script harden.sh --audit; exit $? ;;
   --update-node)   run_script node-update.sh; exit $? ;;
@@ -128,20 +130,22 @@ main_menu() {
     box_top "Главное меню"
     box_row "${C_B}1${C_RESET}  Полная настройка сервера ${C_DIM}(нода или панель)${C_RESET}"
     box_row "${C_B}2${C_RESET}  Панель Remnawave ${C_DIM}· подписка · обновление${C_RESET}"
-    box_row "${C_B}3${C_RESET}  Обновить ноду"
-    box_row "${C_B}4${C_RESET}  Закрыть лишние порты и укрепить сервер"
-    box_row "${C_B}5${C_RESET}  Проверка и исправление проблем"
-    box_row "${C_B}6${C_RESET}  Дополнительно"
+    box_row "${C_B}3${C_RESET}  Профиль и хосты на панели ${C_DIM}(по API)${C_RESET}"
+    box_row "${C_B}4${C_RESET}  Обновить ноду"
+    box_row "${C_B}5${C_RESET}  Закрыть лишние порты и укрепить сервер"
+    box_row "${C_B}6${C_RESET}  Проверка и исправление проблем"
+    box_row "${C_B}7${C_RESET}  Дополнительно"
     box_row "${C_B}0${C_RESET}  Выход"
     box_bottom
     read -r -p "$(echo -e "${C_Y}›${C_RESET} Выбор: ")" ch <"$(prompt_input)" || exit 0
     case "$ch" in
       1) run_script full-setup.sh; pause ;;
       2) run_script panel-install.sh ;;
-      3) run_script node-update.sh; pause ;;
-      4) run_script harden.sh; pause ;;
-      5) run_script doctor.sh; pause ;;
-      6) advanced_menu ;;
+      3) run_script profile-setup.sh; pause ;;
+      4) run_script node-update.sh; pause ;;
+      5) run_script harden.sh; pause ;;
+      6) run_script doctor.sh; pause ;;
+      7) advanced_menu ;;
       0|q|Q) exit 0 ;;
       *) ;;
     esac

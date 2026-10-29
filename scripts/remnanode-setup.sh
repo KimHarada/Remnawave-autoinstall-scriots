@@ -113,6 +113,12 @@ if [ "$USE_HY2" = "1" ]; then
     ok "Сертификат для Hysteria2: ${CERT_DOMAIN} (валиден)."
     VOLUME_LINES="      - /etc/letsencrypt/live/${CERT_DOMAIN}/fullchain.pem:/etc/hysteria/fullchain.pem:ro
       - /etc/letsencrypt/live/${CERT_DOMAIN}/privkey.pem:/etc/hysteria/privkey.pem:ro"
+    # Masquerade Hysteria2 (type "file") отдаёт страницу из каталога ВНУТРИ контейнера:
+    # монтируем заглушку этого протокола по тому же пути, что указан в конфиге профиля.
+    if [ -d /var/www/decoy-hy2 ]; then
+      VOLUME_LINES="${VOLUME_LINES}
+      - /var/www/decoy-hy2:/var/www/decoy-hy2:ro"
+    fi
   fi
 fi
 

@@ -17,9 +17,9 @@
 
 DECOY_CONF=/etc/dorik/decoys.conf
 DECOY_WEB=/var/www
-DECOY_ORDER=(tcp grpc xhttp hy2)
-declare -gA DECOY_PORT=( [tcp]=8081 [grpc]=8082 [xhttp]=8083 [hy2]=8084 )
-declare -gA DECOY_LABEL=( [tcp]="REALITY TCP" [grpc]="gRPC" [xhttp]="XHTTP" [hy2]="Hysteria2" )
+DECOY_ORDER=(tcp grpc xhttp hy2 tg)
+declare -gA DECOY_PORT=( [tcp]=8081 [grpc]=8082 [xhttp]=8083 [hy2]=8084 [tg]=8085 )
+declare -gA DECOY_LABEL=( [tcp]="REALITY TCP" [grpc]="gRPC" [xhttp]="XHTTP" [hy2]="Hysteria2" [tg]="Telegram" )
 
 decoy_root() { echo "${DECOY_WEB}/decoy-$1"; }
 
@@ -31,6 +31,7 @@ decoy_domain() {
     grpc)  [ -n "${DOMAIN_GRPC:-}" ]  && [ "$DOMAIN_GRPC"  != "${DOMAIN_TCP:-}" ] && echo "$DOMAIN_GRPC" ;;
     xhttp) [ -n "${DOMAIN_XHTTP:-}" ] && [ "$DOMAIN_XHTTP" != "${DOMAIN_TCP:-}" ] && echo "$DOMAIN_XHTTP" ;;
     hy2)   [ -n "${DOMAIN_HY2:-}" ]   && [ "${USE_HY2:-0}" = "1" ] && echo "$DOMAIN_HY2" ;;
+    tg)    [ -n "${DOMAIN_TG:-}" ]    && [ "${USE_TG:-0}" = "1" ] && echo "$DOMAIN_TG" ;;
   esac
   return 0
 }
@@ -58,6 +59,7 @@ decoy_write_basic() {  # decoy_write_basic <proto> <root>
     grpc)  title="Scheduled maintenance";   text="We are performing scheduled maintenance. Please check back later." ;;
     xhttp) title="Coming soon";             text="A new website is on its way." ;;
     hy2)   title="Service status";          text="All systems operational." ;;
+    tg)    title="Under construction";      text="This page is under construction." ;;
     *)     title="Hello";                   text="Hello." ;;
   esac
   mkdir -p "$2"
@@ -292,6 +294,10 @@ decoys_table() {
     box_row "  dest → ${C_BOLD}127.0.0.1:${port}${C_RESET}  ${C_DIM}(${zip%.zip})${C_RESET}"
   done < "$DECOY_CONF"
   box_sep
-  box_wrap "${C_DIM}→${C_RESET}" "В профиле Xray на панели укажите этот адрес как dest (target) для REALITY нужного протокола; для Hysteria2 — как адрес masquerade, если он у вас включён."
+  if [ -s /etc/dorik/profile.json ]; then
+    box_wrap "${C_DIM}→${C_RESET}" "Эти адреса уже прописаны как target в профиле на панели (создан по API); Hysteria2 отдаёт файлы из своего каталога."
+  else
+    box_wrap "${C_DIM}→${C_RESET}" "В профиле Xray на панели укажите этот адрес как dest (target) для REALITY нужного протокола; для Hysteria2 — masquerade типа file с каталогом /var/www/decoy-hy2 (или proxy на этот адрес)."
+  fi
   box_bottom
 }

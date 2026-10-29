@@ -36,11 +36,15 @@ panel_installed() { [ -f "$PANEL_DIR/docker-compose.yml" ] && [ -f "$PANEL_DIR/.
 sub_installed()   { [ -f "$SUB_DIR/docker-compose.yml" ] && [ -f "$SUB_DIR/.env" ]; }
 
 # set_env <файл> <КЛЮЧ> <значение> — заменить KEY=... или дописать, если ключа нет.
+# Файл .env из репозитория Remnawave может заканчиваться БЕЗ перевода строки — тогда
+# дописанный ключ приклеился бы к последней строке (POSTGRES_DB=postgresKEY=...).
+ensure_trailing_newline() { [ -s "$1" ] && [ -n "$(tail -c1 "$1")" ] && printf '\n' >> "$1"; return 0; }
+
 set_env() {
   local f="$1" k="$2" v="$3" esc
   esc="$(printf '%s' "$v" | sed -e 's/[\/&|]/\\&/g')"
   if grep -qE "^${k}=" "$f"; then sed -i -E "s|^${k}=.*|${k}=${esc}|" "$f"
-  else printf '%s=%s\n' "$k" "$v" >> "$f"; fi
+  else ensure_trailing_newline "$f"; printf '%s=%s\n' "$k" "$v" >> "$f"; fi
 }
 conf_set() { touch "$PANEL_CONF"; chmod 600 "$PANEL_CONF"; set_env "$PANEL_CONF" "$1" "$2"; }
 conf_get() { env_get "$PANEL_CONF" "$1"; }
@@ -58,7 +62,7 @@ merge_env_sample() {  # merge_env_sample <sample> <.env>
   while IFS= read -r line; do
     case "$line" in ''|\#*) continue ;; esac
     k="${line%%=*}"
-    grep -qE "^${k}=" "$2" || { echo "$line" >> "$2"; info "в .env добавлен новый параметр ${k}"; }
+    grep -qE "^${k}=" "$2" || { ensure_trailing_newline "$2"; echo "$line" >> "$2"; info "в .env добавлен новый параметр ${k}"; }
   done < "$1"
 }
 

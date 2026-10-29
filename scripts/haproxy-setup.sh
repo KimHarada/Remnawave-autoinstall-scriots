@@ -21,14 +21,21 @@ if [ "$NONINTERACTIVE" != "1" ]; then
   DOMAIN_HY2=$(ask_valid "Домен для Hysteria2 (Enter — не использовать)" "${DOMAIN_HY2:-}" is_valid_domain 1) || exit 1
   USE_HY2=0
   if [ -n "$DOMAIN_HY2" ] && ask_yes_no "Использовать Hysteria2?" "1"; then USE_HY2=1; fi
+  USE_TG=0
+  if ask_yes_no "Нужен отдельный хост только для Telegram и ЮKassa?" "2"; then
+    USE_TG=1
+    DOMAIN_TG=$(ask_valid "Домен для Telegram-хоста" "${DOMAIN_TG:-}" is_valid_domain) || exit 1
+  fi
   if ask_yes_no "Ставить красивые страницы-заглушки (своя, разная для каждого протокола)?" "1"; then INSTALL_DECOY=1; else INSTALL_DECOY=0; fi
 else
   INSTALL_DECOY="${INSTALL_DECOY:-1}"
   DOMAIN_TCP="${DOMAIN_TCP:-}"; DOMAIN_GRPC="${DOMAIN_GRPC:-}"
   DOMAIN_XHTTP="${DOMAIN_XHTTP:-}"; DOMAIN_HY2="${DOMAIN_HY2:-}"
   USE_HY2="${USE_HY2:-0}"
+  USE_TG="${USE_TG:-0}"; DOMAIN_TG="${DOMAIN_TG:-}"
 fi
-DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"
+[ "$USE_TG" = "1" ] || DOMAIN_TG=""
+DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"; DOMAIN_TG="${DOMAIN_TG,,}"
 
 if [ -z "$DOMAIN_TCP" ]; then
   err "DOMAIN_TCP не задан — это домен по умолчанию для HAProxy (REALITY TCP)."
@@ -36,7 +43,7 @@ if [ -z "$DOMAIN_TCP" ]; then
 fi
 
 _dorik_source decoys.sh
-ALL_DOMAINS=("$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2")
+ALL_DOMAINS=("$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2" "$DOMAIN_TG")
 
 step "Установка Nginx / HAProxy / Certbot"
 apt_update || warn "apt update не удался — ставлю из имеющихся списков."
@@ -157,6 +164,7 @@ frontend fe_443
 EOF
 [ -n "$DOMAIN_GRPC" ]  && [ "$DOMAIN_GRPC"  != "$DOMAIN_TCP" ] && echo "    use_backend be_grpc if { req.ssl_sni -i ${DOMAIN_GRPC} }"
 [ -n "$DOMAIN_XHTTP" ] && [ "$DOMAIN_XHTTP" != "$DOMAIN_TCP" ] && echo "    use_backend be_xhttp if { req.ssl_sni -i ${DOMAIN_XHTTP} }"
+[ -n "$DOMAIN_TG" ]    && [ "$DOMAIN_TG"    != "$DOMAIN_TCP" ] && echo "    use_backend be_tg if { req.ssl_sni -i ${DOMAIN_TG} }"
 cat <<'EOF'
     default_backend be_tcp
 
@@ -168,6 +176,9 @@ if [ -n "$DOMAIN_GRPC" ] && [ "$DOMAIN_GRPC" != "$DOMAIN_TCP" ]; then
 fi
 if [ -n "$DOMAIN_XHTTP" ] && [ "$DOMAIN_XHTTP" != "$DOMAIN_TCP" ]; then
   printf '\nbackend be_xhttp\n    server xhttp1 127.0.0.1:56791\n'
+fi
+if [ -n "$DOMAIN_TG" ] && [ "$DOMAIN_TG" != "$DOMAIN_TCP" ]; then
+  printf '\nbackend be_tg\n    server tg1 127.0.0.1:56792\n'
 fi
 if [ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ]; then
   printf '\n# Hysteria2 обслуживается напрямую Xray на 443/udp, HAProxy его не касается\n'

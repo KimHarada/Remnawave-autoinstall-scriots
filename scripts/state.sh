@@ -190,6 +190,13 @@ st_ports() {
   else _st ok "снаружи только нужное: ${open:-—}"; fi
 }
 
+st_profile() {
+  local f=/etc/dorik/profile.json n
+  if [ ! -s "$f" ]; then _st off "не создавался (пункт «Профиль и хосты на панели»)"; return; fi
+  n="$(jq -r '[.protocols[]?.domain] | length' "$f" 2>/dev/null)"
+  _st ok "$(jq -r '.name // "?"' "$f") · протоколов: ${n:-?}$(jq -e '.protocols.tg' "$f" &>/dev/null && echo " · есть Telegram-хост")"
+}
+
 st_issues() {
   if ! declare -F doctor_scan &>/dev/null; then _st off "—"; return; fi
   doctor_scan
@@ -203,7 +210,7 @@ show_dashboard() {
   for entry in \
     "Система:st_system" "SSH:st_ssh" "Firewall (ufw):st_ufw" "fail2ban:st_f2b" \
     "Открытые порты:st_ports" "BBR:st_bbr" "Nginx/HAProxy:st_web" "Сертификаты:st_certs" "Docker:st_docker" \
-    "Нода Remnanode:st_node" "Панель Remnawave:st_panel" "Страница подп.:st_sub" \
+    "Нода Remnanode:st_node" "Профиль панели:st_profile" "Панель Remnawave:st_panel" "Страница подп.:st_sub" \
     "Расписание:st_cron" "Проверка:st_issues"; do
     label="${entry%%:*}"; fn="${entry##*:}"
     "$fn"

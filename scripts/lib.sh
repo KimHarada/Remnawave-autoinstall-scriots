@@ -87,6 +87,7 @@ is_valid_port()   { [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 6
 is_valid_domain() { [[ "${1:-}" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; }
 is_valid_ip()     { [[ "${1:-}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || [[ "${1:-}" =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ ]]; }
 is_valid_choice12() { [ "${1:-}" = "1" ] || [ "${1:-}" = "2" ]; }
+is_valid_url()    { [[ "${1:-}" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[^[:space:]]*)?$ ]]; }
 
 # ask_valid <prompt> <default> <validator> [optional=0]
 # Спрашивает, пока validator не примет значение. optional=1 — пустой ответ
@@ -200,7 +201,7 @@ apt_install() { spin_run "Установка пакетов: $*" apt_run install
 
 # Базовый набор для любого этапа: на минимальном образе Ubuntu часть этого нет
 # (ufw, dnsutils, psmisc, cron) — и раньше шаги молча «ставились» впустую.
-BASE_PACKAGES=(curl ca-certificates iproute2 dnsutils unzip ufw cron openssl psmisc procps)
+BASE_PACKAGES=(curl ca-certificates iproute2 dnsutils unzip ufw cron openssl psmisc procps jq)
 
 ensure_base_packages() {
   step "Базовые пакеты"
