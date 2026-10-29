@@ -147,7 +147,8 @@ if [ "$ROLE" = "1" ]; then
     WEB_SECRET="${WEB_SECRET:-$(openssl rand -hex 16)}"
     echo
     box_top "Реклама канала: регистрация в @MTProxybot (по желанию)"
-    box_row "1. Бот → /newproxy"
+    box_row "Бот: ${C_BOLD}https://t.me/MTProxybot${C_RESET}"
+    box_row "1. Отправьте боту: /newproxy"
     box_row "2. Адрес:  ${C_BOLD}${DOMAIN_WEB}:443${C_RESET}"
     box_row "3. Ключ:   ${C_BOLD}${WEB_SECRET}${C_RESET}"
     box_row "4. Тег из бота (32 символа) введите ниже; пропустить можно"

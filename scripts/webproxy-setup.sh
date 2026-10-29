@@ -56,7 +56,8 @@ wp_link() { printf 'tg://webproxy?server=%s&secret=dd%s' "$1" "$2"; }
 # Данные для регистрации прокси в @MTProxybot (бот просит адрес и ключ, потом выдаёт рекламный тег).
 wp_bot_info() {  # wp_bot_info <домен> <секрет 32hex>
   box_top "Регистрация в @MTProxybot (для рекламы канала)"
-  box_row "1. Бот → /newproxy"
+  box_row "Бот: ${C_BOLD}https://t.me/MTProxybot${C_RESET}"
+  box_row "1. Отправьте боту: /newproxy"
   box_row "2. Адрес:  ${C_BOLD}$1:443${C_RESET}"
   box_row "3. Ключ:   ${C_BOLD}$2${C_RESET}  ${C_DIM}(без dd)${C_RESET}"
   box_row "4. Бот выдаст тег (32 символа) — его укажите скрипту"
