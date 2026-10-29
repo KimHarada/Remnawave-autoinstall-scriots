@@ -455,9 +455,10 @@ profile_collect_params() {
   if [ -z "${PSIPHON:-}" ]; then
     if ask_yes_no "Маршрут Gemini/AI Studio через psiphon (172.17.0.1:1080, как в вашем конфиге)?" "1"; then PSIPHON=1; else PSIPHON=0; fi
   fi
-  if [ -z "${PROFILE_CREATE_NODE:-}" ]; then
-    if ask_yes_no "Создать на панели ноду этого сервера и привязать профиль?" "1"; then PROFILE_CREATE_NODE=1; else PROFILE_CREATE_NODE=0; fi
-  fi
+  # Нода создаётся на панели сама (SECRET_KEY панель выдаёт по API — вручную ничего копировать не нужно).
+  # Не создавать: PROFILE_CREATE_NODE=0.
+  PROFILE_CREATE_NODE="${PROFILE_CREATE_NODE:-1}"
+  [ "$PROFILE_CREATE_NODE" = "1" ] && info "Нода этого сервера будет создана на панели автоматически, SECRET_KEY получим по API."
   return 0
 }
 
