@@ -143,18 +143,13 @@ ok "Nginx настроен."
 step "Настройка HAProxy"
 
 # ---- защита от сканеров ------------------------------------------------------------------
-# SCAN_PROTECT=1 (по умолчанию): на 443 пропускаем только TLS с SNI одного из НАШИХ доменов.
-# Всё остальное — соединение без SNI (заход по голому IP), чужой SNI, не-TLS мусор, молчание —
-# молча обрывается. Раньше такие соединения уходили в бэкенд REALITY TCP и отдавали сканеру
-# заглушку с сертификатом первого домена: по одному IP узнавался домен сервера.
-# Дополнительно: лимит новых соединений и одновременных соединений с одного IP.
+# Любой заход (по IP, с чужим SNI) должен видеть обычный сайт-заглушку, как у настоящего сервера:
+# мёртвый порт для проверяющего (ТСПУ) подозрительнее. Поэтому лишнее НЕ рвём, а отдаём REALITY TCP.
+# SCAN_PROTECT=1 добавляет: лимит новых соединений и одновременных соединений с одного IP.
 #   HAPROXY_RATE (300 новых за 10 с), HAPROXY_CONN_MAX (3000 одновременных) — под CGNAT/офисы
 #   с тысячами клиентов за одним адресом при необходимости поднимите.
 SCAN_PROTECT="${SCAN_PROTECT:-1}"
 HAP_RATE="${HAPROXY_RATE:-300}"; HAP_CONN_MAX="${HAPROXY_CONN_MAX:-3000}"
-KNOWN_SNI=()
-for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_TG"; do [ -n "$d" ] && KNOWN_SNI+=("$d"); done
-[ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ] && KNOWN_SNI+=("$DOMAIN_HY2")
 
 HAP_NEW="$(mktemp)"
 {
@@ -182,11 +177,11 @@ if [ "$SCAN_PROTECT" = "1" ]; then
     tcp-request connection track-sc0 src
     tcp-request connection reject if { sc_conn_rate(0) gt ${HAP_RATE} }
     tcp-request connection reject if { sc_conn_cur(0) gt ${HAP_CONN_MAX} }
-    # ждём ClientHello недолго: молчащий сканер не должен занимать сокет
+    # ждём ClientHello недолго: молчащий сканер не должен занимать сокет.
+    # Неизвестный/пустой SNI и не-TLS НЕ отбрасываем: они уходят в REALITY TCP, а тот показывает
+    # заглушку, как настоящий сайт (иначе проверка по IP/чужому SNI видела бы «мёртвый» порт).
     tcp-request inspect-delay 3s
-    acl known_sni req.ssl_sni -i ${KNOWN_SNI[*]}
-    tcp-request content accept if { req.ssl_hello_type 1 } known_sni
-    tcp-request content reject
+    tcp-request content accept if { req.ssl_hello_type 1 }
 EOF
 else
   cat <<'EOF'
@@ -199,11 +194,7 @@ fi
 [ -n "$DOMAIN_TG" ]    && [ "$DOMAIN_TG"    != "$DOMAIN_TCP" ] && echo "    use_backend be_tg if { req.ssl_sni -i ${DOMAIN_TG} }"
 # Домен Hysteria2 по TCP — его собственная заглушка с его сертификатом (по UDP отвечает сам Hysteria2).
 [ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ] && [ "$DOMAIN_HY2" != "$DOMAIN_TCP" ] && echo "    use_backend be_hy2 if { req.ssl_sni -i ${DOMAIN_HY2} }"
-if [ "$SCAN_PROTECT" = "1" ]; then
-  echo "    use_backend be_tcp if { req.ssl_sni -i ${DOMAIN_TCP} }"
-else
-  echo "    default_backend be_tcp"
-fi
+echo "    default_backend be_tcp"
 cat <<'EOF'
 
 backend be_tcp
