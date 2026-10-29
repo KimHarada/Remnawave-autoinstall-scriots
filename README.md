@@ -47,7 +47,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/KimHarada/Remnawave-autoinst
    У Hysteria2 masquerade — файлы заглушки `/var/www/decoy-hy2` (каталог монтируется в контейнер ноды).
 3. **Telegram-хост (пятый).** Вопрос «да/нет». При «да» добавляется ещё один REALITY-хост со своим доменом, ключами и заглушкой, который
    пропускает **только Telegram и ЮKassa/ЮMoney** (`geosite:telegram`, `geoip:telegram`, `yookassa.ru`, `yoomoney.ru` + свои домены в
-   `TG_EXTRA_DOMAINS`); всё остальное с него блокируется. Остальные хосты работают как обычно.
+   `TG_EXTRA_DOMAINS`) и адреса проверки задержки клиентов (`cp.cloudflare.com`, `gstatic.com`, `google.com/generate_204`) — иначе у хоста
+   не будет «пинга»; всё остальное с него блокируется. Остальные хосты работают как обычно.
 4. Профиль создаётся на панели (при повторном запуске обновляется, **ключи сохраняются** в `/etc/dorik/profile.json`, права 600), для каждого
    протокола создаётся хост (sni, fingerprint, path/host для XHTTP, alpn h3 для Hysteria2), inbound'ы добавляются в сквад, создаётся нода.
 5. `SECRET_KEY` ноды берётся по API — вставлять его вручную не нужно. После установки ноды скрипт ждёт, пока панель подключится

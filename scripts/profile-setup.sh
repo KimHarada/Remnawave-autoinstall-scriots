@@ -248,7 +248,8 @@ build_config() {  # печатает полный конфиг Xray
   done
   # Что пропускает Telegram-хост: Telegram + ЮKassa/ЮMoney (+ свои домены). Всё остальное — в BLOCK.
   tgdomains="$(jq -nc --arg extra "${TG_EXTRA_DOMAINS:-}" '
-    ["geosite:telegram","domain:telegram.org","domain:t.me","domain:telegra.ph","domain:yookassa.ru","domain:yoomoney.ru"]
+    ["geosite:telegram","domain:telegram.org","domain:t.me","domain:telegra.ph","domain:yookassa.ru","domain:yoomoney.ru",
+     "full:cp.cloudflare.com","full:www.gstatic.com","full:connectivitycheck.gstatic.com","full:clients3.google.com","full:www.google.com"]   # + адреса проверки задержки в клиентах (generate_204), иначе у хоста нет «пинга»
     + ($extra | split(" ") | map(select(length>0) | "domain:" + .))')"
   jq -n --argjson inbounds "$inbounds" --argjson tags "$all_tags" --arg tg "$tg_tag" --argjson tgd "$tgdomains" \
         --arg psiphon "${PSIPHON:-1}" --arg ll "${XRAY_LOGLEVEL:-warning}" \
