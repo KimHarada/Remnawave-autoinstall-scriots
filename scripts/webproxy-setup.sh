@@ -45,10 +45,15 @@ WP_PORT_BACKEND=18080
 
 wp_get() { [ -s "$WP_STATE" ] && jq -r "$1 // empty" "$WP_STATE" 2>/dev/null; return 0; }
 wp_save() {  # wp_save <домен> <секрет> <тег>
-  mkdir -p "$(dirname "$WP_STATE")"; umask 077
-  jq -n --arg d "$1" --arg s "$2" --arg t "$3" --arg v "$TELEMT_VERSION" \
-    '{domain:$d, secret:$s, adTag:$t, telemt:$v}' > "$WP_STATE"
-  chmod 600 "$WP_STATE"
+  # umask только внутри подоболочки: иначе он остался бы 077 до конца скрипта и каталоги Telemt
+  # создавались бы недоступными для его пользователя (status=203/EXEC, «Permission denied»).
+  (
+    umask 077
+    mkdir -p "$(dirname "$WP_STATE")"
+    jq -n --arg d "$1" --arg s "$2" --arg t "$3" --arg v "$TELEMT_VERSION" \
+      '{domain:$d, secret:$s, adTag:$t, telemt:$v}' > "$WP_STATE"
+    chmod 600 "$WP_STATE"
+  )
 }
 wp_installed() { [ -s "$WP_STATE" ] && [ -x "$WP_LIB_DIR/telemt" ]; }
 wp_link() { printf 'tg://webproxy?server=%s&secret=dd%s' "$1" "$2"; }
@@ -134,6 +139,7 @@ wp_install_binary() {
   arch="$(uname -m)"
   [ -n "${TELEMT_SHA256[$arch]:-}" ] || { err "Архитектура ${arch} не поддерживается (нужен x86_64 или aarch64)."; return 1; }
   if [ -x "$WP_LIB_DIR/telemt" ] && [ "$(cat "$WP_LIB_DIR/.version" 2>/dev/null)" = "$TELEMT_VERSION" ]; then
+    chmod 755 "$WP_LIB_DIR" 2>/dev/null || true     # чинит каталог, созданный прежней версией скрипта с правами 700
     ok "Telemt ${TELEMT_VERSION} уже установлен."; return 0
   fi
   work="$(mktemp -d)"
@@ -153,6 +159,7 @@ wp_install_binary() {
   local bin; bin="$(find "$work/x" -type f -name telemt | head -1)"
   [ -n "$bin" ] || { err "В архиве нет файла telemt."; rm -rf "$work"; return 1; }
   mkdir -p "$WP_LIB_DIR"
+  chmod 755 "$WP_LIB_DIR"            # каталог должен быть доступен пользователю службы независимо от umask
   install -m 755 "$bin" "$WP_LIB_DIR/telemt"
   echo "$TELEMT_VERSION" > "$WP_LIB_DIR/.version"
   rm -rf "$work"
@@ -319,6 +326,8 @@ wp_install() {
   wp_install_binary || return 1
   wp_write_config "$WEB_DOMAIN" "$WEB_SECRET_VAL" "$WEB_TAG_VAL" || return 1
   wp_write_unit
+  runuser -u mtproxy-web -- test -x "$WP_LIB_DIR/telemt" \
+    || { err "Пользователь mtproxy-web не может запустить ${WP_LIB_DIR}/telemt (проверьте права каталога: ls -ld ${WP_LIB_DIR})."; return 1; }
   systemctl enable "$WP_SERVICE" &>/dev/null || true
   systemctl restart "$WP_SERVICE"
   spin_run "Запуск Telemt" wp_wait_ready || { err "Telemt не стал принимать соединения:"; journalctl -u "$WP_SERVICE" -n 30 --no-pager >&2; return 1; }
