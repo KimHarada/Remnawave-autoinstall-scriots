@@ -142,10 +142,19 @@ if [ "$ROLE" = "1" ]; then
   # Рекламный тег канала-спонсора для WEB-прокси (необязательно; можно добавить позже: webproxy-setup.sh tag <тег>)
   WEB_AD_TAG="${WEB_AD_TAG:-}"
   if [ "$USE_WEB" = "1" ]; then
-    info "Чтобы ваш канал показывался спонсором: @MTProxybot → зарегистрировать прокси → тег (32 символа). Можно пропустить."
+    # Ключ нужен боту ДО выдачи тега, поэтому создаём его сейчас (установка возьмёт тот же).
+    WEB_SECRET="${WEB_SECRET:-$([ -s /etc/dorik/webproxy.json ] && jq -r '.secret // empty' /etc/dorik/webproxy.json 2>/dev/null)}"
+    WEB_SECRET="${WEB_SECRET:-$(openssl rand -hex 16)}"
+    echo
+    box_top "Реклама канала: регистрация в @MTProxybot (по желанию)"
+    box_row "1. Бот → /newproxy"
+    box_row "2. Адрес:  ${C_BOLD}${DOMAIN_WEB}:443${C_RESET}"
+    box_row "3. Ключ:   ${C_BOLD}${WEB_SECRET}${C_RESET}"
+    box_row "4. Тег из бота (32 символа) введите ниже; пропустить можно"
+    box_bottom
     WEB_AD_TAG=$(ask_valid "Рекламный тег (Enter — без рекламы канала)" "$WEB_AD_TAG" is_hex32 1) || exit 1
   fi
-  export USE_WEB DOMAIN_WEB WEB_AD_TAG
+  export USE_WEB DOMAIN_WEB WEB_AD_TAG WEB_SECRET
 
   # ---- предварительная проверка DNS сразу после ввода доменов --------------
   # Видно сразу, до подтверждения запуска, пока ещё можно поправить A-записи
@@ -512,7 +521,7 @@ if [ "$ROLE" = "1" ]; then
   if [ "${USE_WEB:-0}" = "1" ]; then
     do_webproxy() {
       local src; src="$(get_script webproxy-setup.sh)" || { err "Не удалось получить webproxy-setup.sh"; return 1; }
-      DOMAIN_WEB="$DOMAIN_WEB" WEB_AD_TAG="$WEB_AD_TAG" WEB_FRONT_DONE=1 WEB_NONINTERACTIVE=1 bash "$src" install
+      DOMAIN_WEB="$DOMAIN_WEB" WEB_AD_TAG="$WEB_AD_TAG" WEB_SECRET="$WEB_SECRET" WEB_FRONT_DONE=1 WEB_NONINTERACTIVE=1 bash "$src" install
     }
     run_step "WEB-прокси Telegram (Telemt)" do_webproxy
   fi

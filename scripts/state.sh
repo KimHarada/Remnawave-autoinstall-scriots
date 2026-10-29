@@ -199,7 +199,7 @@ st_profile() {
 
 st_webproxy() {
   local f=/etc/dorik/webproxy.json
-  if [ ! -s "$f" ]; then _st off "не установлен (пункт «WEB-прокси Telegram»)"; return; fi
+  if [ ! -s "$f" ] || [ ! -x /usr/local/lib/mtproxy-web/telemt ]; then _st off "не установлен (пункт «WEB-прокси Telegram»)"; return; fi
   if svc_active mtproxy-web; then
     _st ok "$(jq -r '.domain' "$f" 2>/dev/null)$(jq -e '.adTag != ""' "$f" &>/dev/null && echo " · канал-спонсор подключён")"
   else

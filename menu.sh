@@ -165,6 +165,7 @@ web_menu() {
     box_row "${C_B}2${C_RESET}  Показать ссылку и состояние"
     box_row "${C_B}3${C_RESET}  Рекламный тег канала-спонсора"
     box_row "${C_B}4${C_RESET}  Удалить WEB-прокси"
+    box_row "${C_B}5${C_RESET}  Создать ключ для @MTProxybot ${C_DIM}(до установки)${C_RESET}"
     box_row "${C_B}9${C_RESET}  Назад"
     box_bottom
     read -r -p "$(echo -e "${C_Y}›${C_RESET} Выбор: ")" ch <"$(prompt_input)" || return 0
@@ -174,6 +175,7 @@ web_menu() {
       3) read -r -p "Тег из @MTProxybot (32 символа; off — убрать): " tg <"$(prompt_input)" || tg=""
          [ -n "$tg" ] && run_script webproxy-setup.sh tag "$tg"; pause ;;
       4) run_script webproxy-setup.sh remove; pause ;;
+      5) run_script webproxy-setup.sh secret; pause ;;
       *) return 0 ;;
     esac
   done

@@ -14,6 +14,7 @@
 #   webproxy-setup.sh [install]     установить / обновить (по умолчанию)
 #   webproxy-setup.sh status        состояние и ссылка
 #   webproxy-setup.sh link          только ссылка для клиентов
+#   webproxy-setup.sh secret [домен]  заранее создать ключ и показать данные для @MTProxybot
 #   webproxy-setup.sh tag <32hex>   сменить рекламный тег (пусто/off — убрать)
 #   webproxy-setup.sh remove        удалить WEB-прокси (домен и сертификат остаются)
 # Без вопросов: ASSUME_YES=1 DOMAIN_WEB=web.example.com [WEB_SECRET=32hex] [WEB_AD_TAG=32hex]
@@ -52,6 +53,17 @@ wp_save() {  # wp_save <домен> <секрет> <тег>
 wp_installed() { [ -s "$WP_STATE" ] && [ -x "$WP_LIB_DIR/telemt" ]; }
 wp_link() { printf 'tg://webproxy?server=%s&secret=dd%s' "$1" "$2"; }
 
+# Данные для регистрации прокси в @MTProxybot (бот просит адрес и ключ, потом выдаёт рекламный тег).
+wp_bot_info() {  # wp_bot_info <домен> <секрет 32hex>
+  box_top "Регистрация в @MTProxybot (для рекламы канала)"
+  box_row "1. Бот → /newproxy"
+  box_row "2. Адрес:  ${C_BOLD}$1:443${C_RESET}"
+  box_row "3. Ключ:   ${C_BOLD}$2${C_RESET}  ${C_DIM}(без dd)${C_RESET}"
+  box_row "4. Бот выдаст тег (32 символа) — его укажите скрипту"
+  box_row "5. В боте: /myproxies → прокси → Set promotion → ваш канал"
+  box_bottom
+}
+
 # ---- параметры ------------------------------------------------------------------------------
 wp_collect() {
   local d s t
@@ -61,7 +73,8 @@ wp_collect() {
   if [ "${ASSUME_YES:-0}" != "1" ] && [ "${WEB_NONINTERACTIVE:-0}" != "1" ]; then
     ensure_tty
     d="$(ask_valid "Домен для WEB-прокси (A-запись на этот сервер, отдельный от доменов протоколов)" "$d" is_valid_domain)" || return 1
-    info "Рекламный тег показывает ваш канал спонсором: напишите @MTProxybot, зарегистрируйте прокси и скопируйте тег (32 символа)."
+    if [ -z "$s" ]; then s="$(openssl rand -hex 16)"; wp_save "${d,,}" "$s" "${t:-}"; fi   # ключ нужен боту ДО тега
+    wp_bot_info "${d,,}" "${s#dd}"
     t="$(ask_value "Рекламный тег (Enter — без рекламы канала)" "$t")"
     t="$(printf '%s' "$t" | tr -d ' \r\n"' | tr 'A-F' 'a-f')"
   fi
@@ -315,6 +328,28 @@ wp_install() {
   wp_print_link "$WEB_DOMAIN" "$WEB_SECRET_VAL" "$WEB_TAG_VAL"
 }
 
+# Сгенерировать ключ заранее и показать данные для бота (установка потом использует тот же ключ).
+wp_secret() {  # wp_secret [домен]
+  command -v jq &>/dev/null || apt_install jq || { err "Не удалось установить jq."; return 1; }
+  local d s t
+  d="${1:-${DOMAIN_WEB:-$(wp_get .domain)}}"
+  if [ -z "$d" ] && [ "${ASSUME_YES:-0}" != "1" ]; then
+    ensure_tty; d="$(ask_valid "Домен для WEB-прокси" "" is_valid_domain)" || return 1
+  fi
+  is_valid_domain "$d" || { err "Укажите домен: webproxy-setup.sh secret <домен> (или DOMAIN_WEB=...)."; return 1; }
+  d="${d,,}"
+  s="${WEB_SECRET:-$(wp_get .secret)}"; s="${s#dd}"
+  if [ -n "$s" ]; then is_hex32 "$s" || { err "WEB_SECRET должен быть 32 hex-символа."; return 1; }
+  else s="$(openssl rand -hex 16)"; fi
+  s="$(printf '%s' "$s" | tr 'A-F' 'a-f')"
+  t="$(wp_get .adTag)"
+  wp_save "$d" "$s" "$t"
+  wp_bot_info "$d" "$s"
+  echo
+  info "Ключ сохранён: установка WEB-прокси использует именно его (тег можно указать при установке или потом: --web tag <тег>)."
+  echo "$s"
+}
+
 wp_status() {
   wp_installed || { info "WEB-прокси не установлен."; return 0; }
   local d s t; d="$(wp_get .domain)"; s="$(wp_get .secret)"; t="$(wp_get .adTag)"
@@ -368,7 +403,8 @@ if [ "$_wp_standalone" = "1" ]; then
     link)       wp_installed || { echo "WEB-прокси не установлен." >&2; exit 1; }
                 wp_link "$(wp_get .domain)" "$(wp_get .secret)"; echo; exit 0 ;;
     tag)        wp_tag "${2:-}"; exit $? ;;
+    secret)     banner; wp_secret "${2:-}"; exit $? ;;
     remove)     banner; wp_remove; exit $? ;;
-    *) echo "Использование: $0 [install|status|link|tag <32hex|off>|remove]" >&2; exit 2 ;;
+    *) echo "Использование: $0 [install|status|link|secret [домен]|tag <32hex|off>|remove]" >&2; exit 2 ;;
   esac
 fi
