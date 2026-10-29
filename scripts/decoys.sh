@@ -17,9 +17,12 @@
 
 DECOY_CONF=/etc/dorik/decoys.conf
 DECOY_WEB=/var/www
-DECOY_ORDER=(tcp grpc xhttp hy2 tg)
-declare -gA DECOY_PORT=( [tcp]=8081 [grpc]=8082 [xhttp]=8083 [hy2]=8084 [tg]=8085 )
-declare -gA DECOY_LABEL=( [tcp]="REALITY TCP" [grpc]="gRPC" [xhttp]="XHTTP" [hy2]="Hysteria2" [tg]="Telegram" )
+DECOY_ORDER=(tcp grpc xhttp hy2 tg web)
+declare -gA DECOY_PORT=( [tcp]=8081 [grpc]=8082 [xhttp]=8083 [hy2]=8084 [tg]=8085 [web]=8086 )
+declare -gA DECOY_LABEL=( [tcp]="REALITY TCP" [grpc]="gRPC" [xhttp]="XHTTP" [hy2]="Hysteria2" [tg]="Telegram" [web]="WEB-прокси" )
+# «web» — не Xray-протокол: на его домене nginx проксирует запросы на Telemt (WEB-прокси Telegram,
+# 127.0.0.1:18080), а страницу-заглушку для обычных посетителей отдаёт сам Telemt (webproxy-setup.sh).
+WEB_BACKEND="127.0.0.1:18080"
 
 decoy_root() { echo "${DECOY_WEB}/decoy-$1"; }
 
@@ -32,6 +35,7 @@ decoy_domain() {
     xhttp) [ -n "${DOMAIN_XHTTP:-}" ] && [ "$DOMAIN_XHTTP" != "${DOMAIN_TCP:-}" ] && echo "$DOMAIN_XHTTP" ;;
     hy2)   [ -n "${DOMAIN_HY2:-}" ]   && [ "${USE_HY2:-0}" = "1" ] && echo "$DOMAIN_HY2" ;;
     tg)    [ -n "${DOMAIN_TG:-}" ]    && [ "${USE_TG:-0}" = "1" ] && echo "$DOMAIN_TG" ;;
+    web)   [ -n "${DOMAIN_WEB:-}" ]   && [ "${USE_WEB:-0}" = "1" ] && echo "$DOMAIN_WEB" ;;
   esac
   return 0
 }
@@ -60,6 +64,7 @@ decoy_write_basic() {  # decoy_write_basic <proto> <root>
     xhttp) title="Coming soon";             text="A new website is on its way." ;;
     hy2)   title="Service status";          text="All systems operational." ;;
     tg)    title="Under construction";      text="This page is under construction." ;;
+    web)   title="Notes";                   text="A few notes, written slowly." ;;
     *)     title="Hello";                   text="Hello." ;;
   esac
   mkdir -p "$2"
@@ -188,6 +193,57 @@ decoys_write_conf() {
 }
 
 # ---- nginx -------------------------------------------------------------------------------------
+# Сайт WEB-прокси: TLS с сертификатом своего домена, все пути — на Telemt. Заголовки и таймауты
+# те же, что у штатного установщика Telemt (WebSocket-обновление, без буферизации, без кэша).
+# Возвращает 1, если сертификата нет и сайт пока без TLS.
+decoys_write_nginx_web() {  # decoys_write_nginx_web <домен> <порт>
+  local d="$1" port="$2" listen tls="" rc=0
+  cat > /etc/nginx/conf.d/dorik-web-upgrade.conf <<'EOF'
+# DORIK toolkit — WEB-прокси: значение заголовка Connection для WebSocket
+map $http_upgrade $dorik_web_upgrade {
+    default upgrade;
+    ''      '';
+}
+EOF
+  if cert_is_valid "$d"; then
+    listen="listen 127.0.0.1:${port} ssl http2;"
+    tls="ssl_certificate /etc/letsencrypt/live/${d}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${d}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;"
+  else
+    warn "WEB-прокси: нет сертификата для ${d} — сайт пока без TLS (клиенты не подключатся, пока не выпущен сертификат; перезапустите скрипт)."
+    listen="listen 127.0.0.1:${port};"
+    rc=1
+  fi
+  cat > /etc/nginx/sites-available/decoy-web <<EOF
+# DORIK toolkit — WEB-прокси Telegram (${d}) -> Telemt ${WEB_BACKEND}
+server {
+    ${listen}
+    server_name ${d};
+    server_tokens off;
+    ${tls}
+    access_log off;
+    client_max_body_size 2m;
+    location / {
+        proxy_pass http://${WEB_BACKEND};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$dorik_web_upgrade;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_next_upstream off;
+        proxy_connect_timeout 75s;
+        proxy_send_timeout 75s;
+        proxy_read_timeout 75s;
+        add_header Cache-Control "no-store" always;
+    }
+}
+EOF
+  return "$rc"
+}
+
 # ВАЖНО: Reality «ворует» сертификат у target-сервера реальным TLS-хендшейком. Если target
 # отдаёт голый HTTP или сертификат ДРУГОГО домена, self-steal ломается или выдаёт себя.
 # Поэтому каждая заглушка слушает TLS с сертификатом СВОЕГО домена.
@@ -196,9 +252,15 @@ decoys_write_nginx() {
   local p d port root no_tls=0 keep=" "
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
   rm -f /etc/nginx/sites-enabled/decoy /etc/nginx/sites-available/decoy   # прежняя единая заглушка
+  rm -f /etc/nginx/conf.d/dorik-web-upgrade.conf
   for p in $(decoy_protos); do
     d="$(decoy_domain "$p")"; port="${DECOY_PORT[$p]}"; root="$(decoy_root "$p")"
     keep+="decoy-$p "
+    if [ "$p" = "web" ]; then
+      decoys_write_nginx_web "$d" "$port" || no_tls=$((no_tls+1))
+      ln -sf "/etc/nginx/sites-available/decoy-$p" "/etc/nginx/sites-enabled/decoy-$p"
+      continue
+    fi
     if cert_is_valid "$d"; then
       cat > "/etc/nginx/sites-available/decoy-$p" <<EOF
 # DORIK toolkit — заглушка протокола ${DECOY_LABEL[$p]} (${d})
@@ -250,6 +312,10 @@ decoys_verify() {
   body="$(mktemp)"
   for p in $(decoy_protos); do
     d="$(decoy_domain "$p")"; port="${DECOY_PORT[$p]}"
+    if [ "$p" = "web" ] && ! systemctl is-active --quiet mtproxy-web 2>/dev/null; then
+      info "${DECOY_LABEL[$p]}: Telemt ещё не запущен — проверка страницы будет после установки WEB-прокси."
+      continue
+    fi
     if cert_is_valid "$d"; then
       code="$(curl -sk -o "$body" -w '%{http_code}' --max-time 5 --resolve "${d}:${port}:127.0.0.1" "https://${d}:${port}/" 2>/dev/null || echo 000)"
       if echo | openssl s_client -connect "127.0.0.1:${port}" -servername "$d" 2>/dev/null | openssl x509 -noout -checkhost "$d" 2>/dev/null | grep -q 'does match'; then
@@ -291,7 +357,11 @@ decoys_table() {
   while IFS='|' read -r p d port zip; do
     [ -n "$p" ] || continue
     box_row "${C_B}${DECOY_LABEL[$p]:-$p}${C_RESET}  ${d}"
-    box_row "  dest → ${C_BOLD}127.0.0.1:${port}${C_RESET}  ${C_DIM}(${zip%.zip})${C_RESET}"
+    if [ "$p" = "web" ]; then
+      box_row "  nginx 127.0.0.1:${port} → Telemt  ${C_DIM}(страница: ${zip%.zip})${C_RESET}"
+    else
+      box_row "  dest → ${C_BOLD}127.0.0.1:${port}${C_RESET}  ${C_DIM}(${zip%.zip})${C_RESET}"
+    fi
   done < "$DECOY_CONF"
   box_sep
   if [ -s /etc/dorik/profile.json ]; then

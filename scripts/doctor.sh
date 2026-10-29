@@ -125,6 +125,10 @@ doctor_scan() {
   if svc_exists haproxy && [ -f /etc/haproxy/haproxy.cfg ] && grep -q 'fe_443' /etc/haproxy/haproxy.cfg; then
     svc_active haproxy || _issue web_down "HAProxy настроен, но остановлен — клиенты не подключатся"
   fi
+  # WEB-прокси Telegram (Telemt): установлен, но служба не работает
+  if [ -f /etc/dorik/webproxy.json ] && [ -f /etc/systemd/system/mtproxy-web.service ]; then
+    svc_active mtproxy-web || _issue webproxy_down "WEB-прокси Telegram установлен, но служба mtproxy-web не работает"
+  fi
 
   # панель
   if [ -f "$PANEL_DIR/.env" ]; then
@@ -302,6 +306,8 @@ fix_decoy_legacy() {
   NONINTERACTIVE=1 INSTALL_DECOY=1 DOMAIN_TCP="$dtcp" DOMAIN_GRPC="$dgrpc" DOMAIN_XHTTP="$dxhttp" \
     DOMAIN_HY2="$dhy2" USE_HY2="$([ -n "$dhy2" ] && echo 1 || echo 0)" bash "$src"
 }
+
+fix_webproxy_down() { systemctl restart mtproxy-web && sleep 3 && svc_active mtproxy-web; }
 
 fix_web_down() {
   local rc=0

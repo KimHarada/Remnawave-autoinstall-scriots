@@ -9,6 +9,7 @@
 #   --doctor         проверка и исправление последствий старых версий
 #   --profile        создать профиль и хосты на панели по API
 #   --harden         закрыть лишние порты и укрепить сервер (--ports — только показать порты)
+#   --web            WEB-прокси Telegram (установка/ссылка/тег/удаление: --web status|link|tag <тег>|remove)
 #   --update-node    обновить ноду          --bbr   BBR + сетевая оптимизация
 #   --panel-install  установить панель      --panel-update  обновить панель
 #   --sub            страница подписки      --sub-update    обновить страницу
@@ -50,7 +51,7 @@ download_repo() {
     echo "▲ Архив не скачался — пробую по файлам."
     rm -rf "$tmp"; tmp="$(mktemp -d)"; mkdir -p "$tmp/scripts"
     for f in lib.sh ui.sh state.sh harden.sh decoys.sh profile-setup.sh doctor.sh preflight.sh full-setup.sh bbr-install.sh haproxy-setup.sh \
-             remnanode-setup.sh node-update.sh panel-install.sh fix-ssh-access.sh; do
+             remnanode-setup.sh node-update.sh panel-install.sh fix-ssh-access.sh webproxy-setup.sh; do
       curl -fsSL --retry 3 "${DORIK_RAW}/scripts/${f}" -o "$tmp/scripts/${f}" || { rm -rf "$tmp"; return 1; }
     done
   fi
@@ -106,6 +107,7 @@ case "${1:-}" in
   --bbr)           run_script bbr-install.sh; exit $? ;;
   --doctor)        run_script doctor.sh; exit $? ;;
   --profile)       run_script profile-setup.sh; exit $? ;;
+  --web)           shift; run_script webproxy-setup.sh "$@"; exit $? ;;
   --harden)        run_script harden.sh; exit $? ;;
   --ports)         run_script harden.sh --audit; exit $? ;;
   --update-node)   run_script node-update.sh; exit $? ;;
@@ -134,7 +136,8 @@ main_menu() {
     box_row "${C_B}4${C_RESET}  Обновить ноду"
     box_row "${C_B}5${C_RESET}  Закрыть лишние порты и укрепить сервер"
     box_row "${C_B}6${C_RESET}  Проверка и исправление проблем"
-    box_row "${C_B}7${C_RESET}  Дополнительно"
+    box_row "${C_B}7${C_RESET}  WEB-прокси Telegram ${C_DIM}(реклама своего канала)${C_RESET}"
+    box_row "${C_B}8${C_RESET}  Дополнительно"
     box_row "${C_B}0${C_RESET}  Выход"
     box_bottom
     read -r -p "$(echo -e "${C_Y}›${C_RESET} Выбор: ")" ch <"$(prompt_input)" || exit 0
@@ -145,9 +148,33 @@ main_menu() {
       4) run_script node-update.sh; pause ;;
       5) run_script harden.sh; pause ;;
       6) run_script doctor.sh; pause ;;
-      7) advanced_menu ;;
+      7) web_menu ;;
+      8) advanced_menu ;;
       0|q|Q) exit 0 ;;
       *) ;;
+    esac
+  done
+}
+
+web_menu() {
+  local ch tg
+  while true; do
+    echo
+    box_top "WEB-прокси Telegram"
+    box_row "${C_B}1${C_RESET}  Установить / обновить"
+    box_row "${C_B}2${C_RESET}  Показать ссылку и состояние"
+    box_row "${C_B}3${C_RESET}  Рекламный тег канала-спонсора"
+    box_row "${C_B}4${C_RESET}  Удалить WEB-прокси"
+    box_row "${C_B}9${C_RESET}  Назад"
+    box_bottom
+    read -r -p "$(echo -e "${C_Y}›${C_RESET} Выбор: ")" ch <"$(prompt_input)" || return 0
+    case "$ch" in
+      1) run_script webproxy-setup.sh install; pause ;;
+      2) run_script webproxy-setup.sh status; pause ;;
+      3) read -r -p "Тег из @MTProxybot (32 символа; off — убрать): " tg <"$(prompt_input)" || tg=""
+         [ -n "$tg" ] && run_script webproxy-setup.sh tag "$tg"; pause ;;
+      4) run_script webproxy-setup.sh remove; pause ;;
+      *) return 0 ;;
     esac
   done
 }

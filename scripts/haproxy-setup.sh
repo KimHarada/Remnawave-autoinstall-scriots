@@ -26,6 +26,11 @@ if [ "$NONINTERACTIVE" != "1" ]; then
     USE_TG=1
     DOMAIN_TG=$(ask_valid "Домен для Telegram-хоста" "${DOMAIN_TG:-}" is_valid_domain) || exit 1
   fi
+  USE_WEB=0
+  if ask_yes_no "Нужен WEB-прокси Telegram (отдельный домен, реклама своего канала)?" "2"; then
+    USE_WEB=1
+    DOMAIN_WEB=$(ask_valid "Домен для WEB-прокси" "${DOMAIN_WEB:-}" is_valid_domain) || exit 1
+  fi
   if ask_yes_no "Ставить красивые страницы-заглушки (своя, разная для каждого протокола)?" "1"; then INSTALL_DECOY=1; else INSTALL_DECOY=0; fi
 else
   INSTALL_DECOY="${INSTALL_DECOY:-1}"
@@ -33,9 +38,13 @@ else
   DOMAIN_XHTTP="${DOMAIN_XHTTP:-}"; DOMAIN_HY2="${DOMAIN_HY2:-}"
   USE_HY2="${USE_HY2:-0}"
   USE_TG="${USE_TG:-0}"; DOMAIN_TG="${DOMAIN_TG:-}"
+  USE_WEB="${USE_WEB:-0}"; DOMAIN_WEB="${DOMAIN_WEB:-}"
 fi
 [ "$USE_TG" = "1" ] || DOMAIN_TG=""
-DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"; DOMAIN_TG="${DOMAIN_TG,,}"
+[ "${USE_WEB:-0}" = "1" ] || DOMAIN_WEB=""
+USE_WEB="${USE_WEB:-0}"
+DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"; DOMAIN_TG="${DOMAIN_TG,,}"; DOMAIN_WEB="${DOMAIN_WEB,,}"
+export USE_WEB DOMAIN_WEB
 
 if [ -z "$DOMAIN_TCP" ]; then
   err "DOMAIN_TCP не задан — это домен по умолчанию для HAProxy (REALITY TCP)."
@@ -43,7 +52,7 @@ if [ -z "$DOMAIN_TCP" ]; then
 fi
 
 _dorik_source decoys.sh
-ALL_DOMAINS=("$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2" "$DOMAIN_TG")
+ALL_DOMAINS=("$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2" "$DOMAIN_TG" "$DOMAIN_WEB")
 
 step "Установка Nginx / HAProxy / Certbot"
 apt_update || warn "apt update не удался — ставлю из имеющихся списков."
@@ -194,6 +203,8 @@ fi
 [ -n "$DOMAIN_TG" ]    && [ "$DOMAIN_TG"    != "$DOMAIN_TCP" ] && echo "    use_backend be_tg if { req.ssl_sni -i ${DOMAIN_TG} }"
 # Домен Hysteria2 по TCP — его собственная заглушка с его сертификатом (по UDP отвечает сам Hysteria2).
 [ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ] && [ "$DOMAIN_HY2" != "$DOMAIN_TCP" ] && echo "    use_backend be_hy2 if { req.ssl_sni -i ${DOMAIN_HY2} }"
+# WEB-прокси Telegram: nginx (TLS своего домена) -> Telemt; страницу для обычных посетителей отдаёт Telemt.
+[ -n "$DOMAIN_WEB" ] && [ "$DOMAIN_WEB" != "$DOMAIN_TCP" ] && echo "    use_backend be_web if { req.ssl_sni -i ${DOMAIN_WEB} }"
 echo "    default_backend be_tcp"
 cat <<'EOF'
 
@@ -211,6 +222,9 @@ if [ -n "$DOMAIN_TG" ] && [ "$DOMAIN_TG" != "$DOMAIN_TCP" ]; then
 fi
 if [ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ] && [ "$DOMAIN_HY2" != "$DOMAIN_TCP" ]; then
   printf '\n# Hysteria2 по UDP 443 обслуживает Xray сам (masquerade); по TCP этот домен ведёт на свою заглушку\nbackend be_hy2\n    server hy2web 127.0.0.1:%s\n' "${DECOY_PORT[hy2]:-8084}"
+fi
+if [ -n "$DOMAIN_WEB" ] && [ "$DOMAIN_WEB" != "$DOMAIN_TCP" ]; then
+  printf '\n# WEB-прокси Telegram (nginx -> Telemt)\nbackend be_web\n    server web1 127.0.0.1:%s\n' "${DECOY_PORT[web]:-8086}"
 fi
 } > "$HAP_NEW"
 

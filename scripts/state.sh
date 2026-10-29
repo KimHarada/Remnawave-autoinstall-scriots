@@ -197,6 +197,16 @@ st_profile() {
   _st ok "$(jq -r '.name // "?"' "$f") · протоколов: ${n:-?}$(jq -e '.protocols.tg' "$f" &>/dev/null && echo " · есть Telegram-хост")"
 }
 
+st_webproxy() {
+  local f=/etc/dorik/webproxy.json
+  if [ ! -s "$f" ]; then _st off "не установлен (пункт «WEB-прокси Telegram»)"; return; fi
+  if svc_active mtproxy-web; then
+    _st ok "$(jq -r '.domain' "$f" 2>/dev/null)$(jq -e '.adTag != ""' "$f" &>/dev/null && echo " · канал-спонсор подключён")"
+  else
+    _st bad "служба mtproxy-web остановлена"
+  fi
+}
+
 st_issues() {
   if ! declare -F doctor_scan &>/dev/null; then _st off "—"; return; fi
   doctor_scan
@@ -210,7 +220,7 @@ show_dashboard() {
   for entry in \
     "Система:st_system" "SSH:st_ssh" "Firewall (ufw):st_ufw" "fail2ban:st_f2b" \
     "Открытые порты:st_ports" "BBR:st_bbr" "Nginx/HAProxy:st_web" "Сертификаты:st_certs" "Docker:st_docker" \
-    "Нода Remnanode:st_node" "Профиль панели:st_profile" "Панель Remnawave:st_panel" "Страница подп.:st_sub" \
+    "Нода Remnanode:st_node" "Профиль панели:st_profile" "WEB-прокси TG:st_webproxy" "Панель Remnawave:st_panel" "Страница подп.:st_sub" \
     "Расписание:st_cron" "Проверка:st_issues"; do
     label="${entry%%:*}"; fn="${entry##*:}"
     "$fn"

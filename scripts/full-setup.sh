@@ -82,8 +82,8 @@ if [ "$ROLE" = "1" ]; then
   # Вручную (по домену на протокол) либо от ОДНОГО базового домена: остальные сгенерирую сам
   # (случайные имена — по названию поддомена нельзя угадать протокол; нужна wildcard-запись DNS).
   # значения из окружения (режим без вопросов) запоминаем до обнуления
-  USE_TG_ENV="${USE_TG:-0}"; USE_HY2_ENV="${USE_HY2:-1}"
-  USE_TG=0; DOMAIN_TG="${DOMAIN_TG:-}"; USE_HY2=0
+  USE_TG_ENV="${USE_TG:-0}"; USE_HY2_ENV="${USE_HY2:-1}"; USE_WEB_ENV="${USE_WEB:-0}"
+  USE_TG=0; DOMAIN_TG="${DOMAIN_TG:-}"; USE_HY2=0; USE_WEB=0; DOMAIN_WEB="${DOMAIN_WEB:-}"
   DOMAIN_MODE=2
   [ -n "${DOMAIN_TCP:-}" ] && DOMAIN_MODE=1
   echo "Как задать домены протоколов?"
@@ -99,6 +99,7 @@ if [ "$ROLE" = "1" ]; then
     BASE_DOMAIN="${BASE_DOMAIN,,}"
     if ask_yes_no "Использовать Hysteria2 на этой ноде?" "$([ "$USE_HY2_ENV" = "0" ] && echo 2 || echo 1)"; then USE_HY2=1; fi
     if ask_yes_no "Нужен отдельный хост только для Telegram и ЮKassa?" "$([ "${USE_TG_ENV:-0}" = "1" ] && echo 1 || echo 2)"; then USE_TG=1; fi
+    if ask_yes_no "Нужен WEB-прокси Telegram (тип «WEB», реклама своего канала)?" "$([ "${USE_WEB_ENV:-0}" = "1" ] && echo 1 || echo 2)"; then USE_WEB=1; fi
     gen_domain() {  # gen_domain <proto> — прежний домен под этой базой либо новый случайный
       local d; d="$(prev_domain "$1")"
       case "$d" in *".${BASE_DOMAIN}") echo "$d" ;; *) echo "$(openssl rand -hex 4).${BASE_DOMAIN}" ;; esac
@@ -106,6 +107,7 @@ if [ "$ROLE" = "1" ]; then
     DOMAIN_TCP="$(gen_domain tcp)"; DOMAIN_GRPC="$(gen_domain grpc)"; DOMAIN_XHTTP="$(gen_domain xhttp)"
     DOMAIN_HY2=""; [ "$USE_HY2" = "1" ] && DOMAIN_HY2="$(gen_domain hy2)"
     DOMAIN_TG="";  [ "$USE_TG" = "1" ]  && DOMAIN_TG="$(gen_domain tg)"
+    DOMAIN_WEB=""; [ "$USE_WEB" = "1" ] && DOMAIN_WEB="$(gen_domain web)"
     echo
     box_top "Домены протоколов"
     box_row "REALITY TCP   ${DOMAIN_TCP}"
@@ -113,6 +115,7 @@ if [ "$ROLE" = "1" ]; then
     box_row "XHTTP         ${DOMAIN_XHTTP}"
     [ -n "$DOMAIN_HY2" ] && box_row "Hysteria2     ${DOMAIN_HY2}"
     [ -n "$DOMAIN_TG" ]  && box_row "Telegram      ${DOMAIN_TG}"
+    [ -n "$DOMAIN_WEB" ] && box_row "WEB-прокси    ${DOMAIN_WEB}"
     box_sep
     box_wrap "${C_DIM}→${C_RESET}" "DNS: создайте A-запись *.${BASE_DOMAIN} на IP этого сервера (или отдельные A-записи на каждый домен выше)."
     box_bottom
@@ -128,8 +131,21 @@ if [ "$ROLE" = "1" ]; then
     else
       DOMAIN_TG=""
     fi
+    if ask_yes_no "Нужен WEB-прокси Telegram (тип «WEB», реклама своего канала)?" "$([ "${USE_WEB_ENV:-0}" = "1" ] && echo 1 || echo 2)"; then
+      USE_WEB=1
+      DOMAIN_WEB=$(ask_valid "Домен для WEB-прокси" "${DOMAIN_WEB:-$(prev_domain web)}" is_valid_domain) || exit 1
+    else
+      DOMAIN_WEB=""
+    fi
   fi
-  DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"; DOMAIN_TG="${DOMAIN_TG,,}"
+  DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"; DOMAIN_TG="${DOMAIN_TG,,}"; DOMAIN_WEB="${DOMAIN_WEB,,}"
+  # Рекламный тег канала-спонсора для WEB-прокси (необязательно; можно добавить позже: webproxy-setup.sh tag <тег>)
+  WEB_AD_TAG="${WEB_AD_TAG:-}"
+  if [ "$USE_WEB" = "1" ]; then
+    info "Чтобы ваш канал показывался спонсором: @MTProxybot → зарегистрировать прокси → тег (32 символа). Можно пропустить."
+    WEB_AD_TAG=$(ask_valid "Рекламный тег (Enter — без рекламы канала)" "$WEB_AD_TAG" is_hex32 1) || exit 1
+  fi
+  export USE_WEB DOMAIN_WEB WEB_AD_TAG
 
   # ---- предварительная проверка DNS сразу после ввода доменов --------------
   # Видно сразу, до подтверждения запуска, пока ещё можно поправить A-записи
@@ -141,7 +157,7 @@ if [ "$ROLE" = "1" ]; then
   else
     info "Публичный IP сервера: ${PREFLIGHT_PUB_IP}"
     DNS_PREFLIGHT_BAD=0
-    for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2" "$DOMAIN_TG"; do
+    for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2" "$DOMAIN_TG" "$DOMAIN_WEB"; do
       [ -z "$d" ] && continue
       if dns_points_here "$d" "$PREFLIGHT_PUB_IP"; then
         ok "${d}: DNS указывает на этот сервер."
@@ -269,7 +285,7 @@ else
   box_row "SSH-порт:           ${NEW_SSH_PORT} (без изменений)"
 fi
 if [ "$ROLE" = "1" ]; then
-  box_wrap "Домены:           " "${DOMAIN_TCP}${DOMAIN_GRPC:+ ${DOMAIN_GRPC}}${DOMAIN_XHTTP:+ ${DOMAIN_XHTTP}}${DOMAIN_HY2:+ ${DOMAIN_HY2}}${DOMAIN_TG:+ ${DOMAIN_TG}}"
+  box_wrap "Домены:           " "${DOMAIN_TCP}${DOMAIN_GRPC:+ ${DOMAIN_GRPC}}${DOMAIN_XHTTP:+ ${DOMAIN_XHTTP}}${DOMAIN_HY2:+ ${DOMAIN_HY2}}${DOMAIN_TG:+ ${DOMAIN_TG}}${DOMAIN_WEB:+ ${DOMAIN_WEB} (WEB-прокси)}"
   if [ "$USE_API" = "1" ]; then
     box_row "Профиль на панели: ${C_BOLD}${PROFILE_NAME}${C_RESET}  ${C_DIM}(хосты + SECRET_KEY по API)${C_RESET}"
     box_row "                    $([ "$PROFILE_CREATE_NODE" = "1" ] && echo "нода на панели создаётся" || echo "ноду на панели создадите сами")$([ -n "$DOMAIN_TG" ] && echo "; есть Telegram-хост")"
@@ -308,6 +324,7 @@ fi
 [ "$DO_HARDEN" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
 [ "${USE_API:-0}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
 [ "${USE_API:-0}" = "1" ] && [ "${PROFILE_CREATE_NODE:-0}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
+[ "$ROLE" = "1" ] && [ "${USE_WEB:-0}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
 
 # run_step "Название" функция_этапа [функция_проверки]
 run_step() {
@@ -450,6 +467,7 @@ if [ "$ROLE" = "1" ]; then
     local src; src="$(get_script haproxy-setup.sh)" || { err "Не удалось получить haproxy-setup.sh"; return 1; }
     DOMAIN_TCP="$DOMAIN_TCP" DOMAIN_GRPC="$DOMAIN_GRPC" DOMAIN_XHTTP="$DOMAIN_XHTTP" \
     DOMAIN_HY2="$DOMAIN_HY2" USE_HY2="$USE_HY2" DOMAIN_TG="$DOMAIN_TG" USE_TG="$USE_TG" \
+    DOMAIN_WEB="$DOMAIN_WEB" USE_WEB="$USE_WEB" \
     INSTALL_DECOY="$INSTALL_DECOY" NONINTERACTIVE=1 bash "$src"
   }
   run_step "Nginx (self-steal) + HAProxy + сертификаты" do_nginx_haproxy
@@ -487,6 +505,16 @@ if [ "$ROLE" = "1" ]; then
       return 1
     }
     run_step "Подключение ноды к панели" do_node_link
+  fi
+
+  # WEB-прокси Telegram: домен, сертификат, nginx-сайт и маршрут HAProxy уже сделал этап nginx/HAProxy
+  # (домен передан в DOMAIN_WEB), здесь ставится только Telemt.
+  if [ "${USE_WEB:-0}" = "1" ]; then
+    do_webproxy() {
+      local src; src="$(get_script webproxy-setup.sh)" || { err "Не удалось получить webproxy-setup.sh"; return 1; }
+      DOMAIN_WEB="$DOMAIN_WEB" WEB_AD_TAG="$WEB_AD_TAG" WEB_FRONT_DONE=1 WEB_NONINTERACTIVE=1 bash "$src" install
+    }
+    run_step "WEB-прокси Telegram (Telemt)" do_webproxy
   fi
 
 fi

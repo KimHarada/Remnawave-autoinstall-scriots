@@ -41,7 +41,9 @@ HARDEN_DISABLE_UNITS=" rpcbind avahi-daemon cups cups-browsed snmpd smbd nmbd nf
  bind9 named dnsmasq apache2 lighttpd mosquitto memcached "
 
 # Процессы, чьи публичные порты — часть работы системы или самой ноды.
-HARDEN_SYSTEM_PROCS='systemd-network|dhclient|dhcpcd|NetworkManager|chronyd|systemd-timesyn|systemd-resolve'
+# telemt — WEB-прокси Telegram: слушает только 127.0.0.1, а случайные UDP-сокеты на 0.0.0.0 — исходящие
+# соединения к серверам Telegram (входящих портов у него нет).
+HARDEN_SYSTEM_PROCS='systemd-network|dhclient|dhcpcd|NetworkManager|chronyd|systemd-timesyn|systemd-resolve|telemt'
 HARDEN_NODE_PROCS='rw-node|xray|hysteria|sing-box'
 
 declare -gA EXPECT=()
