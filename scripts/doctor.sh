@@ -186,6 +186,9 @@ doctor_scan() {
     if [ ! -f /etc/sysctl.d/98-dorik-hardening.conf ] || [ ! -f /etc/ssh/sshd_config.d/00-dorik-hardening.conf ] \
        || ! grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null; then
       _issue hardening_missing "не применено укрепление системы (ядро, SSH, автообновления безопасности)"
+    elif [ "${SCAN_PROTECT:-1}" = "1" ] && { [ ! -f /etc/fail2ban/jail.d/dorik-portscan.conf ] \
+         || { [ "${ALLOW_PING:-0}" != "1" ] && [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" != "1" ]; }; }; then
+      _issue shield_missing "нет щита от сканеров (скрытие ping, бан перебора портов)"
     fi
   fi
   return 0
@@ -282,6 +285,7 @@ fix_time_sync() { timedatectl set-ntp true; }
 # задавать некому, поэтому ASSUME_YES=1 (пользователь уже согласился на исправление).
 fix_ports_exposed()     { ( ASSUME_YES=1; harden_firewall; harden_services ); }
 fix_ufw_ipv6()          { sed -i -E 's/^IPV6=no/IPV6=yes/' /etc/default/ufw && ufw reload; }
+fix_shield_missing()    { ( ASSUME_YES=1; harden_shield ); }
 fix_hardening_missing() { ( ASSUME_YES=1; harden_sysctl; harden_ssh; harden_updates ); }
 
 # Миграция со старого формата: домены восстанавливаем из того, что уже настроено (nginx-сайт

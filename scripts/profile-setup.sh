@@ -166,8 +166,8 @@ state_prepare() {
     if [ -z "$(st_get ".protocols.${p}.privateKey")" ]; then
       pair="$(gen_x25519)" || { err "Не удалось сгенерировать ключ x25519 (openssl)"; return 1; }
       st_set --arg p "$p" --arg k "${pair%% *}" --arg pub "${pair##* }" \
-        --arg s1 "$(openssl rand -hex 8)" --arg s2 "$(openssl rand -hex 8)" \
-        '.protocols[$p].privateKey=$k | .protocols[$p].publicKey=$pub | .protocols[$p].shortIds=[$s1,$s2]'
+        --arg s1 "$(openssl rand -hex 8)" --arg s2 "$(openssl rand -hex 4)" --arg s3 "$(openssl rand -hex 6)" \
+        '.protocols[$p].privateKey=$k | .protocols[$p].publicKey=$pub | .protocols[$p].shortIds=[$s1,$s2,$s3]'   # разной длины
     fi
     local cur_fp bad
     cur_fp="$(st_get ".protocols.${p}.fingerprint")"
@@ -200,7 +200,19 @@ build_inbound() {  # build_inbound <proto> — JSON одного inbound'а
           tlsSettings:{alpn:["h3"], certificates:[{keyFile:"/etc/hysteria/privkey.pem", certificateFile:"/etc/hysteria/fullchain.pem"}]},
           hysteriaSettings:{version:2, masquerade:{dir:$dir, type:"file"}}}}' ;;
     *)
-      local net="raw" extra='{}' key=""
+      local net="raw" extra='{}' key="" hard='{}' spx
+      spx="$(st_get ".protocols.${p}.spiderX")"; spx="${spx:-/}"
+      # Защита от активного зондирования (SCAN_PROTECT=1):
+      #  - maxTimeDiff: повторённый перехваченный ClientHello со старым временем не пройдёт
+      #    (REALITY_MAXTIMEDIFF=0 — выключить, если у клиентов уходят часы);
+      #  - limitFallback*: канал «запасного» сайта (при неверном ключе) ограничен по скорости,
+      #    чтобы сервер нельзя было использовать как ретранслятор.
+      if [ "${SCAN_PROTECT:-1}" = "1" ]; then
+        hard="$(jq -nc --argjson t "${REALITY_MAXTIMEDIFF:-90000}" '
+          (if $t > 0 then {maxTimeDiff:$t} else {} end)
+          + {limitFallbackUpload:{afterBytes:65536, bytesPerSec:16384, burstBytesPerSec:65536},
+             limitFallbackDownload:{afterBytes:65536, bytesPerSec:16384, burstBytesPerSec:65536}}')"
+      fi
       if [ "$p" = "grpc" ]; then
         serv="$(st_get '.protocols.grpc.serviceName')"
         net="grpc"; key="grpcSettings"; extra="$(jq -n --arg s "$serv" '{multiMode:true, serviceName:$s}')"
@@ -209,14 +221,21 @@ build_inbound() {  # build_inbound <proto> — JSON одного inbound'а
         net="xhttp"; key="xhttpSettings"; extra="$(jq -n --arg h "$d" --arg pa "$path" '{host:$h, mode:"auto", path:$pa}')"
       fi
       jq -n --arg tag "$tag" --argjson port "${P_PORT[$p]}" --arg target "${P_TARGET[$p]}" --arg priv "$priv" \
-            --arg fp "$fp" --arg sn "$d" --argjson sids "$sids" --arg net "$net" --arg key "$key" --argjson extra "$extra" '
+            --arg fp "$fp" --arg sn "$d" --argjson sids "$sids" --arg net "$net" --arg key "$key" --argjson extra "$extra" \
+            --arg spx "$spx" --argjson hard "$hard" '
         {tag:$tag, port:$port, listen:"127.0.0.1", protocol:"vless",
          settings:{clients:[], decryption:"none"},
          sniffing:{enabled:true, routeOnly:true, destOverride:["http","tls","quic"]},
          streamSettings: ({network:$net, security:"reality",
-           realitySettings:{target:$target, spiderX:"/", shortIds:$sids, privateKey:$priv, fingerprint:$fp, serverNames:[$sn]}}
+           realitySettings:({target:$target, spiderX:$spx, shortIds:$sids, privateKey:$priv, fingerprint:$fp, serverNames:[$sn]} + $hard)}
            + (if $key != "" then {($key): $extra} else {} end))}' ;;
   esac
+}
+
+_self_ip() {  # публичный IPv4 ноды для правила «на сам сервер не ходить»; пусто, если неизвестен
+  local ip="${SELF_IP:-${NODE_ADDRESS:-}}"
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && printf '%s' "$ip"
+  return 0
 }
 
 build_config() {  # печатает полный конфиг Xray
@@ -231,7 +250,8 @@ build_config() {  # печатает полный конфиг Xray
     ["geosite:telegram","domain:telegram.org","domain:t.me","domain:telegra.ph","domain:yookassa.ru","domain:yoomoney.ru"]
     + ($extra | split(" ") | map(select(length>0) | "domain:" + .))')"
   jq -n --argjson inbounds "$inbounds" --argjson tags "$all_tags" --arg tg "$tg_tag" --argjson tgd "$tgdomains" \
-        --arg psiphon "${PSIPHON:-1}" --arg ll "${XRAY_LOGLEVEL:-warning}" '
+        --arg psiphon "${PSIPHON:-1}" --arg ll "${XRAY_LOGLEVEL:-warning}" \
+        --arg self "$(_self_ip)" --arg prot "${SCAN_PROTECT:-1}" '
     {log:{loglevel:$ll},
      dns:{servers:["https+local://1.1.1.1/dns-query","https+local://8.8.8.8/dns-query","localhost"], queryStrategy:"UseIPv4"},
      inbounds:$inbounds,
@@ -242,6 +262,10 @@ build_config() {  # печатает полный конфиг Xray
         {domain:["geosite:private"], outboundTag:"BLOCK"},
         {protocol:["bittorrent"], outboundTag:"BLOCK"},
         {port:"25", type:"field", network:"tcp", outboundTag:"BLOCK"}]
+       # Через прокси нельзя ходить на сам сервер (SSH/панель/внутренние сервисы по публичному IP)
+       # и на порты, которые чаще всего используют для сканирования и брутфорса (telnet, NetBIOS/SMB, RDP).
+       + (if $prot == "1" and $self != "" then [{type:"field", ip:[$self], outboundTag:"BLOCK"}] else [] end)
+       + (if $prot == "1" then [{type:"field", port:"23,135-139,445,3389", outboundTag:"BLOCK"}] else [] end)
        + (if $tg != "" then
             [{type:"field", inboundTag:[$tg], domain:$tgd, outboundTag:"DIRECT"},
              {type:"field", inboundTag:[$tg], ip:["geoip:telegram"], outboundTag:"DIRECT"},

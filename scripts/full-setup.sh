@@ -45,7 +45,7 @@ step "Что уже установлено"
 show_dashboard
 # Укрепление (порты, ядро, SSH) предложим отдельным вопросом ниже — здесь чиним только
 # последствия старых версий, чтобы отказ пользователя в вопросе не был обойдён заранее.
-DORIK_IGNORE="${DORIK_IGNORE:+${DORIK_IGNORE},}ports_exposed,hardening_missing,ufw_ipv6" doctor_run || true
+DORIK_IGNORE="${DORIK_IGNORE:+${DORIK_IGNORE},}ports_exposed,hardening_missing,shield_missing,ufw_ipv6" doctor_run || true
 
 # ---------------------------------------------------------------------------
 # ШАГ 1. Сбор параметров (никаких вопросов после этого блока)
@@ -251,6 +251,13 @@ else
   DO_HARDEN=0
 fi
 
+# Защита от сканеров: HAProxy отбрасывает чужой SNI и не-TLS, лимит соединений с одного IP,
+# усиленный REALITY в профиле, скрытый ping и бан перебора портов (последнее — вместе с укреплением).
+if [ "${SCAN_PROTECT:-}" = "" ]; then
+  if ask_yes_no "Включить защиту от сканеров (рекомендуется)?" "1"; then SCAN_PROTECT=1; else SCAN_PROTECT=0; fi
+fi
+export SCAN_PROTECT
+
 # ---- план выполнения: что именно сейчас будет сделано ------------------------
 yn() { [ "$1" = "1" ] && echo "да" || echo "нет"; }
 echo
@@ -275,6 +282,7 @@ if [ "$ROLE" = "1" ]; then
 fi
 box_row "Ребут в 04:00:      $(yn "$ENABLE_REBOOT")    Часовой пояс: ${DORIK_TZ}"
 box_row "Укрепление:         $(yn "$DO_HARDEN")    Вход по паролю SSH выключить: $(yn "$SSH_PW_OFF")"
+box_row "Защита сканеров:    $(yn "$SCAN_PROTECT")"
 box_bottom
 
 echo
@@ -517,7 +525,7 @@ do_final_audit() {
   local id left=()
   for id in "${ISSUE_IDS[@]}"; do
     [ "$id" = "net_tuning" ] && [ "${USE_BBR:-0}" != "1" ] && continue
-    case "$id" in ports_exposed|hardening_missing|ufw_ipv6) [ "${DO_HARDEN:-0}" != "1" ] && continue ;; esac
+    case "$id" in ports_exposed|hardening_missing|shield_missing|ufw_ipv6) [ "${DO_HARDEN:-0}" != "1" ] && continue ;; esac
     left+=("$id")
   done
   [ "${#left[@]}" -eq 0 ] && return 0

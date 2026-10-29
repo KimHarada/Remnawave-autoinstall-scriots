@@ -141,6 +141,21 @@ ok "Nginx настроен."
 # ACL и backend'ы создаются только для заданных доменов: пустой домен давал
 # невалидное `req.ssl_sni -i ` и HAProxy не стартовал.
 step "Настройка HAProxy"
+
+# ---- защита от сканеров ------------------------------------------------------------------
+# SCAN_PROTECT=1 (по умолчанию): на 443 пропускаем только TLS с SNI одного из НАШИХ доменов.
+# Всё остальное — соединение без SNI (заход по голому IP), чужой SNI, не-TLS мусор, молчание —
+# молча обрывается. Раньше такие соединения уходили в бэкенд REALITY TCP и отдавали сканеру
+# заглушку с сертификатом первого домена: по одному IP узнавался домен сервера.
+# Дополнительно: лимит новых соединений и одновременных соединений с одного IP.
+#   HAPROXY_RATE (300 новых за 10 с), HAPROXY_CONN_MAX (3000 одновременных) — под CGNAT/офисы
+#   с тысячами клиентов за одним адресом при необходимости поднимите.
+SCAN_PROTECT="${SCAN_PROTECT:-1}"
+HAP_RATE="${HAPROXY_RATE:-300}"; HAP_CONN_MAX="${HAPROXY_CONN_MAX:-3000}"
+KNOWN_SNI=()
+for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_TG"; do [ -n "$d" ] && KNOWN_SNI+=("$d"); done
+[ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ] && KNOWN_SNI+=("$DOMAIN_HY2")
+
 HAP_NEW="$(mktemp)"
 {
 cat <<'EOF'
@@ -159,14 +174,37 @@ defaults
 
 frontend fe_443
     bind *:443
+EOF
+if [ "$SCAN_PROTECT" = "1" ]; then
+  cat <<EOF
+    # лимиты на один адрес источника
+    stick-table type ip size 200k expire 5m store conn_rate(10s),conn_cur
+    tcp-request connection track-sc0 src
+    tcp-request connection reject if { sc_conn_rate(0) gt ${HAP_RATE} }
+    tcp-request connection reject if { sc_conn_cur(0) gt ${HAP_CONN_MAX} }
+    # ждём ClientHello недолго: молчащий сканер не должен занимать сокет
+    tcp-request inspect-delay 3s
+    acl known_sni req.ssl_sni -i ${KNOWN_SNI[*]}
+    tcp-request content accept if { req.ssl_hello_type 1 } known_sni
+    tcp-request content reject
+EOF
+else
+  cat <<'EOF'
     tcp-request inspect-delay 5s
     tcp-request content accept if { req.ssl_hello_type 1 }
 EOF
+fi
 [ -n "$DOMAIN_GRPC" ]  && [ "$DOMAIN_GRPC"  != "$DOMAIN_TCP" ] && echo "    use_backend be_grpc if { req.ssl_sni -i ${DOMAIN_GRPC} }"
 [ -n "$DOMAIN_XHTTP" ] && [ "$DOMAIN_XHTTP" != "$DOMAIN_TCP" ] && echo "    use_backend be_xhttp if { req.ssl_sni -i ${DOMAIN_XHTTP} }"
 [ -n "$DOMAIN_TG" ]    && [ "$DOMAIN_TG"    != "$DOMAIN_TCP" ] && echo "    use_backend be_tg if { req.ssl_sni -i ${DOMAIN_TG} }"
+# Домен Hysteria2 по TCP — его собственная заглушка с его сертификатом (по UDP отвечает сам Hysteria2).
+[ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ] && [ "$DOMAIN_HY2" != "$DOMAIN_TCP" ] && echo "    use_backend be_hy2 if { req.ssl_sni -i ${DOMAIN_HY2} }"
+if [ "$SCAN_PROTECT" = "1" ]; then
+  echo "    use_backend be_tcp if { req.ssl_sni -i ${DOMAIN_TCP} }"
+else
+  echo "    default_backend be_tcp"
+fi
 cat <<'EOF'
-    default_backend be_tcp
 
 backend be_tcp
     server tcp1 127.0.0.1:56789
@@ -180,8 +218,8 @@ fi
 if [ -n "$DOMAIN_TG" ] && [ "$DOMAIN_TG" != "$DOMAIN_TCP" ]; then
   printf '\nbackend be_tg\n    server tg1 127.0.0.1:56792\n'
 fi
-if [ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ]; then
-  printf '\n# Hysteria2 обслуживается напрямую Xray на 443/udp, HAProxy его не касается\n'
+if [ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ] && [ "$DOMAIN_HY2" != "$DOMAIN_TCP" ]; then
+  printf '\n# Hysteria2 по UDP 443 обслуживает Xray сам (masquerade); по TCP этот домен ведёт на свою заглушку\nbackend be_hy2\n    server hy2web 127.0.0.1:%s\n' "${DECOY_PORT[hy2]:-8084}"
 fi
 } > "$HAP_NEW"
 

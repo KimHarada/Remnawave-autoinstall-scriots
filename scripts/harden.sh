@@ -387,6 +387,45 @@ EOF
   ok "Автоматические обновления безопасности включены"
 }
 
+# ---- 6. щит от сканеров: молчим на ping, баним сканирующих порты ---------------------------------
+# Сам открытый порт 443 скрыть нельзя, но сервер не должен отвечать на ping и должен банить тех,
+# кто перебирает закрытые порты (в логе ядра — строки «[UFW BLOCK]»).
+harden_shield() {
+  if [ "${ALLOW_PING:-0}" = "1" ]; then
+    rm -f /etc/sysctl.d/97-dorik-noping.conf
+    sysctl -w net.ipv4.icmp_echo_ignore_all=0 &>/dev/null || true
+    info "ALLOW_PING=1 — сервер отвечает на ping"
+  else
+    echo 'net.ipv4.icmp_echo_ignore_all = 1' > /etc/sysctl.d/97-dorik-noping.conf
+    sysctl -w net.ipv4.icmp_echo_ignore_all=1 &>/dev/null || warn "ping не отключён (ядро/контейнер не позволяет)"
+  fi
+  # ICMPv6 не трогаем: на нём держится работа IPv6 (соседи, маршрутизаторы).
+  have ufw && ufw logging low &>/dev/null || true
+  have fail2ban-client || install_fail2ban || { warn "fail2ban не установился — бан сканеров пропущен."; return 1; }
+  mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/filter.d/dorik-portscan.conf <<'EOF'
+[Definition]
+failregex = \[UFW BLOCK\] .*SRC=<HOST> DST=
+ignoreregex =
+journalmatch = _TRANSPORT=kernel
+EOF
+  local ign="127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+  [ -n "${PANEL_IP:-}" ] && ign="$ign ${PANEL_IP}"
+  cat > /etc/fail2ban/jail.d/dorik-portscan.conf <<EOF
+[dorik-portscan]
+enabled  = true
+filter   = dorik-portscan
+backend  = systemd
+maxretry = ${PORTSCAN_MAXRETRY:-20}
+findtime = 60
+bantime  = 1d
+ignoreip = ${ign}
+EOF
+  systemctl restart fail2ban &>/dev/null || { warn "fail2ban не перезапустился."; return 1; }
+  local i; for i in 1 2 3 4 5 6 7 8 9 10; do fail2ban-client status dorik-portscan &>/dev/null && break; sleep 1; done
+  ok "Щит от сканеров: ping скрыт, перебор закрытых портов банится на сутки"
+}
+
 # ---- Docker: публикации в обход ufw --------------------------------------------------------
 docker_public_ports() {  # печатает «контейнер порт» для портов, опубликованных на все интерфейсы
   have docker && svc_active docker || return 0
@@ -431,6 +470,12 @@ verify_hardening() {
   systemctl is-enabled apt-daily-upgrade.timer &>/dev/null && grep -q 'Unattended-Upgrade "1"' /etc/apt/apt.conf.d/20auto-upgrades 2>/dev/null
   _chk $? "автообновления безопасности включены" "автообновления безопасности не включены"
   [ -f /etc/modprobe.d/dorik-blacklist.conf ]; _chk $? "неиспользуемые модули ядра заблокированы" "файл блокировки модулей отсутствует"
+  if [ "${SCAN_PROTECT:-1}" = "1" ]; then
+    if [ "${ALLOW_PING:-0}" != "1" ]; then
+      [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" = "1" ]; _chk $? "сервер не отвечает на ping" "ping не отключён"
+    fi
+    fail2ban-client status dorik-portscan &>/dev/null; _chk $? "fail2ban: защита от сканирования портов активна" "fail2ban: jail dorik-portscan не работает"
+  fi
   return "$VERIFY_FAIL"
 }
 
@@ -458,6 +503,7 @@ harden_run() {
   harden_sysctl || rc=1
   harden_ssh || rc=1
   harden_updates || rc=1
+  [ "${SCAN_PROTECT:-1}" = "1" ] && { harden_shield || rc=1; }
   step "Проверка результата"
   verify_hardening || rc=1
   echo
