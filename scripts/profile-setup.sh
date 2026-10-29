@@ -203,12 +203,13 @@ build_inbound() {  # build_inbound <proto> — JSON одного inbound'а
       local net="raw" extra='{}' key="" hard='{}' spx
       spx="$(st_get ".protocols.${p}.spiderX")"; spx="${spx:-/}"
       # Защита от активного зондирования (SCAN_PROTECT=1):
-      #  - maxTimeDiff: повторённый перехваченный ClientHello со старым временем не пройдёт
-      #    (REALITY_MAXTIMEDIFF=0 — выключить, если у клиентов уходят часы);
+      #  - maxTimeDiff (по умолчанию ВЫКЛЮЧЕН): отбрасывает рукопожатие, если часы клиента расходятся с
+      #    сервером больше заданного (мс). Защищает от повтора перехваченного ClientHello, но у части
+      #    клиентов часы уходят и подключение «молча» ломается — включайте REALITY_MAXTIMEDIFF=90000 осознанно;
       #  - limitFallback*: канал «запасного» сайта (при неверном ключе) ограничен по скорости,
       #    чтобы сервер нельзя было использовать как ретранслятор.
       if [ "${SCAN_PROTECT:-1}" = "1" ]; then
-        hard="$(jq -nc --argjson t "${REALITY_MAXTIMEDIFF:-90000}" '
+        hard="$(jq -nc --argjson t "${REALITY_MAXTIMEDIFF:-0}" '
           (if $t > 0 then {maxTimeDiff:$t} else {} end)
           + {limitFallbackUpload:{afterBytes:65536, bytesPerSec:16384, burstBytesPerSec:65536},
              limitFallbackDownload:{afterBytes:65536, bytesPerSec:16384, burstBytesPerSec:65536}}')"
