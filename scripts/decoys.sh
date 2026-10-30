@@ -198,16 +198,27 @@ decoys_write_conf() {
 # Возвращает 1, если сертификата нет и сайт пока без TLS.
 decoys_write_nginx_web() {  # decoys_write_nginx_web <домен> <порт>
   local d="$1" port="$2" listen tls="" rc=0
-  cat > /etc/nginx/conf.d/dorik-web-upgrade.conf <<'EOF'
-# DORIK toolkit — WEB-прокси: значение заголовка Connection для WebSocket
-map $http_upgrade $dorik_web_upgrade {
+  # upstream с keepalive: пул постоянных соединений к Telemt (long-poll запросов много — без пула каждый
+  # открывал бы новое TCP-соединение). Пустой Connection при обычном запросе нужен именно для keepalive.
+  cat > /etc/nginx/conf.d/dorik-web-upgrade.conf <<EOF
+# DORIK toolkit — WEB-прокси: значение заголовка Connection для WebSocket и пул соединений к Telemt
+map \$http_upgrade \$dorik_web_upgrade {
     default upgrade;
     ''      '';
 }
+upstream dorik_web_backend {
+    server ${WEB_BACKEND};
+    keepalive 64;
+}
 EOF
   if cert_is_valid "$d"; then
-    listen="listen 127.0.0.1:${port} ssl http2;"
-    tls="ssl_certificate /etc/letsencrypt/live/${d}/fullchain.pem;
+    # nginx >= 1.25.1: «listen ... http2» устарела, включается отдельной директивой `http2 on;`
+    local ngv h2_listen="http2" h2_dir=""
+    ngv="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    if [ -n "$ngv" ] && [ "$(printf '%s\n1.25.1\n' "$ngv" | sort -V | head -1)" = "1.25.1" ]; then h2_listen=""; h2_dir="http2 on;"; fi
+    listen="listen 127.0.0.1:${port} ssl ${h2_listen};"
+    tls="${h2_dir}
+    ssl_certificate /etc/letsencrypt/live/${d}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${d}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;"
   else
@@ -225,7 +236,7 @@ server {
     access_log off;
     client_max_body_size 2m;
     location / {
-        proxy_pass http://${WEB_BACKEND};
+        proxy_pass http://dorik_web_backend;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-For \$remote_addr;
@@ -234,9 +245,9 @@ server {
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_next_upstream off;
-        proxy_connect_timeout 75s;
-        proxy_send_timeout 75s;
-        proxy_read_timeout 75s;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 65s;
+        proxy_read_timeout 65s;
         add_header Cache-Control "no-store" always;
     }
 }

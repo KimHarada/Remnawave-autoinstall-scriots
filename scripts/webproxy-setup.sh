@@ -50,8 +50,9 @@ wp_save() {  # wp_save <домен> <секрет> <тег>
   (
     umask 077
     mkdir -p "$(dirname "$WP_STATE")"
-    jq -n --arg d "$1" --arg s "$2" --arg t "$3" --arg v "$TELEMT_VERSION" \
-      '{domain:$d, secret:$s, adTag:$t, telemt:$v}' > "$WP_STATE"
+    local lim; lim="$(jq -c '.limits // {}' "$WP_STATE" 2>/dev/null)"; [ -n "$lim" ] || lim='{}'
+    jq -n --arg d "$1" --arg s "$2" --arg t "$3" --arg v "$TELEMT_VERSION" --argjson lim "$lim" \
+      '{domain:$d, secret:$s, adTag:$t, telemt:$v, limits:$lim}' > "$WP_STATE.new" && mv -f "$WP_STATE.new" "$WP_STATE"
     chmod 600 "$WP_STATE"
   )
 }
@@ -167,7 +168,43 @@ wp_install_binary() {
 }
 
 wp_write_config() {  # wp_write_config <домен> <секрет> <тег>
-  local d="$1" s="$2" t="$3" ip
+  local d="$1" s="$2" t="$3" ip lim_s lim_ip lim_st limits_block=""
+  # ВАЖНО: по умолчанию Telemt пускает не больше 128 живых сессий на весь процесс (max_sessions_global) и 16 с
+  # одного IP (max_sessions_per_ip). Если ключом пользуются сотни людей (реклама канала), поднимите:
+  #   WEB_MAX_SESSIONS=1024 [WEB_MAX_SESSIONS_PER_IP=32]
+  # Глобальные лимиты и лимит профиля должны быть согласованы (иначе Telemt не стартует), поэтому они
+  # масштабируются вместе; память Telemt ограничена его собственным memory_envelope (1,25 ГиБ по умолчанию).
+  lim_s="${WEB_MAX_SESSIONS:-$(wp_get .limits.sessions)}"; lim_s="${lim_s:-128}"
+  lim_ip="${WEB_MAX_SESSIONS_PER_IP:-$(wp_get .limits.perIp)}"; lim_ip="${lim_ip:-16}"
+  [[ "$lim_s" =~ ^[0-9]+$ && "$lim_ip" =~ ^[0-9]+$ && "$lim_s" -ge 1 && "$lim_ip" -ge 1 ]] \
+    || { err "WEB_MAX_SESSIONS и WEB_MAX_SESSIONS_PER_IP должны быть положительными числами."; return 1; }
+  # Потолок задаёт сам Telemt: все резервы растут вместе с числом сессий, а их сумма (memory_envelope_bytes)
+  # не может превышать 4 ГиБ — это около 400 сессий (проверено: 409 запускается, 420 — нет).
+  [ "$lim_s" -le 400 ] || { err "WEB_MAX_SESSIONS: максимум 400 (предел памяти Telemt 4 ГиБ). Для большего числа людей нужен второй сервер/ключ."; return 1; }
+  # запоминаем: смена тега и переустановка не должны сбрасывать лимиты к умолчанию
+  if [ -s "$WP_STATE" ]; then
+    jq --argjson a "$lim_s" --argjson b "$lim_ip" '.limits={sessions:$a, perIp:$b}' \
+      "$WP_STATE" > "$WP_STATE.new" && mv -f "$WP_STATE.new" "$WP_STATE" && chmod 600 "$WP_STATE"
+  fi
+  lim_st=4096
+  if [ "$lim_s" -gt 128 ] || [ "$lim_ip" -ne 16 ]; then
+    # Telemt проверяет все лимиты вместе: увеличив число сессий, нужно пропорционально поднять и резервы
+    # (без этого он не стартует: «control reserves must cover…», «memory reservations must fit…»).
+    # Значения по умолчанию × N/128 — подобрано опытом: 256 и 400 запускаются.
+    local n=$(( lim_s > 128 ? lim_s : 128 ))
+    lim_st=$(( 4096 * n / 128 ))
+    limits_block="[web.limits]
+max_sessions_global = ${n}
+max_sessions_per_ip = ${lim_ip}
+max_streams_global = ${lim_st}
+max_http_connections = $(( 1024 * n / 128 ))
+max_http_handlers = $(( 512 * n / 128 ))
+control_bytes_global = $(( 16777216 * n / 128 ))
+pending_items_global = $(( 262144 * n / 128 ))
+pending_bytes_global = $(( 536870912 * n / 128 ))
+memory_envelope_bytes = $(( 1342177280 * n / 128 ))
+"
+  fi
   ip="$(get_public_ip)"
   [ -n "$ip" ] || ip="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | cut -d' ' -f2)"
   [ -n "$ip" ] || { err "Не удалось определить IP сервера."; return 1; }
@@ -220,6 +257,7 @@ carrier = "https"
 carriers = ["websocket-lanes", "websocket", "https-lanes", "https"]
 decoy_fasttrack_mode = "off"
 
+${limits_block}
 [[web.vhosts]]
 host = "${d}"
 public_addr = "${ip}:443"
@@ -232,8 +270,8 @@ index = "index.html"
 [[web.vhosts.profiles]]
 user = "default"
 secret_mode = "dd"
-max_sessions = 128
-max_streams = 4096
+max_sessions = ${lim_s}
+max_streams = ${lim_st}
 max_streams_per_session = 64
 EOF
   } > "$WP_CONF_DIR/telemt.toml"
