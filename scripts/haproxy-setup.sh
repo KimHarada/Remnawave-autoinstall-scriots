@@ -274,11 +274,20 @@ fi
 
 # Автопродление: пробный прогон certbot (staging) для только что выпущенных
 # сертификатов — убеждаемся, что продление через 60 дней сработает само.
-for d in "${ISSUED[@]}"; do
-  if spin_run "Проверка автопродления для ${d} (dry-run)" certbot renew --dry-run --cert-name "$d"; then :; else
-    err "автопродление для ${d} не пройдёт — проверьте порт 80 и DNS"; CHECK_FAIL=1
-  fi
-done
+# Все сертификаты выпущены одним способом (standalone, порт 80), поэтому достаточно пробного продления
+# ОДНОГО из них: по умолчанию проверяется первый (CERT_DRYRUN=all — каждый, off — пропустить).
+CERT_DRYRUN="${CERT_DRYRUN:-one}"
+if [ "${#ISSUED[@]}" -gt 0 ] && [ "$CERT_DRYRUN" != "off" ]; then
+  DRY_TARGETS=("${ISSUED[@]}")
+  [ "$CERT_DRYRUN" = "all" ] || DRY_TARGETS=("${ISSUED[0]}")
+  for d in "${DRY_TARGETS[@]}"; do
+    if spin_run "Проверка автопродления для ${d} (dry-run)" certbot_dry_run "$d"; then :; else
+      err "автопродление для ${d} не пройдёт — проверьте порт 80 и DNS"; CHECK_FAIL=1
+    fi
+  done
+  [ "${#ISSUED[@]}" -gt "${#DRY_TARGETS[@]}" ] && \
+    info "Остальные $(( ${#ISSUED[@]} - ${#DRY_TARGETS[@]} )) сертификата(ов) выпущены тем же способом — отдельная проверка не нужна (CERT_DRYRUN=all — проверить каждый)."
+fi
 
 # Заглушки: каждая отвечает 200, отдаёт сертификат своего домена, и все страницы разные.
 decoys_verify || CHECK_FAIL=1

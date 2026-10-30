@@ -91,7 +91,7 @@ ensure_cert() {  # ensure_cert <домен>
   systemctl start nginx &>/dev/null || true
   cert_is_valid "$d" || return 1
   # Пробное продление (staging): убеждаемся, что автопродление через ~60 дней сработает.
-  spin_run "Проверка автопродления для ${d} (dry-run)" certbot renew --dry-run --cert-name "$d" \
+  spin_run "Проверка автопродления для ${d} (dry-run)" certbot_dry_run "$d" \
     || warn "Автопродление для ${d} может не сработать — проверьте, что порт 80 открыт и DNS верный."
   systemctl start nginx &>/dev/null || true
   return 0

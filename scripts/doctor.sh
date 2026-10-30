@@ -321,7 +321,7 @@ fix_web_down() {
   return $rc
 }
 
-fix_cert_expiring() { certbot renew; }
+fix_cert_expiring() { certbot renew --no-random-sleep-on-renew; }
 
 fix_docker_down() {
   if have docker; then systemctl enable --now docker; else ensure_docker; fi

@@ -479,6 +479,13 @@ dns_points_here() {
   [ -n "$resolved" ] && [ -n "$pubip" ] && [ "$resolved" = "$pubip" ]
 }
 
+# ---- пробное продление -----------------------------------------------------------
+# `certbot renew` без терминала (а spin_run запускает команды с stdin=/dev/null) ждёт СЛУЧАЙНЫЕ
+# 1–480 секунд перед продлением — и в --dry-run тоже. Из-за этого проверка автопродления
+# «зависала» на минуты на каждый домен. --no-random-sleep-on-renew убирает задержку; штатный
+# certbot.timer она не касается (он запускает свой renew сам).
+certbot_dry_run() { certbot renew --dry-run --no-random-sleep-on-renew --cert-name "$1"; }
+
 # ---- сертификат существует и не протух -------------------------------------
 cert_is_valid() {
   local domain="${1:-}" cert
