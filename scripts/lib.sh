@@ -149,6 +149,57 @@ apt_busy() {
   fi
 }
 
+# ---- «тишина» от автообновлений ------------------------------------------------------------
+# На свежем VPS систему сразу начинает обновлять unattended-upgrades и держит apt десятки минут.
+# apt_quiesce на время работы скрипта:
+#   1) останавливает таймеры автообновления (apt-daily, apt-daily-upgrade) — новые запуски не стартуют;
+#   2) просит уже запущенный unattended-upgrades штатно завершиться (SIGTERM ему одному, не его
+#      дочернему dpkg): он доделывает текущий шаг установки и выходит. Жёстко не убиваем никогда:
+#      kill -9 оставил бы dpkg в битом состоянии.
+# Обновлением пакетов дальше занимается сам скрипт (этап «Обновление пакетов»), а apt_unquiesce
+# при выходе включает таймеры обратно — автообновления безопасности продолжат работать.
+# Восстанавливает только тот процесс, который их остановил (по pid в файле-метке).
+APT_QUIESCE_FLAG="${APT_QUIESCE_FLAG:-/run/dorik-apt-quiesced}"
+
+apt_quiesce() {
+  [ "$(id -u)" -eq 0 ] || return 0
+  if [ -f "$APT_QUIESCE_FLAG" ]; then
+    local owner; owner="$(sed -n 1p "$APT_QUIESCE_FLAG" 2>/dev/null)"
+    # метка от умершего запуска: вернуть то, что он остановил, и начать заново
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      local t; for t in $(sed -n 2p "$APT_QUIESCE_FLAG"); do systemctl start "$t" &>/dev/null || true; done
+      rm -f "$APT_QUIESCE_FLAG"
+    else
+      return 0
+    fi
+  fi
+  local t was="" pid asked=0
+  for t in apt-daily.timer apt-daily-upgrade.timer; do
+    systemctl is-active --quiet "$t" 2>/dev/null && was+="${t} "
+  done
+  printf '%s\n%s\n' "$$" "$was" > "$APT_QUIESCE_FLAG" 2>/dev/null || return 0
+  if [ -n "$was" ]; then systemctl stop apt-daily.timer apt-daily-upgrade.timer &>/dev/null || true; fi
+  for pid in $(pgrep -x 'unattended-upgr' 2>/dev/null); do
+    kill -TERM "$pid" 2>/dev/null && asked=1
+  done
+  if [ "${UI_TTY:-0}" = "1" ]; then
+    info "Автообновления системы на время установки приостановлены: текущее обновление пакетов завершится само, дальше обновлением займусь я, а в конце автообновления включатся обратно."
+    [ "$asked" = "1" ] && info "Уже идущему обновлению отправлена просьба закончить текущий шаг и остановиться."
+  fi
+  return 0
+}
+
+apt_unquiesce() {
+  [ -f "$APT_QUIESCE_FLAG" ] || return 0
+  local owner was t
+  owner="$(sed -n 1p "$APT_QUIESCE_FLAG" 2>/dev/null)"
+  [ "$owner" = "$$" ] || return 0
+  was="$(sed -n 2p "$APT_QUIESCE_FLAG" 2>/dev/null)"
+  rm -f "$APT_QUIESCE_FLAG"
+  for t in $was; do systemctl start "$t" &>/dev/null || true; done
+  return 0
+}
+
 # Что сейчас делает процесс, державший apt: имя, сколько работает и — по журналу dpkg — сколько
 # пакетов уже обработано (для unattended-upgrades ещё и из скольких) и какой сейчас. REPLY = текст.
 # Журналы можно подменить для проверки: DPKG_LOG, UU_LOG.
@@ -156,12 +207,14 @@ apt_wait_status() {
   local lf=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
   local dlog="${DPKG_LOG:-/var/log/dpkg.log}" ulog="${UU_LOG:-/var/log/unattended-upgrades/unattended-upgrades.log}"
   local pid="" comm="" el="" since="" done_n="" total="" cur="" s
+  APT_HOLDER=""
   if command -v fuser &>/dev/null; then
     pid="$(fuser "${lf[@]}" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -1)"
   fi
   [ -n "$pid" ] || pid="$(pgrep -x 'apt|apt-get|dpkg|aptitude|unattended-upgr' 2>/dev/null | head -1)"
   if [ -z "$pid" ]; then REPLY="apt занят другим процессом"; return 0; fi
   comm="$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')"
+  APT_HOLDER="$comm"
   el="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')"
   [[ "$el" =~ ^[0-9]+$ ]] || el=""
   s="${comm:-процесс} (pid ${pid})"
@@ -205,9 +258,11 @@ wait_for_apt_lock() {
   local waited=0 limit=1200 start=$SECONDS cols=80 txt i=0 live=0 line
   [ "${UI_TTY:-0}" = "1" ] && live=1
   [ "$live" = "1" ] && { cols="$(tput cols 2>/dev/null || echo 80)"; printf '\e[?25l'; }
-  [ "$live" = "1" ] && info "На свежем сервере система сама ставит обновления безопасности — дожидаюсь, пока она закончит (прерывать не нужно)."
+  [ "$live" = "1" ] && info "apt занят: на свежем сервере система сама ставит обновления — дожидаюсь, пока она закончит текущий шаг (прерывать не нужно)."
   while apt_busy; do
     apt_wait_status; txt="$REPLY"
+    # Держит apt автообновление — просим его закончить и не запускаться снова (один раз).
+    [ "$APT_HOLDER" = "unattended-upgr" ] && apt_quiesce
     waited=$((SECONDS - start))
     if [ -n "${DORIK_STATUS:-}" ]; then printf '%s' "$txt" > "$DORIK_STATUS" 2>/dev/null; fi
     if [ "$live" = "1" ]; then
