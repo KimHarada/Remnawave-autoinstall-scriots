@@ -65,7 +65,9 @@ step "Что уже установлено"
 show_dashboard
 # Укрепление (порты, ядро, SSH) предложим отдельным вопросом ниже — здесь чиним только
 # последствия старых версий, чтобы отказ пользователя в вопросе не был обойдён заранее.
-DORIK_IGNORE="${DORIK_IGNORE:+${DORIK_IGNORE},}ports_exposed,hardening_missing,shield_missing,ufw_ipv6" doctor_run || true
+# ufw_off и f2b тоже пропускаем: их ставит фоновая подготовка, а настраивает этап «SSH, firewall, fail2ban».
+# Иначе проверка вставала бы в очередь к apt и ждала нашу же фоновую установку.
+DORIK_IGNORE="${DORIK_IGNORE:+${DORIK_IGNORE},}ports_exposed,hardening_missing,shield_missing,ufw_ipv6,ufw_off,f2b" doctor_run || true
 
 # ---------------------------------------------------------------------------
 # ШАГ 1. Сбор параметров (никаких вопросов после этого блока)

@@ -35,7 +35,11 @@ doctor_scan() {
   local sshp cfgp f
 
   # пакеты
-  [ -n "$(dpkg --audit 2>/dev/null)" ] && _issue dpkg_audit "dpkg в незавершённом состоянии (прерванная установка пакетов)"
+  # Пока какой-то процесс ставит пакеты (в том числе наша фоновая подготовка), dpkg показывает их
+  # «в процессе» — это не поломка, и чинить её (dpkg --configure -a) посреди установки нельзя.
+  if [ -n "$(dpkg --audit 2>/dev/null)" ] && ! apt_busy; then
+    _issue dpkg_audit "dpkg в незавершённом состоянии (прерванная установка пакетов)"
+  fi
 
   # SSH
   if have sshd; then
