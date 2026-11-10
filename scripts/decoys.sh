@@ -314,6 +314,81 @@ EOF
   return "$no_tls"
 }
 
+# ---- Caddy ---------------------------------------------------------------------------------------
+# То же самое для Caddy: по сайту на протокол, каждый слушает 127.0.0.1:<порт> с сертификатом
+# СВОЕГО домена (копия сертификата certbot, см. caddy_sync_cert в webserver.sh). Адрес сайта —
+# «:порт» без имени: как и nginx, отвечаем на любой Host (заход по IP видит ту же страницу).
+# Возвращает число заглушек, оставшихся без TLS.
+decoys_write_caddy() {
+  local p d port root f crt no_tls=0 keep=" "
+  mkdir -p "$CADDY_SITES"
+  for p in $(decoy_protos); do
+    d="$(decoy_domain "$p")"; port="${DECOY_PORT[$p]}"; root="$(decoy_root "$p")"
+    f="$CADDY_SITES/decoy-$p.caddy"; keep+="decoy-$p.caddy "
+    # Caddy работает от своего пользователя — страницы должны читаться не только root.
+    [ -d "$root" ] && chmod -R a+rX "$root" 2>/dev/null
+    if cert_is_valid "$d" && caddy_sync_cert "$d"; then
+      crt="$CADDY_CERTS/$d"
+      if [ "$p" = "web" ]; then
+        cat > "$f" <<EOF
+# DORIK toolkit — WEB-прокси Telegram (${d}) -> Telemt ${WEB_BACKEND}
+:${port} {
+    bind 127.0.0.1
+    tls ${crt}/fullchain.pem ${crt}/privkey.pem
+    header -Server
+    header Cache-Control "no-store"
+    reverse_proxy ${WEB_BACKEND} {
+        flush_interval -1
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 65s
+            keepalive 60s
+            keepalive_idle_conns 64
+        }
+    }
+}
+EOF
+      else
+        cat > "$f" <<EOF
+# DORIK toolkit — заглушка протокола ${DECOY_LABEL[$p]} (${d})
+:${port} {
+    bind 127.0.0.1
+    tls ${crt}/fullchain.pem ${crt}/privkey.pem
+    header -Server
+    root * ${root}
+    file_server
+}
+EOF
+      fi
+    else
+      no_tls=$((no_tls+1))
+      warn "${DECOY_LABEL[$p]}: нет сертификата для ${d} — заглушка пока без TLS (self-steal не заработает, пока не выпущен сертификат; перезапустите скрипт)."
+      cat > "$f" <<EOF
+# DORIK toolkit — заглушка протокола ${DECOY_LABEL[$p]} (${d}) БЕЗ TLS: нет сертификата
+http://:${port} {
+    bind 127.0.0.1
+    header -Server
+    root * ${root}
+    file_server
+}
+EOF
+    fi
+  done
+  # заглушки протоколов, которые больше не используются
+  local b
+  for f in "$CADDY_SITES"/decoy-*.caddy; do
+    [ -e "$f" ] || continue
+    b="$(basename "$f")"
+    [[ "$keep" == *" $b "* ]] || rm -f "$f"
+  done
+  return "$no_tls"
+}
+
+# Сайты заглушек для выбранного веб-сервера (nginx или Caddy).
+decoys_write_sites() {
+  if [ "$(ws_current)" = "caddy" ]; then decoys_write_caddy; else decoys_write_nginx; fi
+}
+
 # ---- проверка -------------------------------------------------------------------------------------
 # Для каждого протокола: отвечает 200, отдаёт сертификат СВОЕГО домена; страницы всех протоколов
 # различаются. Возвращает число провалов.
@@ -369,7 +444,7 @@ decoys_table() {
     [ -n "$p" ] || continue
     box_row "${C_B}${DECOY_LABEL[$p]:-$p}${C_RESET}  ${d}"
     if [ "$p" = "web" ]; then
-      box_row "  nginx 127.0.0.1:${port} → Telemt  ${C_DIM}(страница: ${zip%.zip})${C_RESET}"
+      box_row "  $(ws_current) 127.0.0.1:${port} → Telemt  ${C_DIM}(страница: ${zip%.zip})${C_RESET}"
     else
       box_row "  dest → ${C_BOLD}127.0.0.1:${port}${C_RESET}  ${C_DIM}(${zip%.zip})${C_RESET}"
     fi

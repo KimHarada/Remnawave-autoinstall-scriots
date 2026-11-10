@@ -21,6 +21,7 @@ _dorik_source doctor.sh
 _dorik_source preflight.sh
 _dorik_source decoys.sh
 _dorik_source profile-setup.sh
+_dorik_source scanblock.sh
 
 require_root
 require_apt_os
@@ -52,10 +53,12 @@ DORIK_IGNORE="${DORIK_IGNORE:+${DORIK_IGNORE},}ports_exposed,hardening_missing,s
 # ---------------------------------------------------------------------------
 step "Вопросы"
 
-echo "Что настраиваем на этом сервере?"
-echo "  1) Полноценная нода (Nginx self-steal + HAProxy + BBR + Remnanode)"
-echo "  2) Только сервер панели (жёсткий firewall: SSH+80+443, без ноды)"
-ROLE=$(ask_valid "Выбор" "${ROLE:-1}" is_valid_choice12) || exit 1
+ROLE="${ROLE:-1}"; is_valid_choice12 "$ROLE" || { err "ROLE должен быть 1 (нода) или 2 (сервер панели)."; exit 1; }
+ask_choice "РОЛЬ СЕРВЕРА" "$ROLE" \
+  "Нода|Сервер, к которому подключаются клиенты. Вы выберете протоколы (REALITY TCP, gRPC, XHTTP, Hysteria2, Telegram), для каждого зададите домен. Ставятся заглушки self-steal, HAProxy, сертификаты, BBR и Remnanode." \
+  "Сервер панели|Только защита сервера, на котором работает панель Remnawave: SSH, firewall (открыты SSH, 80 и 443), fail2ban, укрепление. Саму панель ставит пункт меню «Панель Remnawave»." \
+  || { err "Отменено пользователем."; exit 1; }
+ROLE="$CHOICE"
 
 # Роль известна — проверяем окружение до остальных вопросов, чтобы не гонять
 # пользователя по вопросам, если установка всё равно невозможна.
@@ -83,62 +86,118 @@ if [ "$ROLE" = "1" ]; then
   # (случайные имена — по названию поддомена нельзя угадать протокол; нужна wildcard-запись DNS).
   # значения из окружения (режим без вопросов) запоминаем до обнуления
   USE_TG_ENV="${USE_TG:-0}"; USE_HY2_ENV="${USE_HY2:-1}"; USE_WEB_ENV="${USE_WEB:-0}"
-  USE_TG=0; DOMAIN_TG="${DOMAIN_TG:-}"; USE_HY2=0; USE_WEB=0; DOMAIN_WEB="${DOMAIN_WEB:-}"
-  DOMAIN_MODE=2
-  [ -n "${DOMAIN_TCP:-}" ] && DOMAIN_MODE=1
-  echo "Как задать домены протоколов?"
-  echo "  1) Указать каждый домен вручную"
-  echo "  2) Один базовый домен — поддомены для всех протоколов создам сам (нужна DNS-запись *.домен → IP сервера)"
-  DOMAIN_MODE=$(ask_valid "Выбор" "$DOMAIN_MODE" is_valid_choice12) || exit 1
+  DOMAIN_TCP="${DOMAIN_TCP:-}"; DOMAIN_GRPC="${DOMAIN_GRPC:-}"; DOMAIN_XHTTP="${DOMAIN_XHTTP:-}"
+  DOMAIN_HY2="${DOMAIN_HY2:-}"; DOMAIN_TG="${DOMAIN_TG:-}"; DOMAIN_WEB="${DOMAIN_WEB:-}"
 
   # домен протокола из прошлой установки (чтобы повторный запуск не менял домены)
   prev_domain() { [ -s /etc/dorik/decoys.conf ] && awk -F'|' -v p="$1" '$1==p{print $2; exit}' /etc/dorik/decoys.conf; return 0; }
 
+  # ---- 1. какие протоколы ставим -------------------------------------------------------------
+  # Сначала выбор протоколов, потом домены — только для выбранных.
+  # Без вопросов: PROTOCOLS="tcp grpc xhttp hy2 tg web" (либо, как раньше, по заданным DOMAIN_* и USE_*).
+  PROTO_KEYS=(tcp grpc xhttp hy2 tg web)
+  PROTO_HOT=(1 2 3 4 5 6)
+  PROTO_LABELS=("VLESS REALITY TCP" "VLESS REALITY gRPC" "VLESS REALITY XHTTP" "Hysteria2" "Telegram-хост" "WEB-прокси Telegram")
+  declare -A PROTO_VAR=( [tcp]=DOMAIN_TCP [grpc]=DOMAIN_GRPC [xhttp]=DOMAIN_XHTTP [hy2]=DOMAIN_HY2 [tg]=DOMAIN_TG [web]=DOMAIN_WEB )
+  NL=$'\n'
+  PROTO_DESC=(
+    "Основной протокол: самый совместимый, работает во всех клиентах. Трафик выглядит как обычный HTTPS к вашему домену, чужим отдаётся страница-заглушка.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy${NL}${NL}@НУЖНО${NL}свой домен и сертификат"
+    "VLESS REALITY поверх gRPC. Запасной транспорт: помогает там, где обычный TCP режут по поведению соединения.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
+    "VLESS REALITY поверх XHTTP: запросы выглядят как обычная работа сайта, устойчив к обрывам длинных соединений.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
+    "Быстрый протокол поверх QUIC (UDP). Хорош на плохих и мобильных сетях; там, где UDP режут, не работает — поэтому ставится вместе с TCP-протоколами.${NL}${NL}@ПОРТ${NL}443/udp напрямую${NL}${NL}@НУЖНО${NL}отдельный домен и сертификат"
+    "Отдельный хост, через который ходят только Telegram и ЮKassa/ЮMoney — остальное на нём блокируется. Удобно для бесплатного или ограниченного тарифа.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
+    "Прокси Telegram типа «WEB» (Telemt) с рекламой вашего канала через @MTProxybot. К Xray и подпискам не относится — это отдельная служба.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
+  )
+  declare -A SEL=()
+  if [ -n "${PROTOCOLS:-}" ]; then
+    for p in ${PROTOCOLS//,/ }; do SEL[${p,,}]=1; done
+  elif [ -n "${DOMAIN_TCP}${DOMAIN_GRPC}${DOMAIN_XHTTP}${DOMAIN_HY2}" ]; then
+    # прежний способ: что задано в DOMAIN_* — то и ставим
+    [ -n "$DOMAIN_TCP" ] && SEL[tcp]=1
+    [ -n "$DOMAIN_GRPC" ] && SEL[grpc]=1
+    [ -n "$DOMAIN_XHTTP" ] && SEL[xhttp]=1
+    [ -n "$DOMAIN_HY2" ] && [ "$USE_HY2_ENV" != "0" ] && SEL[hy2]=1
+    [ "$USE_TG_ENV" = "1" ] && SEL[tg]=1
+    [ "$USE_WEB_ENV" = "1" ] && SEL[web]=1
+  elif [ -s /etc/dorik/decoys.conf ]; then
+    # повторный запуск: отмечено то, что уже стоит
+    while IFS='|' read -r p _; do [ -n "$p" ] && SEL[$p]=1; done < /etc/dorik/decoys.conf
+  else
+    SEL[tcp]=1; SEL[grpc]=1; SEL[xhttp]=1
+    [ "$USE_HY2_ENV" != "0" ] && SEL[hy2]=1
+    [ "$USE_TG_ENV" = "1" ] && SEL[tg]=1
+    [ "$USE_WEB_ENV" = "1" ] && SEL[web]=1
+  fi
+  PROTO_STATE=()
+  for p in "${PROTO_KEYS[@]}"; do PROTO_STATE+=("${SEL[$p]:-0}"); done
+  while true; do
+    TUI_SEL=0
+    tui_checklist "ПРОТОКОЛЫ" PROTO_LABELS PROTO_DESC PROTO_HOT PROTO_STATE || { err "Отменено пользователем."; exit 1; }
+    case " ${PROTO_STATE[*]} " in *" 1 "*) break ;; esac
+    err "Не выбран ни один протокол — отметьте хотя бы один."
+    [ "${ASSUME_YES:-0}" = "1" ] && exit 1
+    sleep 2
+  done
+  SEL=()
+  for i in "${!PROTO_KEYS[@]}"; do [ "${PROTO_STATE[$i]}" = "1" ] && SEL[${PROTO_KEYS[$i]}]=1; done
+  # Есть ли что-то, что обслуживает Xray (нода Remnanode нужна только тогда).
+  HAS_XRAY=0
+  for p in tcp grpc xhttp hy2 tg; do [ -n "${SEL[$p]:-}" ] && HAS_XRAY=1; done
+  USE_HY2="${SEL[hy2]:-0}"; USE_TG="${SEL[tg]:-0}"; USE_WEB="${SEL[web]:-0}"
+
+  # ---- 2. веб-сервер заглушек: nginx или Caddy ------------------------------------------------
+  if [ "${ASSUME_YES:-0}" = "1" ]; then WEB_SERVER="$(ws_current)"; else ws_ask node || { err "Отменено пользователем."; exit 1; }; fi
+  export WEB_SERVER
+
+  # ---- 3. домены — только для выбранных протоколов --------------------------------------------
+  # Вручную (по домену на протокол) либо от ОДНОГО базового домена: остальные сгенерирую сам
+  # (случайные имена — по названию поддомена нельзя угадать протокол; нужна wildcard-запись DNS).
+  DOMAIN_MODE=2
+  if [ -n "${DOMAIN_TCP}${DOMAIN_GRPC}${DOMAIN_XHTTP}${DOMAIN_HY2}" ] || { [ -s /etc/dorik/decoys.conf ] && [ -z "${BASE_DOMAIN:-}" ]; }; then DOMAIN_MODE=1; fi
+  ask_choice "ДОМЕНЫ" "$DOMAIN_MODE" \
+    "Каждый домен вручную|Для каждого выбранного протокола вы вводите свой домен. Домены могут быть на разных зонах — так их труднее связать между собой.${NL}${NL}@DNS${NL}A-запись каждого домена на IP этого сервера" \
+    "Один базовый домен|Вы вводите один домен, а поддомены для выбранных протоколов я создам сам — со случайными именами, чтобы по названию нельзя было угадать протокол.${NL}${NL}@DNS${NL}одна запись *.домен на IP этого сервера" \
+    || { err "Отменено пользователем."; exit 1; }
+  DOMAIN_MODE="$CHOICE"
+
   if [ "$DOMAIN_MODE" = "2" ]; then
     BASE_DOMAIN=$(ask_valid "Базовый домен (например example.com)" "${BASE_DOMAIN:-}" is_valid_domain) || exit 1
     BASE_DOMAIN="${BASE_DOMAIN,,}"
-    if ask_yes_no "Использовать Hysteria2 на этой ноде?" "$([ "$USE_HY2_ENV" = "0" ] && echo 2 || echo 1)"; then USE_HY2=1; fi
-    if ask_yes_no "Нужен отдельный хост только для Telegram и ЮKassa?" "$([ "${USE_TG_ENV:-0}" = "1" ] && echo 1 || echo 2)"; then USE_TG=1; fi
-    if ask_yes_no "Нужен WEB-прокси Telegram (тип «WEB», реклама своего канала)?" "$([ "${USE_WEB_ENV:-0}" = "1" ] && echo 1 || echo 2)"; then USE_WEB=1; fi
     gen_domain() {  # gen_domain <proto> — прежний домен под этой базой либо новый случайный
       local d; d="$(prev_domain "$1")"
       case "$d" in *".${BASE_DOMAIN}") echo "$d" ;; *) echo "$(openssl rand -hex 4).${BASE_DOMAIN}" ;; esac
     }
-    DOMAIN_TCP="$(gen_domain tcp)"; DOMAIN_GRPC="$(gen_domain grpc)"; DOMAIN_XHTTP="$(gen_domain xhttp)"
-    DOMAIN_HY2=""; [ "$USE_HY2" = "1" ] && DOMAIN_HY2="$(gen_domain hy2)"
-    DOMAIN_TG="";  [ "$USE_TG" = "1" ]  && DOMAIN_TG="$(gen_domain tg)"
-    DOMAIN_WEB=""; [ "$USE_WEB" = "1" ] && DOMAIN_WEB="$(gen_domain web)"
-    echo
-    box_top "Домены протоколов"
-    box_row "REALITY TCP   ${DOMAIN_TCP}"
-    box_row "gRPC          ${DOMAIN_GRPC}"
-    box_row "XHTTP         ${DOMAIN_XHTTP}"
-    [ -n "$DOMAIN_HY2" ] && box_row "Hysteria2     ${DOMAIN_HY2}"
-    [ -n "$DOMAIN_TG" ]  && box_row "Telegram      ${DOMAIN_TG}"
-    [ -n "$DOMAIN_WEB" ] && box_row "WEB-прокси    ${DOMAIN_WEB}"
-    box_sep
-    box_wrap "${C_DIM}→${C_RESET}" "DNS: создайте A-запись *.${BASE_DOMAIN} на IP этого сервера (или отдельные A-записи на каждый домен выше)."
-    box_bottom
+    for p in "${PROTO_KEYS[@]}"; do
+      if [ -n "${SEL[$p]:-}" ]; then printf -v "${PROTO_VAR[$p]}" '%s' "$(gen_domain "$p")"; else printf -v "${PROTO_VAR[$p]}" '%s' ""; fi
+    done
   else
-    DOMAIN_TCP=$(ask_valid "Домен для VLESS REALITY TCP (обязателен)" "${DOMAIN_TCP:-$(prev_domain tcp)}" is_valid_domain) || exit 1
-    DOMAIN_GRPC=$(ask_valid "Домен для VLESS gRPC (Enter — не использовать)" "${DOMAIN_GRPC:-$(prev_domain grpc)}" is_valid_domain 1) || exit 1
-    DOMAIN_XHTTP=$(ask_valid "Домен для VLESS XHTTP (Enter — не использовать)" "${DOMAIN_XHTTP:-$(prev_domain xhttp)}" is_valid_domain 1) || exit 1
-    DOMAIN_HY2=$(ask_valid "Домен для Hysteria2 (Enter — не использовать)" "${DOMAIN_HY2:-$(prev_domain hy2)}" is_valid_domain 1) || exit 1
-    if [ -n "$DOMAIN_HY2" ] && ask_yes_no "Использовать Hysteria2 на этой ноде?" "1"; then USE_HY2=1; else DOMAIN_HY2=""; fi
-    if ask_yes_no "Нужен отдельный хост только для Telegram и ЮKassa?" "$([ "${USE_TG_ENV:-0}" = "1" ] && echo 1 || echo 2)"; then
-      USE_TG=1
-      DOMAIN_TG=$(ask_valid "Домен для Telegram-хоста" "${DOMAIN_TG:-$(prev_domain tg)}" is_valid_domain) || exit 1
-    else
-      DOMAIN_TG=""
-    fi
-    if ask_yes_no "Нужен WEB-прокси Telegram (тип «WEB», реклама своего канала)?" "$([ "${USE_WEB_ENV:-0}" = "1" ] && echo 1 || echo 2)"; then
-      USE_WEB=1
-      DOMAIN_WEB=$(ask_valid "Домен для WEB-прокси" "${DOMAIN_WEB:-$(prev_domain web)}" is_valid_domain) || exit 1
-    else
-      DOMAIN_WEB=""
-    fi
+    info "Домены нужны только для выбранных протоколов: $(for i in "${!PROTO_KEYS[@]}"; do [ "${PROTO_STATE[$i]}" = "1" ] && printf '%s; ' "${PROTO_LABELS[$i]}"; done)"
+    for i in "${!PROTO_KEYS[@]}"; do
+      p="${PROTO_KEYS[$i]}"; v="${PROTO_VAR[$p]}"
+      if [ -n "${SEL[$p]:-}" ]; then
+        cur="${!v}"; [ -n "$cur" ] || cur="$(prev_domain "$p")"
+        val=$(ask_valid "Домен для ${PROTO_LABELS[$i]}" "$cur" is_valid_domain) || exit 1
+        printf -v "$v" '%s' "$val"
+      else
+        printf -v "$v" '%s' ""
+      fi
+    done
   fi
   DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"; DOMAIN_TG="${DOMAIN_TG,,}"; DOMAIN_WEB="${DOMAIN_WEB,,}"
+
+  echo
+  box_top "Домены протоколов"
+  for i in "${!PROTO_KEYS[@]}"; do
+    p="${PROTO_KEYS[$i]}"; v="${PROTO_VAR[$p]}"
+    [ -n "${!v}" ] && box_row "${C_B}${PROTO_LABELS[$i]}${C_RESET}  ${!v}"
+  done
+  box_sep
+  if [ "$DOMAIN_MODE" = "2" ]; then
+    box_wrap "${C_DIM}→${C_RESET}" "DNS: создайте A-запись *.${BASE_DOMAIN} на IP этого сервера (или отдельные A-записи на каждый домен выше)."
+  else
+    box_wrap "${C_DIM}→${C_RESET}" "DNS: A-запись каждого домена должна указывать на IP этого сервера."
+  fi
+  box_bottom
   # Рекламный тег канала-спонсора для WEB-прокси (необязательно; можно добавить позже: webproxy-setup.sh tag <тег>)
   WEB_AD_TAG="${WEB_AD_TAG:-}"
   if [ "$USE_WEB" = "1" ]; then
@@ -194,7 +253,11 @@ if [ "$ROLE" = "1" ]; then
   # ---- профиль и хосты на панели по API -------------------------------------------------------------
   USE_API=0
   API_DEFAULT=2; [ -n "${PANEL_URL:-}" ] && API_DEFAULT=1
-  if ask_yes_no "Создать профиль и хосты на панели автоматически по API (и получить SECRET_KEY)?" "$API_DEFAULT"; then
+  if [ "$HAS_XRAY" != "1" ]; then
+    # Выбран только WEB-прокси Telegram: нода Remnanode и профиль на панели не нужны.
+    PROFILE_CREATE_NODE=0
+    info "Протоколы Xray не выбраны — нода Remnanode и профиль на панели не ставятся."
+  elif ask_yes_no "Создать профиль и хосты на панели автоматически по API (и получить SECRET_KEY)?" "$API_DEFAULT"; then
     USE_API=1
     profile_collect_params || exit 1     # PROFILE_CREATE_NODE и др. берутся из окружения либо спрашиваются
     PROFILE_CREATE_NODE="${PROFILE_CREATE_NODE:-0}"
@@ -205,6 +268,8 @@ if [ "$ROLE" = "1" ]; then
     PROFILE_CREATE_NODE=0
   fi
 
+  NODE_PORT="${NODE_PORT:-}"; OPEN_NODE_PORT=0; SECRET_KEY="${SECRET_KEY:-}"; PANEL_IP="${PANEL_IP:-}"
+  if [ "$HAS_XRAY" = "1" ]; then
   # При повторном запуске порт предлагаем тот, что уже настроен в compose ноды.
   EXISTING_NODE_PORT=""
   [ -f "$NODE_DIR/docker-compose.yml" ] && \
@@ -246,7 +311,12 @@ if [ "$ROLE" = "1" ]; then
       [ "${ASSUME_YES:-0}" = "1" ] && exit 1
     done
   fi
+  else
+    NODE_PORT=""
+  fi   # HAS_XRAY
 else
+  HAS_XRAY=0; USE_TG=0; USE_WEB=0; WEB_SERVER="$(ws_current)"
+  DOMAIN_TCP=""; DOMAIN_GRPC=""; DOMAIN_XHTTP=""; DOMAIN_HY2=""; DOMAIN_TG=""; DOMAIN_WEB=""
   USE_HY2=0; USE_BBR=0; OPEN_NODE_PORT=0; NODE_PORT=""
   PANEL_IP=$(ask_valid "IP панели (если нужно ограничить доступ, Enter — пропустить)" "${PANEL_IP:-}" is_valid_ip 1) || exit 1
 fi
@@ -284,31 +354,46 @@ if [ "${SCAN_PROTECT:-}" = "" ]; then
 fi
 export SCAN_PROTECT
 
+# Блок-лист сетей сканеров: пакеты от них отбрасываются до HAProxy/Xray (ipset, список обновляется
+# раз в сутки). Ваш SSH-адрес и IP панели добавляются в исключения. Подробности — scanblock.sh.
+if [ "${SCAN_BLOCKLIST:-}" = "" ]; then
+  if [ "$SCAN_PROTECT" = "1" ] && ask_yes_no "Не отвечать сетям сканеров по блок-листу (обновляется раз в сутки)?" "1"; then SCAN_BLOCKLIST=1; else SCAN_BLOCKLIST=0; fi
+fi
+export SCAN_BLOCKLIST
+
 # ---- план выполнения: что именно сейчас будет сделано ------------------------
 yn() { [ "$1" = "1" ] && echo "да" || echo "нет"; }
+PROTO_LIST=""
+if [ "$ROLE" = "1" ]; then
+  for i in "${!PROTO_KEYS[@]}"; do [ "${PROTO_STATE[$i]}" = "1" ] && PROTO_LIST+="${PROTO_LIST:+, }${PROTO_LABELS[$i]}"; done
+fi
 echo
 box_top "План выполнения"
 box_row "Роль:               $([ "$ROLE" = "1" ] && echo "нода" || echo "сервер панели (только защита)")"
+if [ "$ROLE" = "1" ]; then
+  box_wrap "Протоколы:        " "$PROTO_LIST"
+  box_row "Веб-сервер:         $(ws_label "$WEB_SERVER") ${C_DIM}(заглушки self-steal)${C_RESET}"
+fi
 if [ "$NEW_SSH_PORT" != "$CUR_SSH_PORT" ]; then
   box_row "SSH-порт:           ${CUR_SSH_PORT} → ${C_BOLD}${NEW_SSH_PORT}${C_RESET}"
 else
   box_row "SSH-порт:           ${NEW_SSH_PORT} (без изменений)"
 fi
 if [ "$ROLE" = "1" ]; then
-  box_wrap "Домены:           " "${DOMAIN_TCP}${DOMAIN_GRPC:+ ${DOMAIN_GRPC}}${DOMAIN_XHTTP:+ ${DOMAIN_XHTTP}}${DOMAIN_HY2:+ ${DOMAIN_HY2}}${DOMAIN_TG:+ ${DOMAIN_TG}}${DOMAIN_WEB:+ ${DOMAIN_WEB} (WEB-прокси)}"
+  box_wrap "Домены:           " "${DOMAIN_TCP:+${DOMAIN_TCP} }${DOMAIN_GRPC:+${DOMAIN_GRPC} }${DOMAIN_XHTTP:+${DOMAIN_XHTTP} }${DOMAIN_HY2:+${DOMAIN_HY2} }${DOMAIN_TG:+${DOMAIN_TG} }${DOMAIN_WEB:+${DOMAIN_WEB} (WEB-прокси)}"
   if [ "$USE_API" = "1" ]; then
     box_row "Профиль на панели: ${C_BOLD}${PROFILE_NAME}${C_RESET}  ${C_DIM}(хосты + SECRET_KEY по API)${C_RESET}"
     box_row "                    $([ "$PROFILE_CREATE_NODE" = "1" ] && echo "нода на панели создаётся" || echo "ноду на панели создадите сами")$([ -n "$DOMAIN_TG" ] && echo "; есть Telegram-хост")"
-  else
+  elif [ "$HAS_XRAY" = "1" ]; then
     box_row "Профиль на панели: ${C_DIM}нет (конфиг добавите вручную)${C_RESET}"
   fi
-  box_row "Порт ноды:          ${NODE_PORT}$([ "$OPEN_NODE_PORT" = "1" ] && echo " (открыт$([ -n "$PANEL_IP" ] && echo " только для ${PANEL_IP}"))" || echo " (в firewall не открывается)")"
+  [ "$HAS_XRAY" = "1" ] && box_row "Порт ноды:          ${NODE_PORT}$([ "$OPEN_NODE_PORT" = "1" ] && echo " (открыт$([ -n "$PANEL_IP" ] && echo " только для ${PANEL_IP}"))" || echo " (в firewall не открывается)")"
   box_row "Hysteria2:          $(yn "$USE_HY2")    Заглушки: $(yn "$INSTALL_DECOY")    BBR: $(yn "$USE_BBR")"
   box_row "                    ${C_DIM}по одной заглушке на каждый протокол, все разные${C_RESET}"
 fi
 box_row "Ребут в 04:00:      $(yn "$ENABLE_REBOOT")    Часовой пояс: ${DORIK_TZ}"
 box_row "Укрепление:         $(yn "$DO_HARDEN")    Вход по паролю SSH выключить: $(yn "$SSH_PW_OFF")"
-box_row "Защита сканеров:    $(yn "$SCAN_PROTECT")"
+box_row "Защита сканеров:    $(yn "$SCAN_PROTECT")    Блок-лист сетей сканеров: $(yn "$SCAN_BLOCKLIST")"
 box_bottom
 
 echo
@@ -327,11 +412,13 @@ fi
 FAIL_LOG=()
 STEP_NO=0
 if [ "$ROLE" = "1" ]; then
-  TOTAL_STEPS=6; [ "$USE_BBR" = "1" ] && TOTAL_STEPS=7
+  TOTAL_STEPS=5; [ "$USE_BBR" = "1" ] && TOTAL_STEPS=6
+  [ "$HAS_XRAY" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))     # Remnanode
 else
   TOTAL_STEPS=4
 fi
 [ "$DO_HARDEN" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
+[ "$SCAN_BLOCKLIST" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
 [ "${USE_API:-0}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
 [ "${USE_API:-0}" = "1" ] && [ "${PROFILE_CREATE_NODE:-0}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
 [ "$ROLE" = "1" ] && [ "${USE_WEB:-0}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
@@ -477,10 +564,10 @@ if [ "$ROLE" = "1" ]; then
     local src; src="$(get_script haproxy-setup.sh)" || { err "Не удалось получить haproxy-setup.sh"; return 1; }
     DOMAIN_TCP="$DOMAIN_TCP" DOMAIN_GRPC="$DOMAIN_GRPC" DOMAIN_XHTTP="$DOMAIN_XHTTP" \
     DOMAIN_HY2="$DOMAIN_HY2" USE_HY2="$USE_HY2" DOMAIN_TG="$DOMAIN_TG" USE_TG="$USE_TG" \
-    DOMAIN_WEB="$DOMAIN_WEB" USE_WEB="$USE_WEB" \
+    DOMAIN_WEB="$DOMAIN_WEB" USE_WEB="$USE_WEB" WEB_SERVER="$WEB_SERVER" \
     INSTALL_DECOY="$INSTALL_DECOY" NONINTERACTIVE=1 bash "$src"
   }
-  run_step "Nginx (self-steal) + HAProxy + сертификаты" do_nginx_haproxy
+  run_step "$(ws_label "$WEB_SERVER") (self-steal) + HAProxy + сертификаты" do_nginx_haproxy
 
   if [ "$USE_BBR" = "1" ]; then
     do_bbr() {
@@ -502,7 +589,7 @@ if [ "$ROLE" = "1" ]; then
     NODE_PORT="$NODE_PORT" USE_HY2="$USE_HY2" SECRET_KEY="$SECRET_KEY" \
       DOMAIN_HY2="$DOMAIN_HY2" NONINTERACTIVE=1 bash "$src"
   }
-  run_step "Remnanode (Docker + Hysteria2)" do_remnanode
+  [ "$HAS_XRAY" = "1" ] && run_step "Remnanode (Docker$([ "$USE_HY2" = "1" ] && echo " + Hysteria2"))" do_remnanode
 
   if [ "${USE_API:-0}" = "1" ] && [ "${PROFILE_CREATE_NODE:-0}" = "1" ]; then
     do_node_link() {
@@ -547,6 +634,14 @@ if [ "$DO_HARDEN" = "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Блок-лист сетей сканеров (после firewall: правило ставится перед цепочками ufw)
+# ---------------------------------------------------------------------------
+if [ "$SCAN_BLOCKLIST" = "1" ]; then
+  do_scanblock() { PANEL_IP="${PANEL_IP:-}" scanblock_on; }
+  run_step "Блок-лист сетей сканеров" do_scanblock
+fi
+
+# ---------------------------------------------------------------------------
 # Финальная страховочная проверка SSH
 # ---------------------------------------------------------------------------
 # Промежуточные шаги (apt install nginx/haproxy/certbot, docker install)
@@ -588,13 +683,32 @@ fi
 box_sep
 box_row "SSH-порт:        ${C_BOLD}${NEW_SSH_PORT}${C_RESET}"
 if [ "$ROLE" = "1" ]; then
-  box_row "Нода:            ${DOMAIN_TCP}${DOMAIN_GRPC:+, ${DOMAIN_GRPC}}"
-  box_wrap "${C_DIM}→${C_RESET}" "Дальше: в панели Remnawave добавьте ноду (адрес сервера, порт ${NODE_PORT})."
+  box_wrap "Протоколы:     " "$PROTO_LIST"
+  if [ "$HAS_XRAY" = "1" ] && [ "${PROFILE_CREATE_NODE:-0}" != "1" ]; then
+    box_wrap "${C_DIM}→${C_RESET}" "Дальше: в панели Remnawave добавьте ноду (адрес сервера, порт ${NODE_PORT})."
+  fi
 fi
+box_row "${C_DIM}Отчёт о сервере: команда ${C_RESET}${C_BOLD}dorik report${C_RESET}"
 if [ -f /var/run/reboot-required ]; then
   box_row "${C_Y}▲ Нужна перезагрузка для обновлений ядра: reboot${C_RESET}"
 fi
 box_row "${C_DIM}Лог: ${DORIK_LOG}${C_RESET}"
 box_bottom
+
+# Итог запуска — для пункта «Отчёт» (без секретов: только что ставили и чем закончилось).
+mkdir -p /var/lib/dorik
+{
+  echo "Дата: $(date '+%F %T %Z')"
+  echo "Роль: $([ "$ROLE" = "1" ] && echo "нода" || echo "сервер панели")"
+  if [ "$ROLE" = "1" ]; then
+    echo "Протоколы: ${PROTO_LIST}"
+    echo "Веб-сервер: $(ws_label "$WEB_SERVER")"
+  fi
+  echo "SSH-порт: ${NEW_SSH_PORT}"
+  echo "Укрепление: $(yn "$DO_HARDEN") · защита от сканеров: $(yn "$SCAN_PROTECT") · блок-лист: $(yn "$SCAN_BLOCKLIST")"
+  echo "Этапов выполнено: ${STEP_NO}, с ошибками: ${#FAIL_LOG[@]}"
+  for f in "${FAIL_LOG[@]}"; do echo "  ошибка: ${f}"; done
+  echo "Лог: ${DORIK_LOG}"
+} > /var/lib/dorik/last-run.txt 2>/dev/null || true
 
 [ "${#FAIL_LOG[@]}" -eq 0 ]

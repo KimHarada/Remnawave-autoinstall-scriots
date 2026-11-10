@@ -83,13 +83,15 @@ st_bbr() {
 }
 
 st_web() {
-  local n=0 h=0
-  svc_exists nginx && n=1
+  local n=0 h=0 ws="nginx"
+  # Веб-сервер заглушек/панели — nginx или Caddy (выбор хранится в /etc/dorik/webserver).
+  declare -F ws_current &>/dev/null && ws="$(ws_current)"
+  svc_exists "$ws" && n=1
   svc_exists haproxy && h=1
   if [ "$n$h" = "00" ]; then _st off "не установлены"; return; fi
-  if { [ "$n" = 0 ] || svc_active nginx; } && { [ "$h" = 0 ] || svc_active haproxy; }; then
+  if { [ "$n" = 0 ] || svc_active "$ws"; } && { [ "$h" = 0 ] || svc_active haproxy; }; then
     local decoy="" names="" total uniq
-    [ "$n" = 1 ] && names="nginx"
+    [ "$n" = 1 ] && names="$ws"
     [ "$h" = 1 ] && names="${names:+$names + }haproxy"
     if [ -s /etc/dorik/decoys.conf ]; then
       total="$(wc -l < /etc/dorik/decoys.conf)"
@@ -101,8 +103,23 @@ st_web() {
     fi
     _st ok "${names}${decoy}"
   else
-    _st bad "служба остановлена (nginx/haproxy)"
+    _st bad "служба остановлена (${ws}/haproxy)"
   fi
+}
+
+# Защита от сканеров: бан перебора портов (fail2ban) и блок-лист сетей сканеров (ipset).
+st_shield() {
+  local jail=0 nets=0 txt=""
+  have fail2ban-client && fail2ban-client status dorik-portscan &>/dev/null && jail=1
+  if have ipset && ipset list -n dorik-scan4 &>/dev/null; then
+    nets="$(ipset list -t dorik-scan4 2>/dev/null | awk -F': ' '/Number of entries/{print $2}')"
+    nets="${nets:-0}"
+  fi
+  [ "$jail" = "1" ] && txt="бан перебора портов"
+  [ "$nets" -gt 0 ] && txt="${txt:+$txt · }блок-лист: ${nets} сетей"
+  if [ "$jail" = "1" ] && [ "$nets" -gt 0 ]; then _st ok "$txt"
+  elif [ -n "$txt" ]; then _st warn "${txt} (включено не всё)"
+  else _st off "не включена (пункт «Защита и порты»)"; fi
 }
 
 st_certs() {
@@ -214,20 +231,37 @@ st_issues() {
   else _st warn "найдено: ${#ISSUE_IDS[@]} — пункт «Проверка и исправление»"; fi
 }
 
-show_dashboard() {
-  local entry label fn
-  box_top "Состояние сервера"
-  for entry in \
-    "Система:st_system" "SSH:st_ssh" "Firewall (ufw):st_ufw" "fail2ban:st_f2b" \
-    "Открытые порты:st_ports" "BBR:st_bbr" "Nginx/HAProxy:st_web" "Сертификаты:st_certs" "Docker:st_docker" \
-    "Нода Remnanode:st_node" "Профиль панели:st_profile" "WEB-прокси TG:st_webproxy" "Панель Remnawave:st_panel" "Страница подп.:st_sub" \
-    "Расписание:st_cron" "Проверка:st_issues"; do
-    label="${entry%%:*}"; fn="${entry##*:}"
-    "$fn"
-    dot_row "$ST_L" "$label" "$ST_T"
+# Пункты сводки «название:функция». Результат сбора — в DASH_N / DASH_L / DASH_T: его
+# используют рамка «Состояние сервера», правая панель меню, заставка и отчёт.
+DASH_ENTRIES=(
+  "Система:st_system" "SSH:st_ssh" "Firewall (ufw):st_ufw" "fail2ban:st_f2b"
+  "Щит сканеров:st_shield" "Открытые порты:st_ports" "BBR:st_bbr" "Веб-сервер:st_web"
+  "Сертификаты:st_certs" "Docker:st_docker" "Нода Remnanode:st_node" "Профиль панели:st_profile"
+  "WEB-прокси TG:st_webproxy" "Панель Remnawave:st_panel" "Страница подп.:st_sub"
+  "Расписание:st_cron" "Проверка:st_issues"
+)
+declare -ga DASH_N=() DASH_L=() DASH_T=()
+
+dash_collect() {  # dash_collect [функция] — её вызывают после каждого пункта: <номер> <всего>
+  local entry i=0 total=${#DASH_ENTRIES[@]} cb="${1:-}"
+  DASH_N=(); DASH_L=(); DASH_T=()
+  for entry in "${DASH_ENTRIES[@]}"; do
+    "${entry##*:}" 2>/dev/null
+    DASH_N+=("${entry%%:*}"); DASH_L+=("$ST_L"); DASH_T+=("$ST_T")
+    i=$((i+1))
+    [ -n "$cb" ] && "$cb" "$i" "$total"
   done
+  return 0
+}
+
+dash_print() {
+  local i
+  box_top "Состояние сервера"
+  for i in "${!DASH_N[@]}"; do dot_row "${DASH_L[$i]}" "${DASH_N[$i]}" "${DASH_T[$i]}"; done
   box_bottom
 }
+
+show_dashboard() { dash_collect; dash_print; }
 
 # ---- проверки результата этапов ---------------------------------------------
 # Каждая verify_* печатает галочки по пунктам и возвращает число провалов.

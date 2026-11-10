@@ -15,7 +15,7 @@ DORIK_RAW="${DORIK_RAW:-https://raw.githubusercontent.com/KimHarada/Remnawave-au
 DORIK_TZ="${DORIK_TZ:-Asia/Irkutsk}"
 DEFAULT_NODE_PORT="3001"
 
-DORIK_VERSION="2.0"
+DORIK_VERSION="3.0"
 
 # Оформление (цвета, рамки, спиннер, прогресс) лежит рядом, в ui.sh.
 _dorik_source() {  # _dorik_source <файл рядом с lib.sh>
@@ -105,6 +105,10 @@ ask_valid() {
     default=""
   done
 }
+
+# Двухпанельные меню и выбор веб-сервера (nginx/Caddy) — после функций ввода: они на них опираются.
+_dorik_source tui.sh
+_dorik_source webserver.sh
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -534,7 +538,21 @@ install_renew_hook() {
   install -d /etc/letsencrypt/renewal-hooks/deploy
   cat > /etc/letsencrypt/renewal-hooks/deploy/dorik-reload.sh <<'HOOK'
 #!/bin/sh
-systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+if systemctl is-active nginx >/dev/null 2>&1; then
+  systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+fi
+# Caddy читает копии сертификатов (к /etc/letsencrypt у него нет доступа) — обновляем копии.
+if [ -d /etc/caddy/certs ] && systemctl is-active caddy >/dev/null 2>&1; then
+  for dst in /etc/caddy/certs/*/; do
+    [ -d "$dst" ] || continue
+    d="$(basename "$dst")"
+    [ -f "/etc/letsencrypt/live/$d/fullchain.pem" ] || continue
+    cp -fL "/etc/letsencrypt/live/$d/fullchain.pem" "$dst/fullchain.pem"
+    cp -fL "/etc/letsencrypt/live/$d/privkey.pem" "$dst/privkey.pem"
+    chown caddy:caddy "$dst"/*.pem 2>/dev/null; chmod 640 "$dst"/*.pem
+  done
+  systemctl restart caddy >/dev/null 2>&1 || true
+fi
 if [ -f /opt/remnanode/docker-compose.yml ] && grep -q '/etc/letsencrypt/live' /opt/remnanode/docker-compose.yml \
    && command -v docker >/dev/null 2>&1; then
   (cd /opt/remnanode && docker compose up -d --force-recreate) >/dev/null 2>&1 || true

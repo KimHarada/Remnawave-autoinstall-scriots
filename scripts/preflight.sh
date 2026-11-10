@@ -23,7 +23,7 @@ _pf_reach() {  # _pf_reach <url>
 }
 
 preflight_run() {
-  local need_docker=0 need_certs=0 ports="" ram_min=1024 disk_min=5 allow='nginx|haproxy'
+  local need_docker=0 need_certs=0 ports="" ram_min=1024 disk_min=5 allow='nginx|haproxy|caddy'
   while [ $# -gt 0 ]; do
     case "$1" in
       --docker)  need_docker=1 ;;

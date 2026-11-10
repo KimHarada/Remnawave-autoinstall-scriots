@@ -222,6 +222,78 @@ EOF
   ln -sf "$f" "$NGX_EN/remnawave-sub"
 }
 
+# ---- Caddy -----------------------------------------------------------------------
+# То же самое для Caddy. Сертификаты он выпускает и продлевает сам (certbot не нужен), заголовки
+# X-Forwarded-* проставляет сам. «abort» — обрыв соединения без ответа, как 444 у nginx.
+write_caddy_panel() {
+  local d="$1" protect="$2" key="$3" val="$4" f="$CADDY_SITES/panel.caddy"
+  mkdir -p "$CADDY_SITES"
+  {
+    cat <<EOF
+# Создано DORIK toolkit. Панель Remnawave за Caddy.
+${d} {
+    header -Server
+
+    # Встроенная выдача подписок публична по замыслу — клиентам нужен доступ без cookie.
+    @dorik_sub path /api/sub/*
+    handle @dorik_sub {
+        reverse_proxy 127.0.0.1:3000
+    }
+
+EOF
+    if [ "$protect" = "1" ]; then
+      # Панель открывается только по секретной ссылке (/?${key}=...): при первом заходе ставится
+      # cookie, дальше ссылка не нужна. Остальным соединение рвётся — панель не видна сканерам.
+      cat <<EOF
+    @dorik_key query ${key}=${val}
+    handle @dorik_key {
+        header Set-Cookie "${key}=${val}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=31536000"
+        reverse_proxy 127.0.0.1:3000
+    }
+
+    @dorik_cookie header_regexp Cookie ${key}=${val}
+    handle @dorik_cookie {
+        reverse_proxy 127.0.0.1:3000
+    }
+
+    handle {
+        abort
+    }
+}
+EOF
+    else
+      cat <<'EOF'
+    handle {
+        reverse_proxy 127.0.0.1:3000
+    }
+}
+EOF
+    fi
+  } > "$f"
+  chmod 640 "$f"; chown root:caddy "$f" 2>/dev/null || chmod 644 "$f"
+}
+
+write_caddy_sub() {
+  local d="$1" f="$CADDY_SITES/sub.caddy"
+  mkdir -p "$CADDY_SITES"
+  cat > "$f" <<EOF
+# Создано DORIK toolkit. Страница подписки Remnawave.
+${d} {
+    header -Server
+    reverse_proxy 127.0.0.1:3010
+}
+EOF
+}
+
+# Применяет конфиг Caddy и ждёт, пока он выпустит сертификат для домена.
+caddy_panel_apply() {  # caddy_panel_apply <домен, для которого ждём сертификат>
+  local d="$1"
+  caddy_apply panel || return 1
+  spin_run "Caddy выпускает сертификат для ${d} (до 2 минут)" caddy_wait_https "$d" 120 && return 0
+  err "Caddy не получил сертификат для ${d}: проверьте A-запись домена и что порты 80/443 открыты. Журнал: journalctl -u caddy -n 40"
+  return 1
+}
+
 nginx_apply() {
   rm -f "$NGX_EN/default"
   if nginx -t 2>/tmp/dorik_nginx_err; then
@@ -233,11 +305,11 @@ nginx_apply() {
   return 1
 }
 
-# Порт 80/443 должны быть свободны (или заняты нашим же nginx).
+# Порт 80/443 должны быть свободны (или заняты нашим же nginx/Caddy).
 check_ports_free() {
   local p busy
   for p in 80 443; do
-    busy="$(ss -tlnp 2>/dev/null | grep -E "[:.]${p}[[:space:]]" | grep -v nginx || true)"
+    busy="$(ss -tlnp 2>/dev/null | grep -E "[:.]${p}[[:space:]]" | grep -vE 'nginx|caddy' || true)"
     if [ -n "$busy" ]; then
       err "Порт ${p} уже занят другим сервисом:"
       echo "$busy" | head -2 | sed 's/^/      /' >&2
@@ -255,7 +327,7 @@ panel_install() {
     return 0
   fi
   # Панель тяжелее ноды: PostgreSQL + Valkey + backend — от 2 ГБ памяти и 10 ГБ диска.
-  preflight_run --docker --certs --ports "80 443" --allow nginx --ram-mb 2048 --disk-gb 10 || return 1
+  preflight_run --docker --certs --ports "80 443" --allow 'nginx|caddy' --ram-mb 2048 --disk-gb 10 || return 1
   # Для панели строже, чем в предполётной проверке: 443 не должен занимать и HAProxy ноды.
   check_ports_free || return 1
 
@@ -265,6 +337,10 @@ panel_install() {
   SUB_DOMAIN=$(ask_valid "Домен страницы подписки (Enter — пропустить, будет /api/sub панели)" "${SUB_DOMAIN:-}" is_valid_domain 1) || return 1
   PANEL_DOMAIN="${PANEL_DOMAIN,,}"; SUB_DOMAIN="${SUB_DOMAIN,,}"
   if ask_yes_no "Скрыть панель за секретной ссылкой (рекомендуется)?" "1"; then PROTECT=1; else PROTECT=0; fi
+  # Что будет стоять перед панелью: nginx (сертификаты certbot) или Caddy (сертификаты сам).
+  local WS
+  if [ "${ASSUME_YES:-0}" = "1" ]; then WS="$(ws_current)"; else ws_ask panel || return 1; WS="$WEB_SERVER"; fi
+  export WEB_SERVER="$WS"
 
   # DNS заранее: без него сертификат не выпустится, а HTTPS-панель не откроется.
   pub_ip="$(get_public_ip)"
@@ -311,22 +387,36 @@ panel_install() {
   spin_run "Ожидание готовности панели (до 3 минут)" wait_container_ready remnawave 180 \
     || { err "Панель не стала healthy: docker logs remnawave --tail 50"; return 1; }
 
-  step "Домен и HTTPS"
+  step "Домен и HTTPS ($(ws_label "$WS"))"
   local web_ok=1
-  if ! have nginx || ! have certbot; then apt_install nginx certbot || web_ok=0; fi
-  if [ "$web_ok" = 1 ]; then
-    systemctl stop nginx &>/dev/null || true
-    ensure_cert "$PANEL_DOMAIN" || web_ok=0
-    [ -n "$SUB_DOMAIN" ] && { ensure_cert "$SUB_DOMAIN" || warn "Сертификат для ${SUB_DOMAIN} не выпущен — страницу подписки настроите позже."; }
-  fi
-  if [ "$web_ok" = 1 ]; then
-    install_renew_hook
-    write_nginx_panel "$PANEL_DOMAIN" "$PROTECT" "$KEY" "$VAL"
-    if [ -n "$SUB_DOMAIN" ] && cert_is_valid "$SUB_DOMAIN"; then write_nginx_sub "$SUB_DOMAIN"; fi
-    nginx_apply || web_ok=0
-  fi
+  # Порты открываем ДО выпуска сертификатов: проверка Let's Encrypt приходит на 80/443.
   if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow 80/tcp comment "HTTP" &>/dev/null; ufw allow 443/tcp comment "HTTPS" &>/dev/null
+  fi
+  if [ "$WS" = "caddy" ]; then
+    caddy_install || web_ok=0
+    if [ "$web_ok" = 1 ]; then
+      ws_save caddy
+      ws_cleanup_other panel
+      write_caddy_panel "$PANEL_DOMAIN" "$PROTECT" "$KEY" "$VAL"
+      [ -n "$SUB_DOMAIN" ] && write_caddy_sub "$SUB_DOMAIN"
+      caddy_panel_apply "$PANEL_DOMAIN" || web_ok=0
+    fi
+  else
+    if ! have nginx || ! have certbot; then apt_install nginx certbot || web_ok=0; fi
+    if [ "$web_ok" = 1 ]; then
+      ws_save nginx
+      ws_cleanup_other panel
+      systemctl stop nginx &>/dev/null || true
+      ensure_cert "$PANEL_DOMAIN" || web_ok=0
+      [ -n "$SUB_DOMAIN" ] && { ensure_cert "$SUB_DOMAIN" || warn "Сертификат для ${SUB_DOMAIN} не выпущен — страницу подписки настроите позже."; }
+    fi
+    if [ "$web_ok" = 1 ]; then
+      install_renew_hook
+      write_nginx_panel "$PANEL_DOMAIN" "$PROTECT" "$KEY" "$VAL"
+      if [ -n "$SUB_DOMAIN" ] && cert_is_valid "$SUB_DOMAIN"; then write_nginx_sub "$SUB_DOMAIN"; fi
+      nginx_apply || web_ok=0
+    fi
   fi
 
   # ---- проверка результата ----
@@ -504,16 +594,26 @@ sub_install() {
   fi
   conf_set SUB_DOMAIN "$SUB_DOMAIN"
 
-  if ! have nginx || ! have certbot; then apt_install nginx certbot || web_ok=0; fi
-  if [ "$web_ok" = 1 ]; then
-    ensure_cert "$SUB_DOMAIN" || web_ok=0
-  fi
-  if [ "$web_ok" = 1 ]; then
-    install_renew_hook
-    write_nginx_sub "$SUB_DOMAIN"
-    nginx_apply || web_ok=0
-  fi
   have ufw && ufw status 2>/dev/null | grep -q '^Status: active' && { ufw allow 80/tcp &>/dev/null; ufw allow 443/tcp &>/dev/null; }
+  # Тот же веб-сервер, что стоит перед панелью (выбран при её установке).
+  local WS; WS="$(ws_current)"
+  if [ "$WS" = "caddy" ]; then
+    caddy_install || web_ok=0
+    if [ "$web_ok" = 1 ]; then
+      write_caddy_sub "$SUB_DOMAIN"
+      caddy_panel_apply "$SUB_DOMAIN" || web_ok=0
+    fi
+  else
+    if ! have nginx || ! have certbot; then apt_install nginx certbot || web_ok=0; fi
+    if [ "$web_ok" = 1 ]; then
+      ensure_cert "$SUB_DOMAIN" || web_ok=0
+    fi
+    if [ "$web_ok" = 1 ]; then
+      install_renew_hook
+      write_nginx_sub "$SUB_DOMAIN"
+      nginx_apply || web_ok=0
+    fi
+  fi
 
   step "Проверка результата"
   VERIFY_FAIL=0
@@ -527,9 +627,9 @@ sub_install() {
   if [ "$web_ok" = 1 ]; then
     # 502 на «/» — штатно (см. выше); 000 означает, что nginx/TLS не работают.
     code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 8 --resolve "${SUB_DOMAIN}:443:127.0.0.1" "https://${SUB_DOMAIN}/" || true)"
-    [ "$code" != "000" ]; _chk $? "nginx принимает HTTPS для ${SUB_DOMAIN} (HTTP ${code})" "nginx не отвечает по HTTPS для ${SUB_DOMAIN}"
+    [ "$code" != "000" ]; _chk $? "${WS} принимает HTTPS для ${SUB_DOMAIN} (HTTP ${code})" "${WS} не отвечает по HTTPS для ${SUB_DOMAIN}"
   else
-    err "HTTPS для ${SUB_DOMAIN} не настроен (сертификат/nginx)."; VERIFY_FAIL=$((VERIFY_FAIL+1))
+    err "HTTPS для ${SUB_DOMAIN} не настроен (сертификат/${WS})."; VERIFY_FAIL=$((VERIFY_FAIL+1))
   fi
   echo
   box_top "Страница подписки"
@@ -583,27 +683,35 @@ panel_status() {
   return 0
 }
 
+_panel_pause() {
+  [ "${ASSUME_YES:-0}" = "1" ] && return 0
+  echo
+  read -r -p "$(echo -e "${C_DIM}Enter — вернуться в меню${C_RESET} ")" _ <"$(prompt_input)" || true
+}
+
 panel_menu() {
-  local ch
+  local nl=$'\n' pst sst
+  local -a PM_L=("Установить панель" "Обновить панель" "Установить страницу подписки" "Обновить страницу подписки" "Статус и ссылка для входа")
+  local -a PM_K=(1 2 3 4 5) PM_D
+  TUI_SEL=0
   while true; do
-    echo
-    box_top "Панель Remnawave"
-    box_row "${C_B}1${C_RESET}  Установить панель (+ nginx и сертификат)"
-    box_row "${C_B}2${C_RESET}  Обновить панель (с резервной копией БД)"
-    box_row "${C_B}3${C_RESET}  Установить страницу подписки"
-    box_row "${C_B}4${C_RESET}  Обновить страницу подписки"
-    box_row "${C_B}5${C_RESET}  Статус и ссылка для входа"
-    box_row "${C_B}9${C_RESET}  Назад"
-    box_bottom
-    read -r -p "$(echo -e "${C_Y}›${C_RESET} Выбор: ")" ch <"$(prompt_input)" || return 0
-    case "$ch" in
-      1) panel_install ;;
-      2) panel_update ;;
-      3) sub_install ;;
-      4) sub_update ;;
-      5) panel_status ;;
-      *) return 0 ;;
+    st_panel; pst="$ST_T"; st_sub; sst="$ST_T"
+    PM_D=(
+      "Ставит панель Remnawave в Docker (backend, PostgreSQL, Valkey), веб-сервер перед ней — nginx или Caddy на выбор — и сертификат. По желанию панель скрывается за секретной ссылкой: без неё сервер не отвечает вовсе.${nl}${nl}@НУЖНО${nl}домен панели, от 2 ГБ памяти, свободные порты 80 и 443${nl}${nl}@СЕЙЧАС${nl}${pst}"
+      "Скачивает свежие образы и compose из репозитория Remnawave. Перед обновлением делает резервную копию базы данных; если панель не поднимется — подскажет команды отката.${nl}${nl}@СЕЙЧАС${nl}${pst}"
+      "Отдельная страница, на которую ведут ссылки подписок клиентов. Ставится рядом с панелью, нужен свой домен и API-токен панели.${nl}${nl}@СЕЙЧАС${nl}${sst}"
+      "Скачивает свежий образ страницы подписки и перезапускает её.${nl}${nl}@СЕЙЧАС${nl}${sst}"
+      "Показывает состояние контейнеров и ссылку для входа в панель (с секретным ключом, если панель скрыта).${nl}${nl}@СЕЙЧАС${nl}панель: ${pst}${nl}подписка: ${sst}"
+    )
+    tui_select "ПАНЕЛЬ REMNAWAVE" PM_L PM_D PM_K || return 0
+    case "$TUI_SEL" in
+      0) panel_install ;;
+      1) panel_update ;;
+      2) sub_install ;;
+      3) sub_update ;;
+      4) panel_status ;;
     esac
+    _panel_pause
   done
 }
 

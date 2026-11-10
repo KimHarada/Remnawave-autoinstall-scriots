@@ -15,7 +15,9 @@ NONINTERACTIVE="${NONINTERACTIVE:-${ASSUME_YES:-0}}"
 
 if [ "$NONINTERACTIVE" != "1" ]; then
   ensure_tty
-  DOMAIN_TCP=$(ask_valid "Домен для VLESS REALITY TCP (обязателен)" "${DOMAIN_TCP:-}" is_valid_domain) || exit 1
+  ws_ask node || exit 1
+  info "Протокол без домена не настраивается. Нужен хотя бы один домен."
+  DOMAIN_TCP=$(ask_valid "Домен для VLESS REALITY TCP (Enter — не использовать)" "${DOMAIN_TCP:-}" is_valid_domain 1) || exit 1
   DOMAIN_GRPC=$(ask_valid "Домен для VLESS gRPC (Enter — не использовать)" "${DOMAIN_GRPC:-}" is_valid_domain 1) || exit 1
   DOMAIN_XHTTP=$(ask_valid "Домен для VLESS XHTTP (Enter — не использовать)" "${DOMAIN_XHTTP:-}" is_valid_domain 1) || exit 1
   DOMAIN_HY2=$(ask_valid "Домен для Hysteria2 (Enter — не использовать)" "${DOMAIN_HY2:-}" is_valid_domain 1) || exit 1
@@ -46,21 +48,36 @@ USE_WEB="${USE_WEB:-0}"
 DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"; DOMAIN_TG="${DOMAIN_TG,,}"; DOMAIN_WEB="${DOMAIN_WEB,,}"
 export USE_WEB DOMAIN_WEB
 
-if [ -z "$DOMAIN_TCP" ]; then
-  err "DOMAIN_TCP не задан — это домен по умолчанию для HAProxy (REALITY TCP)."
+[ "$USE_HY2" = "1" ] || DOMAIN_HY2=""
+if [ -z "${DOMAIN_TCP}${DOMAIN_GRPC}${DOMAIN_XHTTP}${DOMAIN_HY2}${DOMAIN_TG}${DOMAIN_WEB}" ]; then
+  err "Не задан ни один домен — нечего настраивать (DOMAIN_TCP, DOMAIN_GRPC, DOMAIN_XHTTP, DOMAIN_HY2, DOMAIN_TG, DOMAIN_WEB)."
   exit 1
 fi
+
+# Основной протокол: к нему HAProxy отправляет всё, что пришло с неизвестным SNI или без него
+# (заход по IP, сканер). Это первый из выбранных протоколов Xray, который слушает TCP 443.
+declare -A XPORT=( [tcp]=56789 [grpc]=56790 [xhttp]=56791 [tg]=56792 )
+declare -A XDOM=( [tcp]="$DOMAIN_TCP" [grpc]="$DOMAIN_GRPC" [xhttp]="$DOMAIN_XHTTP" [tg]="$DOMAIN_TG" )
+PRIMARY=""; PRIMARY_DOMAIN=""
+for p in tcp grpc xhttp tg; do
+  [ -n "${XDOM[$p]}" ] && { PRIMARY="$p"; PRIMARY_DOMAIN="${XDOM[$p]}"; break; }
+done
+# Только Hysteria2 и/или WEB-прокси: на TCP 443 отвечает их собственная заглушка.
+[ -z "$PRIMARY_DOMAIN" ] && PRIMARY_DOMAIN="${DOMAIN_HY2:-$DOMAIN_WEB}"
 
 _dorik_source decoys.sh
+WS="$(ws_current)"
 ALL_DOMAINS=("$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2" "$DOMAIN_TG" "$DOMAIN_WEB")
 
-step "Установка Nginx / HAProxy / Certbot"
+step "Установка $(ws_label "$WS") / HAProxy / Certbot"
 apt_update || warn "apt update не удался — ставлю из имеющихся списков."
-apt_install nginx haproxy certbot unzip dnsutils curl openssl
-if ! command -v nginx &>/dev/null || ! command -v certbot &>/dev/null || ! command -v haproxy &>/dev/null; then
-  err "nginx/haproxy/certbot не установились — дальше этот шаг работать не будет. Проверьте: apt-get update; apt-get install nginx haproxy certbot unzip dnsutils"
+apt_install haproxy certbot unzip dnsutils curl openssl
+if [ "$WS" = "caddy" ]; then caddy_install; else apt_install nginx; fi
+if ! command -v "$WS" &>/dev/null || ! command -v certbot &>/dev/null || ! command -v haproxy &>/dev/null; then
+  err "${WS}/haproxy/certbot не установились — дальше этот шаг работать не будет. Проверьте: apt-get update; apt-get install ${WS} haproxy certbot unzip dnsutils"
   exit 1
 fi
+ws_save "$WS"
 
 # ---- заглушки: по одной на КАЖДЫЙ протокол, все разные ---------------------------------
 # (домен, сертификат, nginx-сайт, порт и страница — свои; подробности в decoys.sh)
@@ -93,9 +110,11 @@ done
 # ---- certbot ---------------------------------------------------------------
 step "Выпуск SSL сертификатов"
 ufw allow 80/tcp &>/dev/null || true
-# certbot --standalone сам слушает 80-й порт, поэтому nginx на это время
-# нужно остановить, иначе "port 80 already in use".
-systemctl stop nginx 2>&1 || true
+# certbot --standalone сам слушает 80-й порт, поэтому веб-сервер на это время
+# нужно остановить, иначе "port 80 already in use". Останавливаем оба: при смене
+# nginx ↔ Caddy прежний сервер ещё может быть запущен.
+systemctl stop nginx &>/dev/null || true
+systemctl stop caddy &>/dev/null || true
 # LE_EMAIL — необязательный адрес для уведомлений об истечении. Без него
 # регистрируемся без email (раньше подставлялся несуществующий admin@домен).
 if [ -n "${LE_EMAIL:-}" ]; then
@@ -122,27 +141,40 @@ for d in "${ALL_DOMAINS[@]}"; do
     fi
   fi
 done
-systemctl start nginx 2>&1 || true
+[ "$WS" = "nginx" ] && { systemctl start nginx 2>&1 || true; }
 
-# Хук продления (см. install_renew_hook в lib.sh): перезапуск nginx и remnanode.
+# Хук продления (см. install_renew_hook в lib.sh): перезапуск веб-сервера и remnanode.
 install_renew_hook
 
-# ---- nginx: отдельная заглушка (и сертификат) на каждый протокол ------------------------
+# ---- веб-сервер: отдельная заглушка (и сертификат) на каждый протокол -------------------
 # Reality «ворует» сертификат у target-сервера реальным TLS-хендшейком, поэтому каждая
 # заглушка слушает TLS с сертификатом СВОЕГО домена (см. decoys.sh).
-step "Настройка Nginx (self-steal: заглушка на каждый протокол)"
-decoys_write_nginx || true   # код > 0 = часть заглушек пока без TLS; предупреждение уже выведено
-rm -f /etc/nginx/sites-enabled/default
-sed -i 's/worker_connections .*/worker_connections 16384;/' /etc/nginx/nginx.conf || true
-grep -q "large_client_header_buffers" /etc/nginx/nginx.conf || \
-  sed -i '/http {/a \    large_client_header_buffers 8 64k;' /etc/nginx/nginx.conf
-if ! nginx -t 2>&1; then
-  err "Ошибка конфигурации nginx"
-  exit 1
+step "Настройка $(ws_label "$WS") (self-steal: заглушка на каждый протокол)"
+# Сайты тулкита у другого веб-сервера убираем: иначе оба слушали бы одни и те же порты.
+ws_cleanup_other decoy
+if [ "$WS" = "caddy" ]; then
+  decoys_write_caddy || true   # код > 0 = часть заглушек пока без TLS; предупреждение уже выведено
+  # При чужом/пустом SNI отдаём сертификат основного домена — как nginx с первым сайтом.
+  CADDY_DEFAULT_SNI=""; cert_is_valid "$PRIMARY_DOMAIN" && CADDY_DEFAULT_SNI="$PRIMARY_DOMAIN"
+  if ! caddy_apply node "$CADDY_DEFAULT_SNI"; then
+    err "Ошибка конфигурации Caddy"
+    exit 1
+  fi
+  ok "Caddy настроен."
+else
+  decoys_write_nginx || true
+  rm -f /etc/nginx/sites-enabled/default
+  sed -i 's/worker_connections .*/worker_connections 16384;/' /etc/nginx/nginx.conf || true
+  grep -q "large_client_header_buffers" /etc/nginx/nginx.conf || \
+    sed -i '/http {/a \    large_client_header_buffers 8 64k;' /etc/nginx/nginx.conf
+  if ! nginx -t 2>&1; then
+    err "Ошибка конфигурации nginx"
+    exit 1
+  fi
+  systemctl enable nginx &>/dev/null || true
+  systemctl restart nginx
+  ok "Nginx настроен."
 fi
-systemctl enable nginx &>/dev/null || true
-systemctl restart nginx
-ok "Nginx настроен."
 
 # ---- haproxy (SNI passthrough) --------------------------------------------
 # Конфиг пишем во временный файл, проверяем, и только потом ставим на место
@@ -198,33 +230,41 @@ else
     tcp-request content accept if { req.ssl_hello_type 1 }
 EOF
 fi
-[ -n "$DOMAIN_GRPC" ]  && [ "$DOMAIN_GRPC"  != "$DOMAIN_TCP" ] && echo "    use_backend be_grpc if { req.ssl_sni -i ${DOMAIN_GRPC} }"
-[ -n "$DOMAIN_XHTTP" ] && [ "$DOMAIN_XHTTP" != "$DOMAIN_TCP" ] && echo "    use_backend be_xhttp if { req.ssl_sni -i ${DOMAIN_XHTTP} }"
-[ -n "$DOMAIN_TG" ]    && [ "$DOMAIN_TG"    != "$DOMAIN_TCP" ] && echo "    use_backend be_tg if { req.ssl_sni -i ${DOMAIN_TG} }"
+# Какие backend'ы нужны. Протокол на том же домене, что и основной, отдельного маршрута
+# не получает: HAProxy различает только SNI.
+declare -A BE=()
+for p in grpc xhttp tg; do
+  [ "$p" = "$PRIMARY" ] && continue
+  [ -n "${XDOM[$p]}" ] && [ "${XDOM[$p]}" != "$PRIMARY_DOMAIN" ] && BE[$p]=1
+done
 # Домен Hysteria2 по TCP — его собственная заглушка с его сертификатом (по UDP отвечает сам Hysteria2).
-[ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ] && [ "$DOMAIN_HY2" != "$DOMAIN_TCP" ] && echo "    use_backend be_hy2 if { req.ssl_sni -i ${DOMAIN_HY2} }"
-# WEB-прокси Telegram: nginx (TLS своего домена) -> Telemt; страницу для обычных посетителей отдаёт Telemt.
-[ -n "$DOMAIN_WEB" ] && [ "$DOMAIN_WEB" != "$DOMAIN_TCP" ] && echo "    use_backend be_web if { req.ssl_sni -i ${DOMAIN_WEB} }"
-echo "    default_backend be_tcp"
-cat <<'EOF'
+[ -n "$DOMAIN_HY2" ] && { [ -z "$PRIMARY" ] || [ "$DOMAIN_HY2" != "$PRIMARY_DOMAIN" ]; } && BE[hy2]=1
+# WEB-прокси Telegram: веб-сервер (TLS своего домена) -> Telemt; страницу для обычных посетителей отдаёт Telemt.
+[ -n "$DOMAIN_WEB" ] && { [ -z "$PRIMARY" ] || [ "$DOMAIN_WEB" != "$PRIMARY_DOMAIN" ]; } && BE[web]=1
 
-backend be_tcp
-    server tcp1 127.0.0.1:56789
-EOF
-if [ -n "$DOMAIN_GRPC" ] && [ "$DOMAIN_GRPC" != "$DOMAIN_TCP" ]; then
-  printf '\nbackend be_grpc\n    server grpc1 127.0.0.1:56790\n'
+# Куда уходит всё неизвестное: основной протокол Xray; без него — заглушка Hysteria2 или WEB-прокси.
+if [ -n "$PRIMARY" ]; then DEFAULT_BE="be_${PRIMARY}"
+elif [ -n "${BE[hy2]:-}" ]; then DEFAULT_BE="be_hy2"
+else DEFAULT_BE="be_web"; fi
+
+for p in grpc xhttp tg; do
+  [ -n "${BE[$p]:-}" ] && echo "    use_backend be_${p} if { req.ssl_sni -i ${XDOM[$p]} }"
+done
+[ -n "${BE[hy2]:-}" ] && [ "$DEFAULT_BE" != "be_hy2" ] && echo "    use_backend be_hy2 if { req.ssl_sni -i ${DOMAIN_HY2} }"
+[ -n "${BE[web]:-}" ] && [ "$DEFAULT_BE" != "be_web" ] && echo "    use_backend be_web if { req.ssl_sni -i ${DOMAIN_WEB} }"
+echo "    default_backend ${DEFAULT_BE}"
+
+if [ -n "$PRIMARY" ]; then
+  printf '\nbackend be_%s\n    server %s1 127.0.0.1:%s\n' "$PRIMARY" "$PRIMARY" "${XPORT[$PRIMARY]}"
 fi
-if [ -n "$DOMAIN_XHTTP" ] && [ "$DOMAIN_XHTTP" != "$DOMAIN_TCP" ]; then
-  printf '\nbackend be_xhttp\n    server xhttp1 127.0.0.1:56791\n'
-fi
-if [ -n "$DOMAIN_TG" ] && [ "$DOMAIN_TG" != "$DOMAIN_TCP" ]; then
-  printf '\nbackend be_tg\n    server tg1 127.0.0.1:56792\n'
-fi
-if [ -n "$DOMAIN_HY2" ] && [ "$USE_HY2" = "1" ] && [ "$DOMAIN_HY2" != "$DOMAIN_TCP" ]; then
+for p in grpc xhttp tg; do
+  [ -n "${BE[$p]:-}" ] && printf '\nbackend be_%s\n    server %s1 127.0.0.1:%s\n' "$p" "$p" "${XPORT[$p]}"
+done
+if [ -n "${BE[hy2]:-}" ]; then
   printf '\n# Hysteria2 по UDP 443 обслуживает Xray сам (masquerade); по TCP этот домен ведёт на свою заглушку\nbackend be_hy2\n    server hy2web 127.0.0.1:%s\n' "${DECOY_PORT[hy2]:-8084}"
 fi
-if [ -n "$DOMAIN_WEB" ] && [ "$DOMAIN_WEB" != "$DOMAIN_TCP" ]; then
-  printf '\n# WEB-прокси Telegram (nginx -> Telemt)\nbackend be_web\n    server web1 127.0.0.1:%s\n' "${DECOY_PORT[web]:-8086}"
+if [ -n "${BE[web]:-}" ]; then
+  printf '\n# WEB-прокси Telegram (веб-сервер -> Telemt)\nbackend be_web\n    server web1 127.0.0.1:%s\n' "${DECOY_PORT[web]:-8086}"
 fi
 } > "$HAP_NEW"
 
@@ -258,7 +298,7 @@ fi
 step "Итоговая проверка"
 CHECK_FAIL=0
 
-if systemctl is-active --quiet nginx; then ok "nginx: активен"; else err "nginx: НЕ активен"; CHECK_FAIL=1; fi
+if systemctl is-active --quiet "$WS"; then ok "${WS}: активен"; else err "${WS}: НЕ активен"; CHECK_FAIL=1; fi
 if systemctl is-active --quiet haproxy; then ok "haproxy: активен"; else err "haproxy: НЕ активен"; CHECK_FAIL=1; fi
 
 if ss -tlnp 2>/dev/null | grep -E '[:.]443[[:space:]]' | grep -q haproxy; then

@@ -253,17 +253,30 @@ build_config() {  # печатает полный конфиг Xray
     + ($extra | split(" ") | map(select(length>0) | "domain:" + .))')"
   jq -n --argjson inbounds "$inbounds" --argjson tags "$all_tags" --arg tg "$tg_tag" --argjson tgd "$tgdomains" \
         --arg psiphon "${PSIPHON:-1}" --arg ll "${XRAY_LOGLEVEL:-warning}" \
-        --arg self "$(_self_ip)" --arg prot "${SCAN_PROTECT:-1}" '
+        --arg self "$(_self_ip)" --arg prot "${SCAN_PROTECT:-1}" \
+        --arg opt "${XRAY_OPTIMIZE:-1}" --arg ads "${BLOCK_ADS:-0}" '
+    # XRAY_OPTIMIZE=1 (по умолчанию):
+    #  - routing.domainStrategy=IPIfNonMatch: правила по IP (частные сети, сам сервер) действуют и на
+    #    запросы по доменному имени — иначе домен, указывающий на 127.0.0.1 или на адрес сервера,
+    #    обходил бы блокировку;
+    #  - DNS: ответы кэшируются, просроченный ответ отдаётся сразу и обновляется в фоне (serveStale) —
+    #    повторные подключения не ждут резолвера;
+    #  - исходящие соединения: keepalive (зависшие соединения закрываются, а не копятся) и TCP Fast Open.
+    # BLOCK_ADS=1 — рекламные и трекерные домены в BLOCK (geosite:category-ads-all).
     {log:{loglevel:$ll},
-     dns:{servers:["https+local://1.1.1.1/dns-query","https+local://8.8.8.8/dns-query","localhost"], queryStrategy:"UseIPv4"},
+     dns:({servers:["https+local://1.1.1.1/dns-query","https+local://8.8.8.8/dns-query","localhost"], queryStrategy:"UseIPv4"}
+       + (if $opt=="1" then {serveStale:true, serveExpiredTTL:3600} else {} end)),
      inbounds:$inbounds,
-     outbounds:([{tag:"DIRECT", protocol:"freedom", settings:{domainStrategy:"UseIP"}}, {tag:"BLOCK", protocol:"blackhole"}]
+     outbounds:([({tag:"DIRECT", protocol:"freedom", settings:{domainStrategy:"UseIP"}}
+          + (if $opt=="1" then {streamSettings:{sockopt:{tcpFastOpen:true, tcpKeepAliveIdle:120, tcpKeepAliveInterval:30}}} else {} end)),
+        {tag:"BLOCK", protocol:"blackhole"}]
        + (if $psiphon=="1" then [{tag:"psiphon-out", protocol:"socks", settings:{port:1080, address:"172.17.0.1"}}] else [] end)),
-     routing:{rules:(
+     routing:((if $opt=="1" then {domainStrategy:"IPIfNonMatch"} else {} end) + {rules:(
        [{ip:["geoip:private"], outboundTag:"BLOCK"},
         {domain:["geosite:private"], outboundTag:"BLOCK"},
         {protocol:["bittorrent"], outboundTag:"BLOCK"},
         {port:"25", type:"field", network:"tcp", outboundTag:"BLOCK"}]
+       + (if $ads=="1" then [{type:"field", domain:["geosite:category-ads-all"], outboundTag:"BLOCK"}] else [] end)
        # Через прокси нельзя ходить на сам сервер (SSH/панель/внутренние сервисы по публичному IP)
        # и на порты, которые чаще всего используют для сканирования и брутфорса (telnet, NetBIOS/SMB, RDP).
        + (if $prot == "1" and $self != "" then [{type:"field", ip:[$self], outboundTag:"BLOCK"}] else [] end)
@@ -277,7 +290,7 @@ build_config() {  # печатает полный конфиг Xray
             [{type:"field", domain:["domain:gemini.google.com","domain:generativelanguage.googleapis.com","domain:ai.google.dev","domain:aistudio.google.com","domain:alkalimakersuite-pa.clients6.google.com","geosite:google-deepmind"], outboundTag:"psiphon-out"}]
           else [] end)
        + [{port:"443", type:"field", domain:["geosite:facebook","geosite:instagram","domain:fbcdn.net","domain:cdninstagram.com"], network:"udp", outboundTag:"BLOCK"},
-          {inboundTag:$tags, outboundTag:"DIRECT"}])}}'
+          {inboundTag:$tags, outboundTag:"DIRECT"}])})}'
 }
 
 # ---- профиль, хосты, сквад, нода -------------------------------------------------------------------
@@ -472,7 +485,10 @@ profile_apply() {
   have jq || { apt_install jq || { err "jq нужен для работы с API."; return 1; }; }
   have openssl || { err "openssl не найден."; return 1; }
   load_domains || { err "Не найдены домены протоколов. Сначала настройте Nginx+HAProxy (пункт «Полная настройка») или задайте DOMAIN_TCP и др."; return 1; }
-  [ -n "${PDOM[tcp]:-}" ] || { err "Нужен домен REALITY TCP."; return 1; }
+  # Нужен хотя бы один протокол Xray (WEB-прокси Telegram к профилю не относится).
+  local _p _first=""
+  for _p in "${PROTO_ORDER[@]}"; do [ -n "${PDOM[$_p]:-}" ] && { _first="$_p"; break; }; done
+  [ -n "$_first" ] || { err "Не выбран ни один протокол Xray (REALITY TCP, gRPC, XHTTP, Hysteria2, Telegram) — профиль создавать не из чего."; return 1; }
   [ -n "$RW_BASE" ] && [ -n "$RW_TOKEN" ] || { err "Не заданы адрес панели и токен."; return 1; }
   define_protocols "${PROFILE_PREFIX:-NL}"
 
@@ -494,7 +510,7 @@ profile_apply() {
       nport="$(grep -oE 'NODE_PORT=[0-9]+' "${NODE_DIR:-/opt/remnanode}/docker-compose.yml" | head -1 | cut -d= -f2)"
     nport="${nport:-$DEFAULT_NODE_PORT}"
     [ -n "$addr" ] || { err "Не удалось определить адрес сервера — задайте NODE_ADDRESS."; return 1; }
-    nname="$(printf '%s' "${PROFILE_PREFIX}-${PDOM[tcp]%%.*}" | cut -c1-30)"
+    nname="$(printf '%s' "${PROFILE_PREFIX}-${PDOM[$_first]%%.*}" | cut -c1-30)"
     upsert_node "$nname" "$addr" "$nport" "$COUNTRY_CODE" || return 1
   fi
   print_summary

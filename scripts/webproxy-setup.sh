@@ -106,12 +106,12 @@ wp_front() {
     while IFS='|' read -r p d port zip; do [ "$p" = "web" ] && [ "$d" = "$WEB_DOMAIN" ] && have=1; done < "$DECOY_CONF"
   fi
   if [ "$have" = "1" ] && grep -q 'backend be_web' /etc/haproxy/haproxy.cfg 2>/dev/null \
-     && cert_is_valid "$WEB_DOMAIN" && [ -f /etc/nginx/sites-enabled/decoy-web ]; then
-    ok "Домен ${WEB_DOMAIN}: сертификат, nginx и маршрут HAProxy уже настроены."
+     && cert_is_valid "$WEB_DOMAIN" && { [ -f /etc/nginx/sites-enabled/decoy-web ] || [ -f /etc/caddy/dorik/decoy-web.caddy ]; }; then
+    ok "Домен ${WEB_DOMAIN}: сертификат, веб-сервер и маршрут HAProxy уже настроены."
     return 0
   fi
-  if [ ! -f "$DECOY_CONF" ] || ! grep -q '^tcp|' "$DECOY_CONF"; then
-    err "Сначала нужна база: Nginx + HAProxy + сертификаты («Полная настройка» или «Только Nginx + HAProxy»)."
+  if [ ! -s "$DECOY_CONF" ]; then
+    err "Сначала нужна база: веб-сервер + HAProxy + сертификаты («Полная настройка» или «Только веб-сервер + HAProxy»)."
     err "WEB-прокси подключается к ним по SNI — отдельного порта 443 он не занимает."
     return 1
   fi
@@ -427,7 +427,7 @@ wp_remove() {
   fi
   systemctl disable --now "$WP_SERVICE" &>/dev/null || true
   rm -f /etc/systemd/system/${WP_SERVICE}.service; systemctl daemon-reload
-  rm -rf "$WP_LIB_DIR" "$WP_CONF_DIR" "$WP_DATA_DIR" "$WP_STATE" /etc/nginx/sites-enabled/decoy-web /etc/nginx/sites-available/decoy-web /etc/nginx/conf.d/dorik-web-upgrade.conf
+  rm -rf "$WP_LIB_DIR" "$WP_CONF_DIR" "$WP_DATA_DIR" "$WP_STATE" /etc/nginx/sites-enabled/decoy-web /etc/nginx/sites-available/decoy-web /etc/nginx/conf.d/dorik-web-upgrade.conf /etc/caddy/dorik/decoy-web.caddy
   # убираем домен из списка заглушек и маршрут из HAProxy: пересобирать всё не нужно, достаточно
   # убрать be_web — иначе HAProxy отправлял бы SNI удалённого домена на несуществующий nginx-сайт.
   [ -f "$DECOY_CONF" ] && sed -i '/^web|/d' "$DECOY_CONF"
@@ -437,7 +437,8 @@ wp_remove() {
     if haproxy -c -f /etc/haproxy/haproxy.cfg &>/dev/null; then systemctl reload haproxy 2>/dev/null || systemctl restart haproxy
     else warn "HAProxy: после удаления маршрута конфиг невалиден — восстановите копию /etc/haproxy/haproxy.cfg.bak.*"; fi
   fi
-  nginx -t &>/dev/null && systemctl reload nginx 2>/dev/null || true
+  if [ "$(ws_current)" = "caddy" ]; then systemctl restart caddy &>/dev/null || true
+  else nginx -t &>/dev/null && systemctl reload nginx 2>/dev/null || true; fi
   rm -rf "$(decoy_root web)"
   ok "WEB-прокси удалён."
 }

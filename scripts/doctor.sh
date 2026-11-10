@@ -122,6 +122,9 @@ doctor_scan() {
      || compgen -G "/etc/nginx/sites-enabled/remnawave-*" >/dev/null; then
     svc_active nginx || _issue web_down "nginx настроен, но остановлен"
   fi
+  if compgen -G "/etc/caddy/dorik/*.caddy" >/dev/null; then
+    svc_active caddy || _issue web_down "Caddy настроен, но остановлен"
+  fi
   if svc_exists haproxy && [ -f /etc/haproxy/haproxy.cfg ] && grep -q 'fe_443' /etc/haproxy/haproxy.cfg; then
     svc_active haproxy || _issue web_down "HAProxy настроен, но остановлен — клиенты не подключатся"
   fi
@@ -211,7 +214,7 @@ fix_ufw_off() {
   local p; p="$(get_real_ssh_port)"; p="${p:-$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')}"; p="${p:-22}"
   ufw default deny incoming &>/dev/null; ufw default allow outgoing &>/dev/null
   ufw allow "${p}/tcp" comment "SSH" &>/dev/null; info "открыт SSH ${p}/tcp"
-  if svc_active nginx || svc_active haproxy || [ -f "$PANEL_DIR/docker-compose.yml" ]; then
+  if svc_active nginx || svc_active caddy || svc_active haproxy || [ -f "$PANEL_DIR/docker-compose.yml" ]; then
     ufw allow 80/tcp comment "HTTP" &>/dev/null; ufw allow 443/tcp comment "HTTPS" &>/dev/null
     info "открыты 80/tcp и 443/tcp (работают nginx/haproxy/панель)"
   fi
@@ -314,6 +317,9 @@ fix_web_down() {
   if [ -e /etc/nginx/sites-enabled/decoy ] || compgen -G "/etc/nginx/sites-enabled/decoy-*" >/dev/null \
      || compgen -G "/etc/nginx/sites-enabled/remnawave-*" >/dev/null; then
     nginx -t &>/dev/null && systemctl restart nginx || rc=1
+  fi
+  if compgen -G "/etc/caddy/dorik/*.caddy" >/dev/null; then
+    systemctl restart caddy || rc=1
   fi
   if svc_exists haproxy && grep -q 'fe_443' /etc/haproxy/haproxy.cfg 2>/dev/null; then
     haproxy -c -f /etc/haproxy/haproxy.cfg &>/dev/null && systemctl restart haproxy || rc=1

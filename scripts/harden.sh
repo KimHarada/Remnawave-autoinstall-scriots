@@ -63,7 +63,7 @@ build_expected() {
   for p in $(sshd -T 2>/dev/null | awk '/^port /{print $2}'); do _add_expect "$p/tcp"; done
   # Автоопределение работает ВСЕГДА, а HARDEN_EXPECT только дополняет его: иначе запуск
   # в роли «панель» на сервере с нодой удалил бы правила ноды как «лишние».
-  if svc_active nginx || svc_active haproxy || [ -f "$PANEL_DIR/docker-compose.yml" ]; then
+  if svc_active nginx || svc_active caddy || svc_active haproxy || [ -f "$PANEL_DIR/docker-compose.yml" ]; then
     _add_expect 80/tcp; _add_expect 443/tcp
   fi
   if [ -f "$NODE_DIR/docker-compose.yml" ]; then
