@@ -149,21 +149,89 @@ apt_busy() {
   fi
 }
 
-wait_for_apt_lock() {
-  local waited=0 limit=600
-  while apt_busy; do
-    if [ "$waited" -eq 0 ]; then
-      warn "apt занят другим процессом (обычно unattended-upgrades на свежем VPS) — жду освобождения..."
+# Что сейчас делает процесс, державший apt: имя, сколько работает и — по журналу dpkg — сколько
+# пакетов уже обработано (для unattended-upgrades ещё и из скольких) и какой сейчас. REPLY = текст.
+# Журналы можно подменить для проверки: DPKG_LOG, UU_LOG.
+apt_wait_status() {
+  local lf=(/var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock)
+  local dlog="${DPKG_LOG:-/var/log/dpkg.log}" ulog="${UU_LOG:-/var/log/unattended-upgrades/unattended-upgrades.log}"
+  local pid="" comm="" el="" since="" done_n="" total="" cur="" s
+  if command -v fuser &>/dev/null; then
+    pid="$(fuser "${lf[@]}" 2>/dev/null | tr -s ' ' '\n' | grep -E '^[0-9]+$' | head -1)"
+  fi
+  [ -n "$pid" ] || pid="$(pgrep -x 'apt|apt-get|dpkg|aptitude|unattended-upgr' 2>/dev/null | head -1)"
+  if [ -z "$pid" ]; then REPLY="apt занят другим процессом"; return 0; fi
+  comm="$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')"
+  el="$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [[ "$el" =~ ^[0-9]+$ ]] || el=""
+  s="${comm:-процесс} (pid ${pid})"
+  [ -n "$el" ] && s+=" · работает $(printf '%d:%02d' $((el/60)) $((el%60)))"
+  if [ -n "$el" ] && [ -r "$dlog" ]; then
+    # с запасом в 5 с: время старта процесса и записи журнала округляются по-разному
+    since="$(date -d "@$(( $(date +%s) - el - 5 ))" '+%F %T' 2>/dev/null)"
+    if [ -n "$since" ]; then
+      done_n="$(awk -v s="$since" '($1" "$2)>=s && $3=="status" && $4=="installed" {u[$5]=1} END{n=0; for(k in u) n++; print n}' "$dlog" 2>/dev/null)"
+      cur="$(awk -v s="$since" '($1" "$2)>=s && $3=="status" {st=$4; p=$5} END{if(p!="") print st" "p}' "$dlog" 2>/dev/null)"
+      case "$cur" in
+        unpacked*)          cur="распаковка${cur#unpacked}" ;;
+        half-configured*)   cur="настройка${cur#half-configured}" ;;
+        half-installed*)    cur="установка${cur#half-installed}" ;;
+        installed*)         cur="готово${cur#installed}" ;;
+        triggers-pending*)  cur="триггеры${cur#triggers-pending}" ;;
+      esac
     fi
-    sleep 3; waited=$((waited+3))
+  fi
+  if [ -n "$since" ] && [ -r "$ulog" ]; then
+    total="$(awk -v s="$since" '($1" "$2)>=s && /Packages that will be upgraded:/ {sub(/.*upgraded: */, ""); n=NF} END{print n+0}' "$ulog" 2>/dev/null)"
+  fi
+  if [[ "${done_n:-0}" =~ ^[0-9]+$ ]] && [ "${done_n:-0}" -gt 0 ]; then
+    if [[ "${total:-0}" =~ ^[0-9]+$ ]] && [ "${total:-0}" -ge "${done_n}" ] && [ "${total:-0}" -gt 0 ]; then
+      s+=" · обновлено ${done_n} из ${total}"
+    else
+      s+=" · обработано пакетов: ${done_n}"
+    fi
+  fi
+  [ -n "$cur" ] && s+=" · ${cur}"
+  REPLY="apt занят: ${s}"
+}
+
+# Ждёт, пока другой процесс отпустит apt/dpkg, и ПОКАЗЫВАЕТ, чего ждёт: кто держит, сколько
+# работает, сколько пакетов уже готово. На терминале — живая строка; внутри spin_run текст идёт
+# в строку состояния спиннера (DORIK_STATUS); в логе — одна строка раз в 30 с.
+# Процесс никогда не убиваем: он докачивает и доставляет всё, что начал (kill -9 оставил бы dpkg
+# в битом состоянии). Лишь через 20 минут просим unattended-upgrades остановиться штатно.
+wait_for_apt_lock() {
+  apt_busy || return 0
+  local waited=0 limit=1200 start=$SECONDS cols=80 txt i=0 live=0 line
+  [ "${UI_TTY:-0}" = "1" ] && live=1
+  [ "$live" = "1" ] && { cols="$(tput cols 2>/dev/null || echo 80)"; printf '\e[?25l'; }
+  [ "$live" = "1" ] && info "На свежем сервере система сама ставит обновления безопасности — дожидаюсь, пока она закончит (прерывать не нужно)."
+  while apt_busy; do
+    apt_wait_status; txt="$REPLY"
+    waited=$((SECONDS - start))
+    if [ -n "${DORIK_STATUS:-}" ]; then printf '%s' "$txt" > "$DORIK_STATUS" 2>/dev/null; fi
+    if [ "$live" = "1" ]; then
+      line="${txt} · жду $(printf '%d:%02d' $((waited/60)) $((waited%60)))"
+      [ "${#line}" -gt $((cols-6)) ] && line="${line:0:$((cols-7))}…"
+      printf '\r\e[2K  %s%s%s %s' "$C_B" "${SPIN_FRAMES[i % ${#SPIN_FRAMES[@]}]}" "$C_RESET" "$line"
+    elif [ "$waited" -eq 0 ] || [ $((waited % 30)) -lt 2 ]; then
+      echo "  ▲ ${txt} · жду ${waited} с"
+    fi
+    i=$((i+1))
     if [ "$waited" -ge "$limit" ]; then
-      # Штатная остановка: unattended-upgrades доделывает текущий шаг dpkg.
-      # kill -9 здесь не используем — он оставляет dpkg в битом состоянии.
-      warn "apt занят больше 10 минут — прошу unattended-upgrades остановиться штатно."
+      [ "$live" = "1" ] && printf '\r\e[2K'
+      warn "apt занят больше 20 минут — прошу unattended-upgrades остановиться штатно."
       systemctl stop unattended-upgrades.service apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
       break
     fi
+    sleep 1
   done
+  [ -n "${DORIK_STATUS:-}" ] && : > "$DORIK_STATUS" 2>/dev/null
+  if [ "$live" = "1" ]; then
+    printf '\r\e[2K\e[?25h'
+    ok "apt свободен — продолжаю (ждали $(printf '%d:%02d' $(((SECONDS-start)/60)) $(((SECONDS-start)%60)))) "
+  fi
+  return 0
 }
 
 # Если прошлый запуск apt/dpkg был прерван — чиним до начала работы.

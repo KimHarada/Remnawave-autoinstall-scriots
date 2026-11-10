@@ -20,11 +20,18 @@ else
 fi
 
 UI_W=64
+UI_COLS="$(tput cols 2>/dev/null || echo 80)"; [[ "$UI_COLS" =~ ^[0-9]+$ ]] || UI_COLS=80
 SPIN_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+# Строка состояния для спиннера: функции, которые что-то ждут (например, освобождения apt),
+# пишут сюда пояснение, а spin_run показывает его рядом с названием шага.
+DORIK_STATUS="${DORIK_STATUS:-/tmp/dorik-status-$$}"
+export DORIK_STATUS
 
 # Курсор мог остаться скрытым, если спиннер прервали Ctrl+C.
 ui_restore_cursor() { [ "$UI_TTY" = "1" ] && printf '\e[?25h' 2>/dev/null; return 0; }
-trap ui_restore_cursor EXIT
+ui_cleanup() { ui_restore_cursor; rm -f "$DORIK_STATUS" 2>/dev/null; return 0; }
+trap ui_cleanup EXIT
 
 # ---- журнал -----------------------------------------------------------------
 # Весь вывод тяжёлых команд (apt, docker, certbot) идёт в лог, а на экране —
@@ -86,9 +93,10 @@ step_n() {
 # команды. Внимание: команда идёт в подоболочке, изменения переменных не видны.
 spin_run() {
   local title="$1"; shift
-  local tmp pid rc start el i=0
+  local tmp pid rc start el i=0 st maxw
   tmp="$(mktemp)"
   start=$SECONDS
+  : > "$DORIK_STATUS" 2>/dev/null
   printf '\n### %s  %s :: %s\n' "$(date '+%F %T')" "$title" "$*" >>"$DORIK_LOG" 2>/dev/null
   if [ "$UI_TTY" != "1" ]; then
     echo "  … $title"
@@ -100,7 +108,14 @@ spin_run() {
     printf '\e[?25l'
     while kill -0 "$pid" 2>/dev/null; do
       el=$((SECONDS-start))
-      printf '\r\e[2K  %s%s%s %s %s(%dс)%s' "$C_B" "${SPIN_FRAMES[i % ${#SPIN_FRAMES[@]}]}" "$C_RESET" "$title" "$C_DIM" "$el" "$C_RESET"
+      st=""
+      [ -s "$DORIK_STATUS" ] && IFS= read -r st < "$DORIK_STATUS"
+      if [ -n "$st" ]; then
+        maxw=$(( ${UI_COLS:-80} - ${#title} - 18 ))
+        if [ "$maxw" -lt 12 ]; then st=""
+        elif [ "${#st}" -gt "$maxw" ]; then st="${st:0:$((maxw-1))}…"; fi
+      fi
+      printf '\r\e[2K  %s%s%s %s %s(%dс)%s%s' "$C_B" "${SPIN_FRAMES[i % ${#SPIN_FRAMES[@]}]}" "$C_RESET" "$title" "$C_DIM" "$el" "$C_RESET" "${st:+ ${C_Y}· ${st}${C_RESET}}"
       i=$((i+1)); sleep 0.1
     done
     wait "$pid"; rc=$?
