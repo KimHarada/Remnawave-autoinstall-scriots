@@ -234,6 +234,70 @@ wait_for_apt_lock() {
   return 0
 }
 
+# ---- фоновые задачи ------------------------------------------------------------------------
+# bg_start <имя> <функция> [аргументы] — запускает функцию в фоне: вывод в журнал, на экран ничего.
+# bg_wait <имя> [заголовок]            — дожидается её, показывая, что она сейчас делает (для
+#                                         ожидания apt — кто его держит и сколько пакетов готово).
+# Возвращает код функции. Если задача уже закончилась, возвращается мгновенно и молча.
+# Зачем: на свежем VPS apt часто занят десятки минут. Пока он занят, скрипт задаёт вопросы
+# и качает всё, что apt не требует, а не стоит на месте.
+declare -gA BG_PID=() BG_RC=()
+
+bg_start() {
+  local name="$1" fn="$2"; shift 2
+  local rcf="${DORIK_STATUS}.${name}.rc"
+  rm -f "$rcf" "${DORIK_STATUS}.${name}"
+  (
+    # Внутри — режим «без экрана»: никакой анимации и вопросов, собственная строка состояния.
+    UI_TTY=0; ASSUME_YES=1
+    DORIK_STATUS="${DORIK_STATUS}.${name}"; export DORIK_STATUS
+    "$fn" "$@" </dev/null >>"$DORIK_LOG" 2>&1
+    echo $? > "$rcf"
+  ) &
+  BG_PID[$name]=$!
+  BG_RC[$name]=""
+}
+
+bg_running() { [ -n "${BG_PID[$1]:-}" ] && kill -0 "${BG_PID[$1]}" 2>/dev/null; }
+
+bg_wait() {
+  local name="$1" title="${2:-$1}" sf="${DORIK_STATUS}.${1}" rcf="${DORIK_STATUS}.${1}.rc"
+  local start=$SECONDS i=0 st line cols=80 shown=0 el rc last=-30
+  [ -n "${BG_PID[$name]:-}" ] || return 0
+  if bg_running "$name"; then
+    [ "${UI_TTY:-0}" = "1" ] && { cols="$(tput cols 2>/dev/null || echo 80)"; printf '\e[?25l'; }
+    while bg_running "$name"; do
+      el=$((SECONDS - start)); st=""
+      [ -s "$sf" ] && IFS= read -r st < "$sf"
+      if [ "${UI_TTY:-0}" = "1" ]; then
+        line="${title}${st:+ · ${st}} (${el}с)"
+        [ "${#line}" -gt $((cols-6)) ] && line="${line:0:$((cols-7))}…"
+        printf '\r\e[2K  %s%s%s %s' "$C_B" "${SPIN_FRAMES[i % ${#SPIN_FRAMES[@]}]}" "$C_RESET" "$line"
+        shown=1
+      elif [ $((el - last)) -ge 30 ]; then
+        # без терминала (лог): не чаще одной строки в 30 секунд
+        echo "  … ${title}${st:+ · ${st}} (${el} с)"; shown=1; last=$el
+      fi
+      i=$((i+1)); sleep 0.2
+    done
+    [ "${UI_TTY:-0}" = "1" ] && printf '\r\e[2K\e[?25h'
+  fi
+  wait "${BG_PID[$name]}" 2>/dev/null
+  rc="$(cat "$rcf" 2>/dev/null)"; [[ "$rc" =~ ^[0-9]+$ ]] || rc=1
+  rm -f "$rcf" "$sf"
+  unset 'BG_PID[$name]'
+  [ "$shown" = "1" ] && { [ "$rc" -eq 0 ] && ok "${title} — готово ($((SECONDS - start))с)" || warn "${title} — завершено с ошибкой (см. ${DORIK_LOG})"; }
+  return "$rc"
+}
+
+# Адрес A-записи домена: dig, а если dnsutils ещё не поставлен — getent.
+resolve_a() {
+  local r=""
+  if command -v dig &>/dev/null; then r="$(dig +short A "$1" 2>/dev/null | tail -1)"; fi
+  [ -n "$r" ] || r="$(getent ahostsv4 "$1" 2>/dev/null | awk '{print $1; exit}')"
+  echo "$r"
+}
+
 # Если прошлый запуск apt/dpkg был прерван — чиним до начала работы.
 fix_dpkg_state() {
   wait_for_apt_lock
@@ -544,10 +608,7 @@ get_public_ip() {
 dns_points_here() {
   local domain="${1:-}" pubip="${2:-}" resolved
   [ -z "$domain" ] && return 1
-  resolved=$(dig +short A "$domain" 2>/dev/null | tail -1)
-  if [ -z "$resolved" ]; then
-    resolved=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}')
-  fi
+  resolved="$(resolve_a "$domain")"
   [ -n "$resolved" ] && [ -n "$pubip" ] && [ "$resolved" = "$pubip" ]
 }
 

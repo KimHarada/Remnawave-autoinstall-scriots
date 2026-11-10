@@ -26,6 +26,31 @@ WEB_BACKEND="127.0.0.1:18080"
 
 decoy_root() { echo "${DECOY_WEB}/decoy-$1"; }
 
+# Кэш архивов заглушек: полная настройка скачивает их заранее, пока идут вопросы и пока apt занят
+# (decoys_prefetch), а установка заглушек берёт готовые файлы. Нет файла в кэше — качает как раньше.
+DECOY_CACHE="${DORIK_CACHE:-/var/cache/dorik}/decoys"
+
+decoys_prefetch() {
+  local base="${RAW:-$DORIK_RAW}" tmp zip n=0
+  mkdir -p "$DECOY_CACHE" || return 1
+  tmp="$(mktemp)"
+  if curl -fsSL --retry 3 "${base}/decoys/manifest.txt" -o "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+    tr -d '\r' < "$tmp" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -E '\.zip$' > "$DECOY_CACHE/manifest.new"
+    [ -s "$DECOY_CACHE/manifest.new" ] && mv -f "$DECOY_CACHE/manifest.new" "$DECOY_CACHE/manifest.txt"
+  fi
+  rm -f "$tmp" "$DECOY_CACHE/manifest.new"
+  [ -s "$DECOY_CACHE/manifest.txt" ] || return 1
+  while IFS= read -r zip; do
+    [ -n "$zip" ] || continue
+    if curl -fsSL --retry 3 "${base}/decoys/${zip}" -o "$DECOY_CACHE/${zip}.part" 2>/dev/null && [ -s "$DECOY_CACHE/${zip}.part" ]; then
+      mv -f "$DECOY_CACHE/${zip}.part" "$DECOY_CACHE/${zip}"; n=$((n+1))
+    else
+      rm -f "$DECOY_CACHE/${zip}.part"
+    fi
+  done < "$DECOY_CACHE/manifest.txt"
+  [ "$n" -gt 0 ]
+}
+
 # Домен протокола; пусто — протокол не используется (или делит домен с TCP: HAProxy
 # различает их по SNI, поэтому отдельной заглушки такому протоколу не нужно).
 decoy_domain() {
@@ -81,7 +106,9 @@ HTML
 decoy_install_zip() {  # decoy_install_zip <архив.zip> <root> <рабочий каталог>
   local zip="$1" root="$2" work="$3" src
   rm -rf "$work/unzip" "$work/d.zip"
-  if ! { curl -fsSL --retry 3 "${RAW:-$DORIK_RAW}/decoys/${zip}" -o "$work/d.zip" 2>/dev/null && [ -s "$work/d.zip" ]; }; then
+  if [ -s "$DECOY_CACHE/${zip}" ]; then
+    cp -f "$DECOY_CACHE/${zip}" "$work/d.zip"                      # уже скачан заранее
+  elif ! { curl -fsSL --retry 3 "${RAW:-$DORIK_RAW}/decoys/${zip}" -o "$work/d.zip" 2>/dev/null && [ -s "$work/d.zip" ]; }; then
     warn "Не удалось скачать ${zip} — пробую другую."; return 1
   fi
   mkdir -p "$work/unzip"
@@ -149,7 +176,8 @@ decoys_install() {
   done
 
   work="$(mktemp -d)"
-  if curl -fsSL --retry 3 "${RAW:-$DORIK_RAW}/decoys/manifest.txt" -o "$work/manifest.txt" 2>/dev/null && [ -s "$work/manifest.txt" ]; then
+  if [ -s "$DECOY_CACHE/manifest.txt" ]; then cp -f "$DECOY_CACHE/manifest.txt" "$work/manifest.txt"
+  elif curl -fsSL --retry 3 "${RAW:-$DORIK_RAW}/decoys/manifest.txt" -o "$work/manifest.txt" 2>/dev/null && [ -s "$work/manifest.txt" ]; then
     # tr убирает \r (Windows-перевод строки) и пробелы — иначе имя файла получается с мусором
     # на конце и за архивом приходит 404. shuf: на каждом сервере порядок свой.
     mapfile -t candidates < <(tr -d '\r' < "$work/manifest.txt" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -E '\.zip$' | shuf)

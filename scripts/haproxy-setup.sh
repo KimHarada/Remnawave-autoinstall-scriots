@@ -99,7 +99,7 @@ declare -A DNS_OK
 for d in "${ALL_DOMAINS[@]}"; do
   [ -z "$d" ] && continue
   if [ -n "$PUB_IP" ] && ! dns_points_here "$d" "$PUB_IP"; then
-    RESOLVED=$(dig +short A "$d" 2>/dev/null | tail -1)
+    RESOLVED="$(resolve_a "$d")"
     warn "${d}: DNS указывает на '${RESOLVED:-<нет ответа>}', а IP сервера — ${PUB_IP}. Сертификат для этого домена НЕ будет запрошен — сначала поправьте A-запись."
     DNS_OK["$d"]=0
   else

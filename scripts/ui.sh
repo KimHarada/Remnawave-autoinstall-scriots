@@ -30,7 +30,7 @@ export DORIK_STATUS
 
 # Курсор мог остаться скрытым, если спиннер прервали Ctrl+C.
 ui_restore_cursor() { [ "$UI_TTY" = "1" ] && printf '\e[?25h' 2>/dev/null; return 0; }
-ui_cleanup() { ui_restore_cursor; rm -f "$DORIK_STATUS" 2>/dev/null; return 0; }
+ui_cleanup() { ui_restore_cursor; rm -f "$DORIK_STATUS" "$DORIK_STATUS".* 2>/dev/null; return 0; }
 trap ui_cleanup EXIT
 
 # ---- журнал -----------------------------------------------------------------
