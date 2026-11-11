@@ -193,8 +193,8 @@ build_inbound() {  # build_inbound <proto> — JSON одного inbound'а
   local sids; sids="$(jq -c ".protocols.${p}.shortIds // []" "$PROFILE_STATE")"
   case "$p" in
     hy2)
-      jq -n --arg tag "$tag" --arg dir "$(decoy_root hy2)" '{
-        tag:$tag, port:443, listen:"0.0.0.0", protocol:"hysteria",
+      jq -n --arg tag "$tag" --arg dir "$(decoy_root hy2)" --argjson port "$(hy2_port)" '{
+        tag:$tag, port:$port, listen:"0.0.0.0", protocol:"hysteria",
         settings:{clients:[], version:2},
         sniffing:{enabled:true, routeOnly:true, destOverride:["http","tls","quic"]},
         streamSettings:{network:"hysteria", security:"tls",
@@ -344,8 +344,9 @@ host_body() {  # host_body <proto> — JSON хоста для API
   fi
   # Если фрагментация выключена, поле finalMask НЕ отправляем: так не затираем маску, заданную в панели вручную.
   jq -nc --arg cp "$PROFILE_UUID" --arg ib "${IB_UUID[$tag]}" --arg remark "${P_REMARK[$p]}" --arg addr "$d" \
-         --arg fp "$fp" --arg path "$(st_get '.protocols.xhttp.path')" --arg proto "$p" --arg fm "$fm" '
-    {inbound:{configProfileUuid:$cp, configProfileInboundUuid:$ib}, remark:$remark, address:$addr, port:443, sni:$addr}
+         --arg fp "$fp" --arg path "$(st_get '.protocols.xhttp.path')" --arg proto "$p" --arg fm "$fm" \
+         --argjson port "$([ "$p" = "hy2" ] && hy2_port || echo 443)" '
+    {inbound:{configProfileUuid:$cp, configProfileInboundUuid:$ib}, remark:$remark, address:$addr, port:$port, sni:$addr}
     + (if $proto=="hy2" then {alpn:"h3"} else {fingerprint:$fp} end)
     + (if $proto=="xhttp" then {host:$addr, path:$path} else {} end)
     + (if $fm != "" then {finalMask:($fm | fromjson)} else {} end)'

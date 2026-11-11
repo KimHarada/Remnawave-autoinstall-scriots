@@ -125,7 +125,7 @@ if [ "$ROLE" = "1" ]; then
     "Основной протокол: самый совместимый, работает во всех клиентах. Трафик выглядит как обычный HTTPS к вашему домену, чужим отдаётся страница-заглушка.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy${NL}${NL}@НУЖНО${NL}свой домен и сертификат"
     "VLESS REALITY поверх gRPC. Запасной транспорт: помогает там, где обычный TCP режут по поведению соединения.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
     "VLESS REALITY поверх XHTTP: запросы выглядят как обычная работа сайта, устойчив к обрывам длинных соединений.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
-    "Быстрый протокол поверх QUIC (UDP). Хорош на плохих и мобильных сетях; там, где UDP режут, не работает — поэтому ставится вместе с TCP-протоколами.${NL}${NL}@ПОРТ${NL}443/udp напрямую${NL}${NL}@НУЖНО${NL}отдельный домен и сертификат"
+    "Быстрый протокол поверх QUIC (UDP). Хорош на плохих и мобильных сетях; там, где UDP режут, не работает — поэтому ставится вместе с TCP-протоколами.${NL}${NL}@ПОРТ${NL}UDP, по умолчанию 443; можно задать свой (его спросят позже)${NL}${NL}@НУЖНО${NL}отдельный домен и сертификат"
     "Отдельный хост, через который ходят только Telegram и ЮKassa/ЮMoney — остальное на нём блокируется. Удобно для бесплатного или ограниченного тарифа.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
     "Прокси Telegram типа «WEB» (Telemt) с рекламой вашего канала через @MTProxybot. К Xray и подпискам не относится — это отдельная служба.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
   )
@@ -219,6 +219,15 @@ if [ "$ROLE" = "1" ]; then
     box_wrap "${C_DIM}→${C_RESET}" "DNS: A-запись каждого домена должна указывать на IP этого сервера."
   fi
   box_bottom
+
+  # UDP-порт Hysteria2: 443 или свой (если 443/udp режут, занят или нужен «нестандартный» порт, как в чужих
+  # конфигах). Клиент подключается на этот порт по UDP; TCP-заглушка домена остаётся на 443.
+  if [ "$USE_HY2" = "1" ]; then
+    HY2_PORT=$(ask_valid "UDP-порт Hysteria2 (443 — по умолчанию; можно свой, например 20152)" "$(hy2_port)" is_valid_port) || exit 1
+    export HY2_PORT
+    hy2_port_save "$HY2_PORT"
+    [ "$HY2_PORT" = "443" ] || info "Hysteria2 будет слушать UDP ${HY2_PORT}; в хосте на панели порт тоже выставится ${HY2_PORT}."
+  fi
   # Рекламный тег канала-спонсора для WEB-прокси (необязательно; можно добавить позже: webproxy-setup.sh tag <тег>)
   WEB_AD_TAG="${WEB_AD_TAG:-}"
   if [ "$USE_WEB" = "1" ]; then
@@ -413,7 +422,7 @@ if [ "$ROLE" = "1" ]; then
     box_row "Профиль на панели: ${C_DIM}нет (конфиг добавите вручную)${C_RESET}"
   fi
   [ "$HAS_XRAY" = "1" ] && box_row "Порт ноды:          ${NODE_PORT}$([ "$OPEN_NODE_PORT" = "1" ] && echo " (открыт$([ -n "$PANEL_IP" ] && echo " только для ${PANEL_IP}"))" || echo " (в firewall не открывается)")"
-  box_row "Hysteria2:          $(yn "$USE_HY2")    Заглушки: $(yn "$INSTALL_DECOY")    BBR: $(yn "$USE_BBR")"
+  box_row "Hysteria2:          $(yn "$USE_HY2")$([ "$USE_HY2" = "1" ] && echo " (UDP $(hy2_port))")    Заглушки: $(yn "$INSTALL_DECOY")    BBR: $(yn "$USE_BBR")"
   box_row "                    ${C_DIM}по одной заглушке на каждый протокол, все разные${C_RESET}"
 fi
 box_row "Ребут в 04:00:      $(yn "$ENABLE_REBOOT")    Часовой пояс: ${DORIK_TZ}"
@@ -514,7 +523,9 @@ do_protect_common() {
     if [ "$ROLE" = "1" ]; then
       ufw allow 80/tcp comment "HTTP (certbot)" &>/dev/null || true
       ufw allow 443/tcp comment "HTTPS TCP" &>/dev/null || true
-      [ "$USE_HY2" = "1" ] && { ufw allow 443/udp comment "Hysteria2" &>/dev/null || true; }
+      # Прежнее правило Hysteria2 (другой порт от прошлого запуска) убираем — иначе старый порт остался бы открытым.
+      ufw_delete_matching 'Hysteria2'
+      [ "$USE_HY2" = "1" ] && { ufw allow "$(hy2_port)/udp" comment "Hysteria2" &>/dev/null || true; }
       if [ "$OPEN_NODE_PORT" = "1" ]; then
         # Прежние правила «Node panel» (от прошлого запуска — другой порт, другой IP или
         # «для всех») убираем: иначе смена порта оставит дыру, а старое правило «для
@@ -650,7 +661,7 @@ if [ "$DO_HARDEN" = "1" ]; then
   # и итоговая перепроверка — иначе она «критиковала» бы результат, не зная выбранной роли.
   HARDEN_EXPECT="${NEW_SSH_PORT}/tcp 80/tcp 443/tcp"
   if [ "$ROLE" = "1" ]; then
-    [ "$USE_HY2" = "1" ] && HARDEN_EXPECT+=" 443/udp"
+    [ "$USE_HY2" = "1" ] && HARDEN_EXPECT+=" $(hy2_port)/udp"
     [ "$OPEN_NODE_PORT" = "1" ] && HARDEN_EXPECT+=" ${NODE_PORT}/tcp"
   fi
   export HARDEN_EXPECT

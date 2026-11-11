@@ -362,6 +362,20 @@ resolve_a() {
   echo "$r"
 }
 
+# UDP-порт Hysteria2. По умолчанию 443; можно свой (HY2_PORT) — например, если 443/udp режут или
+# занят. Выбранный порт запоминается в /etc/dorik/hy2-port, чтобы firewall, укрепление, проверки и
+# профиль на панели везде брали одно и то же значение.
+HY2_PORT_FILE="${HY2_PORT_FILE:-/etc/dorik/hy2-port}"
+hy2_port() {
+  local p="${HY2_PORT:-}"
+  [ -z "$p" ] && [ -s "$HY2_PORT_FILE" ] && p="$(head -1 "$HY2_PORT_FILE" 2>/dev/null | tr -d '[:space:]')"
+  [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || p=443
+  echo "$p"
+}
+hy2_port_save() {  # hy2_port_save <порт>
+  mkdir -p "$(dirname "$HY2_PORT_FILE")" && echo "$1" > "$HY2_PORT_FILE" && chmod 644 "$HY2_PORT_FILE"
+}
+
 # Если прошлый запуск apt/dpkg был прерван — чиним до начала работы.
 fix_dpkg_state() {
   wait_for_apt_lock

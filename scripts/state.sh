@@ -304,7 +304,7 @@ verify_firewall() {  # verify_firewall <ssh_port> <роль 1|2> <hy2 0|1> <node
   _ufw_open "443/tcp"; _chk $? "ufw: 443/tcp открыт" "ufw: нет правила для 443/tcp"
   _ufw_open "80/tcp"; _chk $? "ufw: 80/tcp открыт" "ufw: нет правила для 80/tcp"
   if [ "$role" = "1" ]; then
-    [ "$hy2" != "1" ] || { _ufw_open "443/udp"; _chk $? "ufw: 443/udp открыт (Hysteria2)" "ufw: нет правила для 443/udp"; }
+    [ "$hy2" != "1" ] || { _ufw_open "$(hy2_port)/udp"; _chk $? "ufw: $(hy2_port)/udp открыт (Hysteria2)" "ufw: нет правила для $(hy2_port)/udp"; }
     [ -z "$nport" ] || { _ufw_allows "${nport}/tcp"; _chk $? "ufw: порт ноды ${nport} открыт" "ufw: нет правила для порта ноды ${nport}"; }
   fi
   fail2ban-client status sshd &>/dev/null; _chk $? "fail2ban: jail sshd работает" "fail2ban: jail sshd не работает"

@@ -69,7 +69,7 @@ build_expected() {
   if [ -f "$NODE_DIR/docker-compose.yml" ]; then
     np="$(grep -oE 'NODE_PORT=[0-9]+' "$NODE_DIR/docker-compose.yml" | head -1 | cut -d= -f2)"
     [ -n "$np" ] && _add_expect "$np/tcp"
-    grep -q '/etc/hysteria' "$NODE_DIR/docker-compose.yml" && _add_expect 443/udp
+    grep -q '/etc/hysteria' "$NODE_DIR/docker-compose.yml" && _add_expect "$(hy2_port)/udp"
   fi
   for e in ${HARDEN_EXPECT:-}; do _add_expect "$e"; done
   for e in ${HARDEN_KEEP_PORTS:-}; do _add_expect "$e"; done

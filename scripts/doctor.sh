@@ -224,7 +224,7 @@ fix_ufw_off() {
   fi
   if [ -f "$NODE_DIR/docker-compose.yml" ]; then
     local np; np="$(grep -oE 'NODE_PORT=[0-9]+' "$NODE_DIR/docker-compose.yml" | head -1 | cut -d= -f2)"
-    ufw allow 443/udp comment "Hysteria2" &>/dev/null
+    ufw allow "$(hy2_port)/udp" comment "Hysteria2" &>/dev/null
     # Правило порта ноды уже могло быть (в т.ч. ограниченное IP панели) — при выключенном
     # ufw `status` его не показывает, а `show added` показывает. Не затираем его открытым.
     if [ -n "$np" ]; then
