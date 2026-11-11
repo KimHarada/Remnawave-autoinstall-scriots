@@ -376,6 +376,45 @@ hy2_port_save() {  # hy2_port_save <порт>
   mkdir -p "$(dirname "$HY2_PORT_FILE")" && echo "$1" > "$HY2_PORT_FILE" && chmod 644 "$HY2_PORT_FILE"
 }
 
+# Случайный свободный UDP-порт из верхнего диапазона (20000–59999): не занят и не совпадает с 443.
+hy2_port_random() {
+  local p tries=0
+  while [ "$tries" -lt 30 ]; do
+    p="$(shuf -i 20000-59999 -n 1 2>/dev/null || echo $((20000 + RANDOM % 40000)))"
+    ss -uln 2>/dev/null | grep -qE "[:.]${p}[[:space:]]" || { echo "$p"; return 0; }
+    tries=$((tries+1))
+  done
+  echo "$p"
+}
+
+# Выбор UDP-порта Hysteria2 в меню: стандартный 443, случайный, свой или текущий.
+# Результат — HY2_PORT; код 1 — отмена. Без вопросов (ASSUME_YES) остаётся текущее значение
+# (HY2_PORT из окружения, иначе сохранённое, иначе 443).
+hy2_port_pick() {
+  local cur rnd def=1 nl=$'\n'
+  cur="$(hy2_port)"
+  if [ "${ASSUME_YES:-0}" = "1" ]; then HY2_PORT="$cur"; export HY2_PORT; return 0; fi
+  rnd="$(hy2_port_random)"
+  local -a opts=(
+    "443 · стандартный|Привычный порт QUIC/HTTP3: трафик выглядит как обычный HTTP/3. Подходит, если провайдер не режет UDP 443."
+    "Случайный · ${rnd}|Свободный порт из диапазона 20000–59999, выбранный сейчас.${nl}${nl}@ЗАЧЕМ${nl}нестандартный порт сложнее заблокировать списком и не пересекается с другими службами."
+    "Свой порт|Любой UDP-порт от 1 до 65535, например 20152 — как в чужих конфигах. Порты ниже 1024 и 443 лучше не занимать чужими службами."
+  )
+  if [ "$cur" != "443" ]; then
+    opts+=("Оставить текущий · ${cur}|Порт, который уже выбран на этом сервере (/etc/dorik/hy2-port).")
+    def=4
+  fi
+  ask_choice "ПОРТ HYSTERIA2 (UDP)" "$def" "${opts[@]}" || return 1
+  case "$CHOICE" in
+    1) HY2_PORT=443 ;;
+    2) HY2_PORT="$rnd" ;;
+    3) HY2_PORT="$(ask_valid "UDP-порт Hysteria2 (1–65535)" "$cur" is_valid_port)" || return 1 ;;
+    *) HY2_PORT="$cur" ;;
+  esac
+  export HY2_PORT
+  return 0
+}
+
 # Если прошлый запуск apt/dpkg был прерван — чиним до начала работы.
 fix_dpkg_state() {
   wait_for_apt_lock

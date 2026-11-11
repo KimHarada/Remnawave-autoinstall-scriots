@@ -16,6 +16,7 @@
 #   --update-node    обновить ноду          --bbr   BBR + сетевая оптимизация
 #   --panel-install  установить панель      --panel-update  обновить панель
 #   --sub            страница подписки      --sub-update    обновить страницу
+#   --hy2-port       сменить UDP-порт Hysteria2 (--hy2-port show — показать текущий)
 #   --report         отчёт о сервере (--report last — прошлый, --report log — журнал, --report print — в вывод)
 #   --status         показать состояние сервера
 #   --update         обновить сам тулкит до свежей версии
@@ -61,7 +62,7 @@ download_repo() {
     curl -fsSL --retry 3 "${DORIK_RAW}/menu.sh" -o "$tmp/menu.sh" || { rm -rf "$tmp"; return 1; }
     for f in lib.sh ui.sh tui.sh webserver.sh state.sh harden.sh decoys.sh profile-setup.sh doctor.sh preflight.sh full-setup.sh \
              bbr-install.sh haproxy-setup.sh remnanode-setup.sh node-update.sh panel-install.sh fix-ssh-access.sh \
-             webproxy-setup.sh scanblock.sh report.sh; do
+             webproxy-setup.sh scanblock.sh report.sh hy2-port.sh; do
       curl -fsSL --retry 3 "${DORIK_RAW}/scripts/${f}" -o "$tmp/scripts/${f}" || { rm -rf "$tmp"; return 1; }
     done
   fi
@@ -162,6 +163,7 @@ case "$ARG" in
   --sub)           run_script panel-install.sh sub; exit $? ;;
   --sub-update)    run_script panel-install.sh sub-update; exit $? ;;
   --report)        run_script report.sh "${1:-new}"; exit $? ;;
+  --hy2-port)      run_script hy2-port.sh "$@"; exit $? ;;
   --status)        banner; show_dashboard; exit 0 ;;
   --help|-h)       sed -n '2,24p' "${BASH_SOURCE[0]:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
   "") ;;
@@ -334,13 +336,14 @@ web_menu() {
 advanced_menu() {
   local -a AM_L AM_D AM_K
   local did=1
-  AM_L=("Восстановить SSH-доступ" "Только BBR и сетевая оптимизация" "Только веб-сервер + HAProxy" "Только Remnanode")
-  AM_K=(1 2 3 4)
+  AM_L=("Восстановить SSH-доступ" "Только BBR и сетевая оптимизация" "Только веб-сервер + HAProxy" "Только Remnanode" "Порт Hysteria2")
+  AM_K=(1 2 3 4 5)
   AM_D=(
     "Экстренный случай: SSH перестал отвечать на нужном порту. Проверяет sshd, firewall и fail2ban и возвращает доступ."
     "Включает BBR и сетевые параметры ядра для ноды, ничего больше не трогая."
     "На уже настроенную ноду: заглушки (Nginx или Caddy), сертификаты и маршрутизация HAProxy по SNI. Спросит веб-сервер и домены протоколов."
     "Ставит или пересоздаёт только контейнер ноды Remnanode."
+    "Меняет UDP-порт Hysteria2 на настроенной ноде: 443, случайный свободный или свой. Переносит правило firewall и предлагает обновить inbound и хост на панели по API; без этого нода останется на прежнем порту.${NL}${NL}@СЕЙЧАС${NL}$(hy2_port)/udp${NL}${NL}@КОМАНДА${NL}dorik hy2-port"
   )
   TUI_SEL=0
   while true; do
@@ -350,6 +353,7 @@ advanced_menu() {
       1) run_script bbr-install.sh ;;
       2) run_script haproxy-setup.sh ;;
       3) run_script remnanode-setup.sh ;;
+      4) run_script hy2-port.sh ;;
     esac
     did=0
     pause

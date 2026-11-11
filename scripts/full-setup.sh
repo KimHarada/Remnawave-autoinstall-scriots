@@ -223,8 +223,7 @@ if [ "$ROLE" = "1" ]; then
   # UDP-порт Hysteria2: 443 или свой (если 443/udp режут, занят или нужен «нестандартный» порт, как в чужих
   # конфигах). Клиент подключается на этот порт по UDP; TCP-заглушка домена остаётся на 443.
   if [ "$USE_HY2" = "1" ]; then
-    HY2_PORT=$(ask_valid "UDP-порт Hysteria2 (443 — по умолчанию; можно свой, например 20152)" "$(hy2_port)" is_valid_port) || exit 1
-    export HY2_PORT
+    hy2_port_pick || { err "Отменено пользователем."; exit 1; }
     hy2_port_save "$HY2_PORT"
     [ "$HY2_PORT" = "443" ] || info "Hysteria2 будет слушать UDP ${HY2_PORT}; в хосте на панели порт тоже выставится ${HY2_PORT}."
   fi
