@@ -177,7 +177,8 @@ report_last() {
 report_log() {
   local f
   # shellcheck disable=SC2012
-  # журнал текущего запуска (почти пустой) пропускаем — нужен предыдущий
+  # журнал текущего запуска (почти пустой) пропускаем — нужен предыдущий; имена файлов наши, без «странных» символов
+  # shellcheck disable=SC2010
   f="$(ls -1t "$REPORT_DIR"/dorik-*.log 2>/dev/null | grep -vxF "${DORIK_LOG:-}" | head -1)"
   [ -n "$f" ] || { info "Журналов пока нет."; return 0; }
   _rp_view "$f"

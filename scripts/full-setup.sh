@@ -22,6 +22,7 @@ _dorik_source preflight.sh
 _dorik_source decoys.sh
 _dorik_source profile-setup.sh
 _dorik_source scanblock.sh
+_dorik_source resume.sh
 
 require_root
 require_apt_os
@@ -59,6 +60,271 @@ wait_prefetch() {
 info "Подготовка системы идёт в фоне — отвечайте на вопросы, ждать не нужно."
 
 # ---------------------------------------------------------------------------
+# Описание протоколов и общие функции вопросов. Они нужны и при первом запуске, и при продолжении
+# (прошлый запуск можно продолжить или поменять в нём домены), поэтому определены заранее.
+# ---------------------------------------------------------------------------
+NL=$'\n'
+PROTO_KEYS=(tcp grpc xhttp hy2 tg web)
+PROTO_HOT=(1 2 3 4 5 6)
+PROTO_LABELS=("VLESS REALITY TCP" "VLESS REALITY gRPC" "VLESS REALITY XHTTP" "Hysteria2" "Telegram-хост" "WEB-прокси Telegram")
+declare -A PROTO_VAR=( [tcp]=DOMAIN_TCP [grpc]=DOMAIN_GRPC [xhttp]=DOMAIN_XHTTP [hy2]=DOMAIN_HY2 [tg]=DOMAIN_TG [web]=DOMAIN_WEB )
+PROTO_DESC=(
+  "Основной протокол: самый совместимый, работает во всех клиентах. Трафик выглядит как обычный HTTPS к вашему домену, чужим отдаётся страница-заглушка.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy${NL}${NL}@НУЖНО${NL}свой домен и сертификат"
+  "VLESS REALITY поверх gRPC. Запасной транспорт: помогает там, где обычный TCP режут по поведению соединения.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
+  "VLESS REALITY поверх XHTTP: запросы выглядят как обычная работа сайта, устойчив к обрывам длинных соединений.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
+  "Быстрый протокол поверх QUIC (UDP). Хорош на плохих и мобильных сетях; там, где UDP режут, не работает — поэтому ставится вместе с TCP-протоколами.${NL}${NL}@ПОРТ${NL}UDP, по умолчанию 443; можно задать свой (его спросят позже)${NL}${NL}@НУЖНО${NL}отдельный домен и сертификат"
+  "Отдельный хост, через который ходят только Telegram и ЮKassa/ЮMoney — остальное на нём блокируется. Удобно для бесплатного или ограниченного тарифа.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
+  "Прокси Telegram типа «WEB» (Telemt) с рекламой вашего канала через @MTProxybot. К Xray и подпискам не относится — это отдельная служба.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
+)
+declare -A SEL=()
+PROTO_STATE=(); PROTO_SELECTED=""; HAS_XRAY=0
+DOMAIN_MODE="${DOMAIN_MODE:-2}"; BASE_DOMAIN="${BASE_DOMAIN:-}"
+DOMAIN_TCP="${DOMAIN_TCP:-}"; DOMAIN_GRPC="${DOMAIN_GRPC:-}"; DOMAIN_XHTTP="${DOMAIN_XHTTP:-}"
+DOMAIN_HY2="${DOMAIN_HY2:-}"; DOMAIN_TG="${DOMAIN_TG:-}"; DOMAIN_WEB="${DOMAIN_WEB:-}"
+RESUME_MODE=""; RESUME_SKIP=0; RESUME_BAD=0; SKIPPED_STEPS=()
+
+# Домен протокола из прошлой установки (чтобы повторный запуск не менял домены).
+prev_domain() { [ -s /etc/dorik/decoys.conf ] && awk -F'|' -v p="$1" '$1==p{print $2; exit}' /etc/dorik/decoys.conf; return 0; }
+
+# Домены выбранных протоколов: вручную по одному либо от одного базового домена. Вызывается и при первом
+# запуске, и когда вы решили поменять домен (в меню прошлого запуска, при проблеме с DNS или перед стартом).
+# Текущие значения подставляются как ответ по умолчанию — достаточно нажать Enter там, где всё верно.
+ask_domains() {
+  local i p v cur val d
+  DOMAIN_MODE=2
+  if [ -n "${DOMAIN_TCP}${DOMAIN_GRPC}${DOMAIN_XHTTP}${DOMAIN_HY2}${DOMAIN_TG}${DOMAIN_WEB}" ] && [ -z "${BASE_DOMAIN:-}" ]; then DOMAIN_MODE=1; fi
+  [ -s /etc/dorik/decoys.conf ] && [ -z "${BASE_DOMAIN:-}" ] && DOMAIN_MODE=1
+  ask_choice "ДОМЕНЫ" "$DOMAIN_MODE" \
+    "Каждый домен вручную|Для каждого выбранного протокола вы вводите свой домен. Домены могут быть на разных зонах — так их труднее связать между собой.${NL}${NL}@DNS${NL}A-запись каждого домена на IP этого сервера" \
+    "Один базовый домен|Вы вводите один домен, а поддомены для выбранных протоколов я создам сам — со случайными именами, чтобы по названию нельзя было угадать протокол.${NL}${NL}@DNS${NL}одна запись *.домен на IP этого сервера" \
+    || { err "Отменено пользователем."; exit 1; }
+  DOMAIN_MODE="$CHOICE"
+
+  if [ "$DOMAIN_MODE" = "2" ]; then
+    BASE_DOMAIN=$(ask_valid "Базовый домен (например example.com)" "${BASE_DOMAIN:-}" is_valid_domain) || exit 1
+    BASE_DOMAIN="${BASE_DOMAIN,,}"
+    for p in "${PROTO_KEYS[@]}"; do
+      v="${PROTO_VAR[$p]}"
+      if [ -n "${SEL[$p]:-}" ]; then
+        d="${!v:-}"
+        # уже выбранный под этой же базой домен сохраняем; иначе — прежний из установки либо новый случайный
+        case "$d" in *".${BASE_DOMAIN}") ;; *)
+          d="$(prev_domain "$p")"
+          case "$d" in *".${BASE_DOMAIN}") ;; *) d="$(openssl rand -hex 4).${BASE_DOMAIN}" ;; esac ;;
+        esac
+        printf -v "$v" '%s' "$d"
+      else
+        printf -v "$v" '%s' ""
+      fi
+    done
+  else
+    BASE_DOMAIN=""
+    info "Домены нужны только для выбранных протоколов: $(for i in "${!PROTO_KEYS[@]}"; do [ "${PROTO_STATE[$i]}" = "1" ] && printf '%s; ' "${PROTO_LABELS[$i]}"; done)"
+    for i in "${!PROTO_KEYS[@]}"; do
+      p="${PROTO_KEYS[$i]}"; v="${PROTO_VAR[$p]}"
+      if [ -n "${SEL[$p]:-}" ]; then
+        cur="${!v:-}"; [ -n "$cur" ] || cur="$(prev_domain "$p")"
+        val=$(ask_valid "Домен для ${PROTO_LABELS[$i]}" "$cur" is_valid_domain) || exit 1
+        printf -v "$v" '%s' "$val"
+      else
+        printf -v "$v" '%s' ""
+      fi
+    done
+  fi
+  DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"; DOMAIN_TG="${DOMAIN_TG,,}"; DOMAIN_WEB="${DOMAIN_WEB,,}"
+  export DOMAIN_TCP DOMAIN_GRPC DOMAIN_XHTTP DOMAIN_HY2 DOMAIN_TG DOMAIN_WEB
+
+  echo
+  box_top "Домены протоколов"
+  for i in "${!PROTO_KEYS[@]}"; do
+    p="${PROTO_KEYS[$i]}"; v="${PROTO_VAR[$p]}"
+    [ -n "${!v:-}" ] && box_row "${C_B}${PROTO_LABELS[$i]}${C_RESET}  ${!v}"
+  done
+  box_sep
+  if [ "$DOMAIN_MODE" = "2" ]; then
+    box_wrap "${C_DIM}→${C_RESET}" "DNS: создайте A-запись *.${BASE_DOMAIN} на IP этого сервера (или отдельные A-записи на каждый домен выше)."
+  else
+    box_wrap "${C_DIM}→${C_RESET}" "DNS: A-запись каждого домена должна указывать на IP этого сервера."
+  fi
+  box_bottom
+}
+
+# Предварительная проверка DNS сразу после ввода доменов: видно сразу, до запуска, пока ещё можно
+# поправить A-запись (или опечатку в самом домене) и не жечь лимит Let's Encrypt. Если домены не
+# указывают на сервер, можно проверить ещё раз, поменять домены или продолжить без них.
+dns_preflight() {
+  local d bad resolved
+  while true; do
+    step "Предварительная проверка DNS"
+    PREFLIGHT_PUB_IP="$(get_public_ip)"
+    if [ -z "$PREFLIGHT_PUB_IP" ]; then
+      warn "Не удалось определить публичный IP сервера — проверку DNS пропускаю."
+      return 0
+    fi
+    info "Публичный IP сервера: ${PREFLIGHT_PUB_IP}"
+    bad=0
+    for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2" "$DOMAIN_TG" "$DOMAIN_WEB"; do
+      [ -z "$d" ] && continue
+      if dns_points_here "$d" "$PREFLIGHT_PUB_IP"; then
+        ok "${d}: DNS указывает на этот сервер."
+      else
+        resolved="$(resolve_a "$d")"
+        warn "${d}: DNS указывает на '${resolved:-<нет ответа>}', а не на ${PREFLIGHT_PUB_IP}. Сертификат для этого домена НЕ будет выпущен, пока не поправите A-запись (или домен введён с опечаткой)."
+        bad=1
+      fi
+    done
+    [ "$bad" = "0" ] && return 0
+    if [ "${ASSUME_YES:-0}" = "1" ]; then
+      warn "Часть доменов пока не указывает на этот сервер — продолжаю: их сертификаты не выпустятся сейчас, скрипт подхватит их при повторном запуске."
+      return 0
+    fi
+    ask_choice "DNS ЕЩЁ НЕ ГОТОВ" 1 \
+      "Проверить ещё раз|Сначала поправьте A-запись у регистратора (изменения доходят от минуты до часа), затем проверка повторится." \
+      "Изменить домены|Если домен введён с опечаткой — введите правильный. Остальные домены можно просто подтвердить Enter." \
+      "Продолжить без них|Сертификаты для этих доменов сейчас не выпустятся. Скрипт можно запустить повторно, когда DNS заработает — он выполнит только недостающее." \
+      || { err "Отменено пользователем."; exit 1; }
+    case "$CHOICE" in
+      2) ask_domains ;;
+      3) warn "Продолжаю: сертификаты для доменов без DNS не будут выпущены сейчас."; return 0 ;;
+    esac
+  done
+}
+
+# SECRET_KEY ноды: по API панели (общий для панели, копировать не нужно) либо вручную.
+acquire_secret_key() {
+  local try old_key=""
+  [ -f "$NODE_DIR/docker-compose.yml" ] && \
+    old_key=$(grep -oE 'SECRET_KEY=.*' "$NODE_DIR/docker-compose.yml" | head -1 | sed 's/SECRET_KEY=//')
+  if [ "$USE_API" = "1" ]; then
+    # Панель может быть временно недоступна — пробуем трижды, а если не вышло, предлагаем ввести ключ
+    # вручную (тогда профиль на панели по API не создаётся — его и ноду добавите в панели сами).
+    SECRET_KEY=""
+    for try in 1 2 3; do
+      SECRET_KEY="$(fetch_secret_key)" && [ -n "$SECRET_KEY" ] && break
+      SECRET_KEY=""
+      [ "$try" -lt 3 ] && { warn "Не получилось (попытка ${try}/3), повторяю через 5 с..."; sleep 5; }
+    done
+    if [ -n "$SECRET_KEY" ]; then
+      ok "SECRET_KEY получен от панели по API"
+    else
+      err "Не удалось получить SECRET_KEY от панели."
+      [ "${ASSUME_YES:-0}" = "1" ] && exit 1
+      if ask_yes_no "Продолжить без API: ввести SECRET_KEY вручную и создать профиль и хосты в панели самому?" "1"; then
+        USE_API=0; PROFILE_CREATE_NODE=0
+        warn "Профиль, хосты и нода на панели по API не создаются: добавите их в панели сами."
+      else
+        err "Отменено пользователем."; exit 1
+      fi
+    fi
+  fi
+  if [ "$USE_API" != "1" ]; then
+    while true; do
+      if [ -n "$old_key" ]; then
+        SECRET_KEY=$(ask_value "SECRET_KEY ноды (Enter — оставить текущий)" "${SECRET_KEY:-}")
+      else
+        SECRET_KEY=$(ask_value "SECRET_KEY ноды (из панели Remnawave, обязателен)" "${SECRET_KEY:-}")
+      fi
+      # Убираем случайные кавычки/переводы строк — частая причина "Invalid SECRET_KEY payload"
+      SECRET_KEY=$(echo -n "$SECRET_KEY" | sed -E 's/^"+//; s/"+$//' | tr -d '\r\n')
+      if [ -n "$SECRET_KEY" ] || [ -n "$old_key" ]; then break; fi
+      err "SECRET_KEY не может быть пустым."
+      [ "${ASSUME_YES:-0}" = "1" ] && exit 1
+    done
+  fi
+}
+
+# ---- отпечатки этапов и проверки «работает ли сейчас» ------------------------------------------
+# Этап пропускается при повторном запуске, только если он раньше прошёл успешно, его параметры не
+# менялись (отпечаток тот же) и он живой на сервере. Поменяли домен — отпечатки зависящих от него
+# этапов другие, и перезапустятся именно они. Все значения с запасом на пустое: часть переменных
+# есть не у всех ролей.
+_all_domains() { echo "${DOMAIN_TCP:-}" "${DOMAIN_GRPC:-}" "${DOMAIN_XHTTP:-}" "${DOMAIN_HY2:-}" "${DOMAIN_TG:-}" "${DOMAIN_WEB:-}"; }
+# Для отпечатка домены идут через «|» с пустыми полями: иначе «tcp пуст, grpc=a» совпало бы с «tcp=a, grpc пуст».
+_domains_fp()  { echo "${DOMAIN_TCP:-}|${DOMAIN_GRPC:-}|${DOMAIN_XHTTP:-}|${DOMAIN_HY2:-}|${DOMAIN_TG:-}|${DOMAIN_WEB:-}"; }
+fp_apt()       { date +%Y%m%d; }
+fp_ssh()       { fp_make "${NEW_SSH_PORT:-}" "${ROLE:-}" "${USE_HY2:-}" "$(hy2_port)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${PANEL_IP:-}" "${ENABLE_REBOOT:-}"; }
+fp_web()       { fp_make "${WEB_SERVER:-}" "${INSTALL_DECOY:-}" "${SCAN_PROTECT:-}" "${USE_HY2:-}" "${USE_TG:-}" "${USE_WEB:-}" "$(_domains_fp)"; }
+fp_bbr()       { fp_make "${USE_BBR:-}"; }
+fp_profile()   { fp_make "$(_domains_fp)" "$(hy2_port)" "${PROFILE_PREFIX:-}" "${PROFILE_NAME:-}" "${COUNTRY_CODE:-}" "${PSIPHON:-}" "${FINAL_MASK:-}" "${SCAN_PROTECT:-}" "${PROFILE_CREATE_NODE:-}" "${NODE_PORT:-}"; }
+fp_node()      { fp_make "${NODE_PORT:-}" "${USE_HY2:-}" "${DOMAIN_HY2:-}"; }
+fp_nodelink()  { fp_make "$(fp_profile)" "$(fp_node)"; }
+fp_webproxy()  { fp_make "${DOMAIN_WEB:-}" "${WEB_AD_TAG:-}"; }
+fp_harden()    { fp_make "${NEW_SSH_PORT:-}" "${USE_HY2:-}" "$(hy2_port)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${SSH_PW_OFF:-}" "${SCAN_PROTECT:-}" "${ROLE:-}"; }
+fp_scanblock() { fp_make "${SCAN_BLOCKLIST:-}" "${PANEL_IP:-}"; }
+
+live_web() {
+  local d
+  svc_active haproxy && svc_active "${WEB_SERVER:-nginx}" && [ -s /etc/dorik/decoys.conf ] || return 1
+  for d in $(_all_domains); do
+    cert_is_valid "$d" && grep -q "|${d}|" /etc/dorik/decoys.conf || return 1
+  done
+}
+live_bbr()       { [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == bbr* ]] && [ -f /etc/sysctl.d/99-dorik-net.conf ]; }
+live_profile()   { [ -s /etc/dorik/profile.json ]; }
+live_node()      { container_running remnanode; }
+live_webproxy()  { svc_active mtproxy-web; }
+live_harden()    { [ -f /etc/sysctl.d/98-dorik-hardening.conf ]; }
+live_scanblock() { [ "$(scanblock_count)" -gt 0 ]; }
+
+# Секреты (токен панели, ключ ноды) в ответах не хранятся. При продолжении спрашиваем их, только
+# если этап, которому они нужны, ещё не выполнен.
+resume_secrets() {
+  local need_api=0 need_key=0
+  [ "${HAS_XRAY:-0}" = "1" ] || return 0
+  if [ "${USE_API:-0}" = "1" ]; then
+    { step_done profile "$(fp_profile)" && live_profile; } || need_api=1
+    [ "${PROFILE_CREATE_NODE:-0}" = "1" ] && ! step_done nodelink "$(fp_nodelink)" && need_api=1
+  fi
+  { step_done node "$(fp_node)" && live_node; } || need_key=1
+  [ "${USE_API:-0}" = "1" ] && [ "$need_key" = "1" ] && need_api=1      # ключ берётся по API
+  if [ "$need_api" = "1" ]; then
+    info "Часть этапов панели не выполнена — нужен доступ к панели (токен в файле не хранится)."
+    wait_prefetch                          # для работы с API нужен jq из базовых пакетов
+    profile_collect_params || exit 1
+  fi
+  if [ "$need_key" = "1" ]; then acquire_secret_key; fi
+}
+
+# Меню прошлого запуска: продолжить, поменять домены, поменять параметры или начать заново.
+resume_menu() {
+  local def=1 v
+  RESUME_MODE=""; RESUME_SKIP=0
+  if ! setup_exists; then
+    [ -f "$STEPS_STATE" ] && RESUME_SKIP=1       # этапы без ответов (запуск без вопросов): всё равно не повторяем лишнее
+    return 0
+  fi
+  # Без вопросов (cloud-init) значения берутся из окружения, а не из сохранённого файла.
+  if [ "${ASSUME_YES:-0}" = "1" ]; then RESUME_SKIP=1; return 0; fi
+  setup_load || return 0
+  proto_unpack
+  step "Прошлый запуск"
+  setup_summary
+  # Пункт «Изменить домены» есть только у ноды: у сервера панели доменов протоколов нет.
+  local -a ro=("Продолжить с места остановки|Берёт сохранённые ответы без повторных вопросов и выполняет только то, что не завершено или перестало работать. Уже настроенное проверяется на живой системе и пропускается.${NL}${NL}@ПАРОЛИ И КЛЮЧИ${NL}в файле не хранятся — если нужны, спросят заново")
+  local -a rmap=(1)
+  if [ "${ROLE:-1}" = "1" ] && [ -n "${PROTO_SELECTED:-}" ]; then
+    ro+=("Изменить домены|Спросит только домены (текущие подставлены, Enter — оставить), проверит DNS и перезапустит только то, что от доменов зависит: сертификаты, заглушки, HAProxy, профиль на панели.${NL}${NL}@ОПЕЧАТКА В ДОМЕНЕ${NL}введите правильный — старый сертификат останется на сервере, его можно удалить командой certbot delete")
+    rmap+=(2)
+  fi
+  ro+=("Изменить параметры|Все вопросы заново. Протоколы, домены и порты подставлены из прошлого раза; да/нет-вопросы предлагают значения по умолчанию.")
+  rmap+=(3)
+  ro+=("Начать заново|Забыть сохранённое и выполнить каждый этап с проверкой, как на новом сервере.")
+  rmap+=(4)
+  ask_choice "ЧТО ДЕЛАТЬ" "$def" "${ro[@]}" || { info "Отменено."; exit 0; }
+  CHOICE="${rmap[$((CHOICE-1))]}"
+  case "$CHOICE" in
+    1) RESUME_MODE="continue"; RESUME_SKIP=1 ;;
+    2) RESUME_MODE="domains";  RESUME_SKIP=1 ;;
+    3) RESUME_MODE="edit";     RESUME_SKIP=1; PROTOCOLS="${PROTO_SELECTED// /,}"; export PROTOCOLS ;;
+    4) RESUME_MODE="fresh"
+       # «Забываем» ответы: пустое значение ведёт себя как «не задано» во всех вопросах (а не unset — set -u)
+       for v in "${SETUP_VARS[@]}"; do printf -v "$v" '%s' ""; done
+       DOMAIN_MODE=2; HAS_XRAY=0
+       steps_clear ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # ШАГ 0.5. Что уже есть на сервере + исправление последствий старых версий
 # ---------------------------------------------------------------------------
 step "Что уже установлено"
@@ -72,6 +338,43 @@ DORIK_IGNORE="${DORIK_IGNORE:+${DORIK_IGNORE},}ports_exposed,hardening_missing,s
 # ---------------------------------------------------------------------------
 # ШАГ 1. Сбор параметров (никаких вопросов после этого блока)
 # ---------------------------------------------------------------------------
+# Если полная настройка уже запускалась: показать, что сделано, и предложить продолжить, поменять
+# домены или параметры, либо начать заново (RESUME_MODE).
+resume_menu
+
+if [ "$RESUME_MODE" = "continue" ] || [ "$RESUME_MODE" = "domains" ]; then
+  # ---- продолжение прошлого запуска: ответы уже сохранены, вопросов нет ----------------------------
+  step "Продолжаю прошлый запуск"
+  ROLE="${ROLE:-1}"
+  if [ "$ROLE" = "1" ]; then
+    preflight_run --docker --certs --ports "80 443" || exit 1
+  else
+    preflight_run || exit 1
+  fi
+  CUR_SSH_PORT=$(get_real_ssh_port)
+  CUR_SSH_PORT=${CUR_SSH_PORT:-$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')}
+  CUR_SSH_PORT=${CUR_SSH_PORT:-22}
+  NEW_SSH_PORT="${NEW_SSH_PORT:-$CUR_SSH_PORT}"
+  # Чего нет в сохранённом файле (он мог быть записан старой версией) — значения по умолчанию.
+  : "${INSTALL_DECOY:=1}" "${USE_BBR:=0}" "${USE_API:=0}" "${OPEN_NODE_PORT:=0}" "${ENABLE_REBOOT:=1}"
+  : "${DO_HARDEN:=1}" "${SSH_PW_OFF:=0}" "${SCAN_PROTECT:=1}" "${SCAN_BLOCKLIST:=0}" "${PROFILE_CREATE_NODE:=0}"
+  : "${PANEL_IP:=}" "${NODE_PORT:=}" "${WEB_AD_TAG:=}" "${WEB_SERVER:=$(ws_current)}"
+  SECRET_KEY="${SECRET_KEY:-}"; WEB_SECRET="${WEB_SECRET:-}"
+  export SCAN_PROTECT SCAN_BLOCKLIST WEB_SERVER HY2_PORT FINAL_MASK PSIPHON
+  if [ "$RESUME_MODE" = "domains" ]; then
+    # Только домены: спрашиваем их заново (текущие подставлены), проверяем DNS — дальше перезапустятся
+    # лишь те этапы, чей отпечаток от доменов зависит.
+    if [ "$ROLE" != "1" ] || [ "$HAS_XRAY$USE_WEB" = "00" ]; then
+      warn "На этом сервере нет доменов протоколов — менять нечего."
+    else
+      ask_domains
+      dns_preflight
+      export USE_WEB DOMAIN_WEB WEB_AD_TAG
+    fi
+  fi
+  resume_secrets
+  wait_prefetch
+else
 step "Вопросы"
 
 ROLE="${ROLE:-1}"; is_valid_choice12 "$ROLE" || { err "ROLE должен быть 1 (нода) или 2 (сервер панели)."; exit 1; }
@@ -102,34 +405,13 @@ while [ "$NEW_SSH_PORT" = "80" ] || [ "$NEW_SSH_PORT" = "443" ]; do
 done
 
 if [ "$ROLE" = "1" ]; then
-  # ---- домены протоколов -----------------------------------------------------------------------
-  # Вручную (по домену на протокол) либо от ОДНОГО базового домена: остальные сгенерирую сам
-  # (случайные имена — по названию поддомена нельзя угадать протокол; нужна wildcard-запись DNS).
+  # ---- какие протоколы ставим ------------------------------------------------------------------
   # значения из окружения (режим без вопросов) запоминаем до обнуления
   USE_TG_ENV="${USE_TG:-0}"; USE_HY2_ENV="${USE_HY2:-1}"; USE_WEB_ENV="${USE_WEB:-0}"
-  DOMAIN_TCP="${DOMAIN_TCP:-}"; DOMAIN_GRPC="${DOMAIN_GRPC:-}"; DOMAIN_XHTTP="${DOMAIN_XHTTP:-}"
-  DOMAIN_HY2="${DOMAIN_HY2:-}"; DOMAIN_TG="${DOMAIN_TG:-}"; DOMAIN_WEB="${DOMAIN_WEB:-}"
-
-  # домен протокола из прошлой установки (чтобы повторный запуск не менял домены)
-  prev_domain() { [ -s /etc/dorik/decoys.conf ] && awk -F'|' -v p="$1" '$1==p{print $2; exit}' /etc/dorik/decoys.conf; return 0; }
-
-  # ---- 1. какие протоколы ставим -------------------------------------------------------------
   # Сначала выбор протоколов, потом домены — только для выбранных.
   # Без вопросов: PROTOCOLS="tcp grpc xhttp hy2 tg web" (либо, как раньше, по заданным DOMAIN_* и USE_*).
-  PROTO_KEYS=(tcp grpc xhttp hy2 tg web)
-  PROTO_HOT=(1 2 3 4 5 6)
-  PROTO_LABELS=("VLESS REALITY TCP" "VLESS REALITY gRPC" "VLESS REALITY XHTTP" "Hysteria2" "Telegram-хост" "WEB-прокси Telegram")
-  declare -A PROTO_VAR=( [tcp]=DOMAIN_TCP [grpc]=DOMAIN_GRPC [xhttp]=DOMAIN_XHTTP [hy2]=DOMAIN_HY2 [tg]=DOMAIN_TG [web]=DOMAIN_WEB )
-  NL=$'\n'
-  PROTO_DESC=(
-    "Основной протокол: самый совместимый, работает во всех клиентах. Трафик выглядит как обычный HTTPS к вашему домену, чужим отдаётся страница-заглушка.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy${NL}${NL}@НУЖНО${NL}свой домен и сертификат"
-    "VLESS REALITY поверх gRPC. Запасной транспорт: помогает там, где обычный TCP режут по поведению соединения.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
-    "VLESS REALITY поверх XHTTP: запросы выглядят как обычная работа сайта, устойчив к обрывам длинных соединений.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
-    "Быстрый протокол поверх QUIC (UDP). Хорош на плохих и мобильных сетях; там, где UDP режут, не работает — поэтому ставится вместе с TCP-протоколами.${NL}${NL}@ПОРТ${NL}UDP, по умолчанию 443; можно задать свой (его спросят позже)${NL}${NL}@НУЖНО${NL}отдельный домен и сертификат"
-    "Отдельный хост, через который ходят только Telegram и ЮKassa/ЮMoney — остальное на нём блокируется. Удобно для бесплатного или ограниченного тарифа.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
-    "Прокси Telegram типа «WEB» (Telemt) с рекламой вашего канала через @MTProxybot. К Xray и подпискам не относится — это отдельная служба.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
-  )
-  declare -A SEL=()
+  # (описание протоколов и функции доменов определены в начале файла)
+  SEL=()
   if [ -n "${PROTOCOLS:-}" ]; then
     for p in ${PROTOCOLS//,/ }; do SEL[${p,,}]=1; done
   elif [ -n "${DOMAIN_TCP}${DOMAIN_GRPC}${DOMAIN_XHTTP}${DOMAIN_HY2}" ]; then
@@ -165,60 +447,16 @@ if [ "$ROLE" = "1" ]; then
   HAS_XRAY=0
   for p in tcp grpc xhttp hy2 tg; do [ -n "${SEL[$p]:-}" ] && HAS_XRAY=1; done
   USE_HY2="${SEL[hy2]:-0}"; USE_TG="${SEL[tg]:-0}"; USE_WEB="${SEL[web]:-0}"
+  proto_pack
 
-  # ---- 2. веб-сервер заглушек: nginx или Caddy ------------------------------------------------
+  # ---- веб-сервер заглушек: nginx или Caddy ------------------------------------------------------
   if [ "${ASSUME_YES:-0}" = "1" ]; then WEB_SERVER="$(ws_current)"; else ws_ask node || { err "Отменено пользователем."; exit 1; }; fi
   export WEB_SERVER
 
-  # ---- 3. домены — только для выбранных протоколов --------------------------------------------
+  # ---- домены — только для выбранных протоколов ----------------------------------------------------
   # Вручную (по домену на протокол) либо от ОДНОГО базового домена: остальные сгенерирую сам
   # (случайные имена — по названию поддомена нельзя угадать протокол; нужна wildcard-запись DNS).
-  DOMAIN_MODE=2
-  if [ -n "${DOMAIN_TCP}${DOMAIN_GRPC}${DOMAIN_XHTTP}${DOMAIN_HY2}" ] || { [ -s /etc/dorik/decoys.conf ] && [ -z "${BASE_DOMAIN:-}" ]; }; then DOMAIN_MODE=1; fi
-  ask_choice "ДОМЕНЫ" "$DOMAIN_MODE" \
-    "Каждый домен вручную|Для каждого выбранного протокола вы вводите свой домен. Домены могут быть на разных зонах — так их труднее связать между собой.${NL}${NL}@DNS${NL}A-запись каждого домена на IP этого сервера" \
-    "Один базовый домен|Вы вводите один домен, а поддомены для выбранных протоколов я создам сам — со случайными именами, чтобы по названию нельзя было угадать протокол.${NL}${NL}@DNS${NL}одна запись *.домен на IP этого сервера" \
-    || { err "Отменено пользователем."; exit 1; }
-  DOMAIN_MODE="$CHOICE"
-
-  if [ "$DOMAIN_MODE" = "2" ]; then
-    BASE_DOMAIN=$(ask_valid "Базовый домен (например example.com)" "${BASE_DOMAIN:-}" is_valid_domain) || exit 1
-    BASE_DOMAIN="${BASE_DOMAIN,,}"
-    gen_domain() {  # gen_domain <proto> — прежний домен под этой базой либо новый случайный
-      local d; d="$(prev_domain "$1")"
-      case "$d" in *".${BASE_DOMAIN}") echo "$d" ;; *) echo "$(openssl rand -hex 4).${BASE_DOMAIN}" ;; esac
-    }
-    for p in "${PROTO_KEYS[@]}"; do
-      if [ -n "${SEL[$p]:-}" ]; then printf -v "${PROTO_VAR[$p]}" '%s' "$(gen_domain "$p")"; else printf -v "${PROTO_VAR[$p]}" '%s' ""; fi
-    done
-  else
-    info "Домены нужны только для выбранных протоколов: $(for i in "${!PROTO_KEYS[@]}"; do [ "${PROTO_STATE[$i]}" = "1" ] && printf '%s; ' "${PROTO_LABELS[$i]}"; done)"
-    for i in "${!PROTO_KEYS[@]}"; do
-      p="${PROTO_KEYS[$i]}"; v="${PROTO_VAR[$p]}"
-      if [ -n "${SEL[$p]:-}" ]; then
-        cur="${!v}"; [ -n "$cur" ] || cur="$(prev_domain "$p")"
-        val=$(ask_valid "Домен для ${PROTO_LABELS[$i]}" "$cur" is_valid_domain) || exit 1
-        printf -v "$v" '%s' "$val"
-      else
-        printf -v "$v" '%s' ""
-      fi
-    done
-  fi
-  DOMAIN_TCP="${DOMAIN_TCP,,}"; DOMAIN_GRPC="${DOMAIN_GRPC,,}"; DOMAIN_XHTTP="${DOMAIN_XHTTP,,}"; DOMAIN_HY2="${DOMAIN_HY2,,}"; DOMAIN_TG="${DOMAIN_TG,,}"; DOMAIN_WEB="${DOMAIN_WEB,,}"
-
-  echo
-  box_top "Домены протоколов"
-  for i in "${!PROTO_KEYS[@]}"; do
-    p="${PROTO_KEYS[$i]}"; v="${PROTO_VAR[$p]}"
-    [ -n "${!v}" ] && box_row "${C_B}${PROTO_LABELS[$i]}${C_RESET}  ${!v}"
-  done
-  box_sep
-  if [ "$DOMAIN_MODE" = "2" ]; then
-    box_wrap "${C_DIM}→${C_RESET}" "DNS: создайте A-запись *.${BASE_DOMAIN} на IP этого сервера (или отдельные A-записи на каждый домен выше)."
-  else
-    box_wrap "${C_DIM}→${C_RESET}" "DNS: A-запись каждого домена должна указывать на IP этого сервера."
-  fi
-  box_bottom
+  ask_domains
 
   # UDP-порт Hysteria2: 443 или свой (если 443/udp режут, занят или нужен «нестандартный» порт, как в чужих
   # конфигах). Клиент подключается на этот порт по UDP; TCP-заглушка домена остаётся на 443.
@@ -247,28 +485,8 @@ if [ "$ROLE" = "1" ]; then
 
   # ---- предварительная проверка DNS сразу после ввода доменов --------------
   # Видно сразу, до подтверждения запуска, пока ещё можно поправить A-записи
-  # и не жечь лимит Let's Encrypt.
-  step "Предварительная проверка DNS"
-  PREFLIGHT_PUB_IP="$(get_public_ip)"
-  if [ -z "$PREFLIGHT_PUB_IP" ]; then
-    warn "Не удалось определить публичный IP сервера — проверку DNS пропускаю."
-  else
-    info "Публичный IP сервера: ${PREFLIGHT_PUB_IP}"
-    DNS_PREFLIGHT_BAD=0
-    for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2" "$DOMAIN_TG" "$DOMAIN_WEB"; do
-      [ -z "$d" ] && continue
-      if dns_points_here "$d" "$PREFLIGHT_PUB_IP"; then
-        ok "${d}: DNS указывает на этот сервер."
-      else
-        RESOLVED="$(resolve_a "$d")"
-        warn "${d}: DNS указывает на '${RESOLVED:-<нет ответа>}', а не на ${PREFLIGHT_PUB_IP}. Сертификат для этого домена НЕ будет выпущен, пока не поправишь A-запись."
-        DNS_PREFLIGHT_BAD=1
-      fi
-    done
-    if [ "$DNS_PREFLIGHT_BAD" = "1" ]; then
-      warn "Часть доменов пока не указывает на этот сервер. Можно продолжить — эти сертификаты не выпустятся сейчас, скрипт подхватит их при повторном запуске."
-    fi
-  fi
+  # (или опечатку в домене) и не жечь лимит Let's Encrypt.
+  dns_preflight
 
   if ask_yes_no "Ставить красивые страницы-заглушки (своя, разная для каждого протокола)?" "1"; then
     INSTALL_DECOY=1
@@ -318,47 +536,8 @@ if [ "$ROLE" = "1" ]; then
     PANEL_IP=$(ask_valid "IP панели (Enter — открыть порт для всех)" "${PANEL_IP:-}" is_valid_ip 1) || exit 1
   fi
 
-  # ---- SECRET_KEY ------------------------------------------------------------------------------------------
-  OLD_KEY=""
-  [ -f "$NODE_DIR/docker-compose.yml" ] && \
-    OLD_KEY=$(grep -oE 'SECRET_KEY=.*' "$NODE_DIR/docker-compose.yml" | head -1 | sed 's/SECRET_KEY=//')
-  if [ "$USE_API" = "1" ]; then
-    # Ключ ноды общий для панели — берём по API, вставлять вручную не нужно. Панель может быть
-    # временно недоступна — пробуем трижды, а если не вышло, предлагаем ввести ключ вручную
-    # (тогда профиль на панели по API не создаётся — его и ноду добавите в панели сами).
-    SECRET_KEY=""
-    for try in 1 2 3; do
-      SECRET_KEY="$(fetch_secret_key)" && [ -n "$SECRET_KEY" ] && break
-      SECRET_KEY=""
-      [ "$try" -lt 3 ] && { warn "Не получилось (попытка ${try}/3), повторяю через 5 с..."; sleep 5; }
-    done
-    if [ -n "$SECRET_KEY" ]; then
-      ok "SECRET_KEY получен от панели по API"
-    else
-      err "Не удалось получить SECRET_KEY от панели."
-      [ "${ASSUME_YES:-0}" = "1" ] && exit 1
-      if ask_yes_no "Продолжить без API: ввести SECRET_KEY вручную и создать профиль и хосты в панели самому?" "1"; then
-        USE_API=0; PROFILE_CREATE_NODE=0
-        warn "Профиль, хосты и нода на панели по API не создаются: добавите их в панели сами."
-      else
-        err "Отменено пользователем."; exit 1
-      fi
-    fi
-  fi
-  if [ "$USE_API" != "1" ]; then
-    while true; do
-      if [ -n "$OLD_KEY" ]; then
-        SECRET_KEY=$(ask_value "SECRET_KEY ноды (Enter — оставить текущий)" "${SECRET_KEY:-}")
-      else
-        SECRET_KEY=$(ask_value "SECRET_KEY ноды (из панели Remnawave, обязателен)" "${SECRET_KEY:-}")
-      fi
-      # Убираем случайные кавычки/переводы строк — частая причина "Invalid SECRET_KEY payload"
-      SECRET_KEY=$(echo -n "$SECRET_KEY" | sed -E 's/^"+//; s/"+$//' | tr -d '\r\n')
-      if [ -n "$SECRET_KEY" ] || [ -n "$OLD_KEY" ]; then break; fi
-      err "SECRET_KEY не может быть пустым."
-      [ "${ASSUME_YES:-0}" = "1" ] && exit 1
-    done
-  fi
+  # ---- SECRET_KEY (по API панели либо вручную) ---------------------------------------------------------
+  acquire_secret_key
   else
     NODE_PORT=""
   fi   # HAS_XRAY
@@ -411,9 +590,12 @@ export SCAN_BLOCKLIST
 
 # Все вопросы позади — дожидаемся фоновой подготовки (если ещё идёт, видно, что именно держит apt).
 wait_prefetch
+fi   # конец ветки «вопросы» (иначе — продолжение прошлого запуска, см. выше)
 
 # ---- план выполнения: что именно сейчас будет сделано ------------------------
 yn() { [ "$1" = "1" ] && echo "да" || echo "нет"; }
+show_plan() {
+local i p v old
 PROTO_LIST=""
 if [ "$ROLE" = "1" ]; then
   for i in "${!PROTO_KEYS[@]}"; do [ "${PROTO_STATE[$i]}" = "1" ] && PROTO_LIST+="${PROTO_LIST:+, }${PROTO_LABELS[$i]}"; done
@@ -445,23 +627,56 @@ fi
 box_row "Ребут в 04:00:      $(yn "$ENABLE_REBOOT")    Часовой пояс: ${DORIK_TZ}"
 box_row "Укрепление:         $(yn "$DO_HARDEN")    Вход по паролю SSH выключить: $(yn "$SSH_PW_OFF")"
 box_row "Защита сканеров:    $(yn "$SCAN_PROTECT")    Блок-лист сетей сканеров: $(yn "$SCAN_BLOCKLIST")"
+# Что поменяется по сравнению с тем, что уже стоит: домены, которые вы исправили.
+if [ "$ROLE" = "1" ]; then
+  for i in "${!PROTO_KEYS[@]}"; do
+    p="${PROTO_KEYS[$i]}"; v="${PROTO_VAR[$p]}"
+    old="$(prev_domain "$p")"
+    [ -n "$old" ] && [ -n "${!v:-}" ] && [ "$old" != "${!v}" ] && box_row "${C_Y}Домен ${PROTO_LABELS[$i]}:${C_RESET} ${old} → ${C_BOLD}${!v}${C_RESET}"
+  done
+fi
 box_bottom
+}
 
-echo
-warn "Все вопросы заданы. Дальше скрипт выполнит все шаги подряд БЕЗ остановок."
-if [ "$NEW_SSH_PORT" != "$CUR_SSH_PORT" ]; then
-  warn "SSH переедет с порта ${CUR_SSH_PORT} на ${NEW_SSH_PORT}. Текущая сессия не оборвётся, но следующее подключение — только на ${NEW_SSH_PORT}."
-fi
-if ! ask_yes_no "Начать выполнение сейчас?" "1"; then
-  err "Отменено пользователем."
-  exit 1
-fi
+while true; do
+  show_plan
+  echo
+  warn "Все вопросы заданы. Дальше скрипт выполнит все шаги подряд БЕЗ остановок."
+  if [ "$NEW_SSH_PORT" != "$CUR_SSH_PORT" ]; then
+    warn "SSH переедет с порта ${CUR_SSH_PORT} на ${NEW_SSH_PORT}. Текущая сессия не оборвётся, но следующее подключение — только на ${NEW_SSH_PORT}."
+  fi
+  # Последний шанс поправить домен (опечатка) до того, как пойдут сертификаты и настройка.
+  if [ "$ROLE" = "1" ] && [ "${DOMAIN_TCP}${DOMAIN_GRPC}${DOMAIN_XHTTP}${DOMAIN_HY2}${DOMAIN_TG}${DOMAIN_WEB}" != "" ]; then
+    ask_choice "ГОТОВО К ЗАПУСКУ" 1 \
+      "Начать выполнение|Все этапы пройдут подряд, после каждого — проверка результата. Если что-то не завершится, скрипт можно запустить снова: он продолжит с недоделанного." \
+      "Изменить домены|Если в домене опечатка — исправьте сейчас, до выпуска сертификатов. Домены подставлены, Enter оставляет прежний." \
+      "Отменить|Ничего не будет изменено на сервере." \
+      || { err "Отменено пользователем."; exit 1; }
+    case "$CHOICE" in
+      1) break ;;
+      2) ask_domains; dns_preflight; export USE_WEB DOMAIN_WEB WEB_AD_TAG ;;
+      *) err "Отменено пользователем."; exit 1 ;;
+    esac
+  else
+    if ask_yes_no "Начать выполнение сейчас?" "1"; then break; fi
+    err "Отменено пользователем."
+    exit 1
+  fi
+done
+
+# Запоминаем ответы (без паролей, токенов и ключей): если установка прервётся или в чём-то ошибётесь,
+# повторный запуск предложит продолжить с этого места.
+PROTO_SELECTED="${PROTO_SELECTED:-}"; [ "${#PROTO_STATE[@]}" -gt 0 ] && proto_pack
+setup_save || warn "Не удалось сохранить ответы в ${SETUP_ENV} — продолжить запуск потом не получится."
 
 # ---------------------------------------------------------------------------
 # Пайплайн: этапы с общим прогрессом и проверкой результата
 # ---------------------------------------------------------------------------
 FAIL_LOG=()
 STEP_NO=0
+declare -A STEP_RAN=()
+# Подключение ноды к панели зависит от профиля и ноды: если любой из них выполнялся заново — проверяем и его.
+live_nodelink() { [ -z "${STEP_RAN[node]:-}" ] && [ -z "${STEP_RAN[profile]:-}" ]; }
 if [ "$ROLE" = "1" ]; then
   TOTAL_STEPS=5; [ "$USE_BBR" = "1" ] && TOTAL_STEPS=6
   [ "$HAS_XRAY" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))     # Remnanode
@@ -474,11 +689,21 @@ fi
 [ "${USE_API:-0}" = "1" ] && [ "${PROFILE_CREATE_NODE:-0}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
 [ "$ROLE" = "1" ] && [ "${USE_WEB:-0}" = "1" ] && TOTAL_STEPS=$((TOTAL_STEPS+1))
 
-# run_step "Название" функция_этапа [функция_проверки]
+# run_step "Название" функция_этапа [функция_проверки] [id] [функция_отпечатка] [функция_«работает ли сейчас»]
+# С id и отпечатком этап запоминается: при повторном запуске он пропускается, если уже выполнен с теми же
+# параметрами и действительно работает (RESUME_SKIP=1). Результат (ok/fail) записывается в любом случае.
 run_step() {
-  local title="${1:-step}" fn="$2" vfn="${3:-}" failed=0
+  local title="${1:-step}" fn="$2" vfn="${3:-}" sid="${4:-}" fpfn="${5:-}" livefn="${6:-}" failed=0 fp=""
   STEP_NO=$((STEP_NO+1))
   step_n "$STEP_NO" "$TOTAL_STEPS" "$title"
+  [ -n "$sid" ] && [ -n "$fpfn" ] && fp="$("$fpfn")"
+  if [ "${RESUME_SKIP:-0}" = "1" ] && [ -n "$sid" ] && [ -n "$fp" ] && step_done "$sid" "$fp" \
+     && { [ -z "$livefn" ] || "$livefn" &>/dev/null; }; then
+    ok "${C_BOLD}${title}${C_RESET} — уже настроено и работает, пропускаю"
+    SKIPPED_STEPS+=("$title")
+    return 0
+  fi
+  [ -n "$sid" ] && STEP_RAN[$sid]=1      # этап реально выполнялся в этом запуске (зависимые за ним перезапускаются)
   export DORIK_NESTED=1
   "$fn" || failed=1
   export DORIK_NESTED=0
@@ -492,13 +717,16 @@ run_step() {
     err "${title} — ОШИБКА (продолжаю дальше, см. итог в конце)"
     FAIL_LOG+=("$title")
   fi
+  # запомнить результат: при ошибке этап повторится при следующем запуске
+  [ -n "$sid" ] && [ -n "$fp" ] && step_record "$sid" "$fp" "$([ "$failed" -eq 0 ] && echo ok || echo fail)"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
 # ЭТАП. Обновление пакетов
 # ---------------------------------------------------------------------------
 do_apt() { apt_upgrade_smart; }
-run_step "Обновление пакетов" do_apt verify_apt
+run_step "Обновление пакетов" do_apt verify_apt apt fp_apt
 
 # ---------------------------------------------------------------------------
 # ЭТАП. SSH (безопасная миграция порта) + firewall + fail2ban + таймзона + ребут
@@ -606,7 +834,11 @@ vf_ssh_and_protect() {
   verify_firewall "$NEW_SSH_PORT" "$ROLE" "$USE_HY2" "$([ "$OPEN_NODE_PORT" = "1" ] && echo "$NODE_PORT")" "$ENABLE_REBOOT" || rc=1
   return $rc
 }
-run_step "SSH, firewall, fail2ban, расписание" do_ssh_and_protect vf_ssh_and_protect
+# Этап быстрый и меняет правила firewall — всегда выполняется заново (id без «живой» проверки не пропускается:
+# отпечаток записывается только для сводки прошлого запуска).
+RESUME_SKIP_SAVE="$RESUME_SKIP"; RESUME_SKIP=0
+run_step "SSH, firewall, fail2ban, расписание" do_ssh_and_protect vf_ssh_and_protect ssh fp_ssh
+RESUME_SKIP="$RESUME_SKIP_SAVE"
 
 # ---------------------------------------------------------------------------
 # Дальше — только для роли "нода"
@@ -620,21 +852,21 @@ if [ "$ROLE" = "1" ]; then
     DOMAIN_WEB="$DOMAIN_WEB" USE_WEB="$USE_WEB" WEB_SERVER="$WEB_SERVER" \
     INSTALL_DECOY="$INSTALL_DECOY" NONINTERACTIVE=1 bash "$src"
   }
-  run_step "$(ws_label "$WEB_SERVER") (self-steal) + HAProxy + сертификаты" do_nginx_haproxy
+  run_step "$(ws_label "$WEB_SERVER") (self-steal) + HAProxy + сертификаты" do_nginx_haproxy "" web fp_web live_web
 
   if [ "$USE_BBR" = "1" ]; then
     do_bbr() {
       local src; src="$(get_script bbr-install.sh)" || { err "Не удалось получить bbr-install.sh"; return 1; }
       NONINTERACTIVE=1 bash "$src"
     }
-    run_step "BBR + сетевая оптимизация" do_bbr
+    run_step "BBR + сетевая оптимизация" do_bbr "" bbr fp_bbr live_bbr
   fi
 
   # Профиль и хосты создаём ДО запуска ноды: заглушки и сертификаты уже готовы, а панель,
   # получив ноду с привязанным профилем, сама подключится к ней, как только та поднимется.
   if [ "${USE_API:-0}" = "1" ]; then
     do_profile() { profile_apply; }
-    run_step "Профиль и хосты на панели (API)" do_profile
+    run_step "Профиль и хосты на панели (API)" do_profile "" profile fp_profile live_profile
   fi
 
   do_remnanode() {
@@ -642,7 +874,7 @@ if [ "$ROLE" = "1" ]; then
     NODE_PORT="$NODE_PORT" USE_HY2="$USE_HY2" SECRET_KEY="$SECRET_KEY" \
       DOMAIN_HY2="$DOMAIN_HY2" NONINTERACTIVE=1 bash "$src"
   }
-  [ "$HAS_XRAY" = "1" ] && run_step "Remnanode (Docker$([ "$USE_HY2" = "1" ] && echo " + Hysteria2"))" do_remnanode
+  [ "$HAS_XRAY" = "1" ] && run_step "Remnanode (Docker$([ "$USE_HY2" = "1" ] && echo " + Hysteria2"))" do_remnanode "" node fp_node live_node
 
   if [ "${USE_API:-0}" = "1" ] && [ "${PROFILE_CREATE_NODE:-0}" = "1" ]; then
     do_node_link() {
@@ -654,7 +886,7 @@ if [ "$ROLE" = "1" ]; then
       warn "Проверьте: порт ноды ${NODE_PORT} открыт для IP панели; адрес ноды на панели верный; docker logs remnanode --tail 30"
       return 1
     }
-    run_step "Подключение ноды к панели" do_node_link
+    run_step "Подключение ноды к панели" do_node_link "" nodelink fp_nodelink live_nodelink
   fi
 
   # WEB-прокси Telegram: домен, сертификат, nginx-сайт и маршрут HAProxy уже сделал этап nginx/HAProxy
@@ -664,7 +896,7 @@ if [ "$ROLE" = "1" ]; then
       local src; src="$(get_script webproxy-setup.sh)" || { err "Не удалось получить webproxy-setup.sh"; return 1; }
       DOMAIN_WEB="$DOMAIN_WEB" WEB_AD_TAG="$WEB_AD_TAG" WEB_SECRET="$WEB_SECRET" WEB_FRONT_DONE=1 WEB_NONINTERACTIVE=1 bash "$src" install
     }
-    run_step "WEB-прокси Telegram (Telemt)" do_webproxy
+    run_step "WEB-прокси Telegram (Telemt)" do_webproxy "" webproxy fp_webproxy live_webproxy
   fi
 
 fi
@@ -683,7 +915,7 @@ if [ "$DO_HARDEN" = "1" ]; then
   fi
   export HARDEN_EXPECT
   do_harden() { SSH_DISABLE_PASSWORD="$SSH_PW_OFF" harden_run; }
-  run_step "Закрытие лишних портов и укрепление" do_harden
+  run_step "Закрытие лишних портов и укрепление" do_harden "" harden fp_harden live_harden
 fi
 
 # ---------------------------------------------------------------------------
@@ -691,7 +923,7 @@ fi
 # ---------------------------------------------------------------------------
 if [ "$SCAN_BLOCKLIST" = "1" ]; then
   do_scanblock() { PANEL_IP="${PANEL_IP:-}" scanblock_on; }
-  run_step "Блок-лист сетей сканеров" do_scanblock
+  run_step "Блок-лист сетей сканеров" do_scanblock "" scanblock fp_scanblock live_scanblock
 fi
 
 # ---------------------------------------------------------------------------
@@ -731,7 +963,10 @@ if [ "${#FAIL_LOG[@]}" -eq 0 ]; then
 else
   box_top "Готово, но есть замечания"
   for f in "${FAIL_LOG[@]}"; do box_row "${C_R}✖${C_RESET} ${f}"; done
-  box_row "${C_DIM}Скрипт идемпотентен — можно запустить повторно.${C_RESET}"
+  box_wrap "${C_DIM}→${C_RESET}" "Запустите полную настройку снова и выберите «Продолжить»: скрипт выполнит только недоделанное, а готовое пропустит. Ошиблись в домене — «Изменить домены»."
+fi
+if [ "${#SKIPPED_STEPS[@]}" -gt 0 ]; then
+  box_row "${C_DIM}Пропущено как уже настроенное: ${#SKIPPED_STEPS[@]}${C_RESET}"
 fi
 box_sep
 box_row "SSH-порт:        ${C_BOLD}${NEW_SSH_PORT}${C_RESET}"
