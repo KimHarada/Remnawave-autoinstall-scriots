@@ -18,6 +18,7 @@
 #                    передаётся как cookie, иначе nginx-защита панели не пропустит API
 #   PANEL_API_TOKEN  токен (панель → Настройки → API-токены)
 #   PROFILE_PREFIX (NL) · PROFILE_NAME · COUNTRY_CODE · PSIPHON=1|0 · PROFILE_CREATE_NODE=1|0
+#   FINAL_MASK=1|0 (фрагментация ClientHello на TCP-хостах; своя маска: FINAL_MASK_JSON)
 #   NODE_ADDRESS (по умолчанию публичный IP) · TG_EXTRA_DOMAINS="a.com b.com"
 #   RW_CURL_OPTS — доп. параметры curl (например -k для самоподписанного сертификата)
 
@@ -326,14 +327,28 @@ load_inbounds() {  # заполняет IB_UUID[tag] из профиля
   [ "${#IB_UUID[@]}" -gt 0 ] || { err "В профиле не нашлось ни одного inbound'а — панель отклонила конфиг?"; return 1; }
 }
 
+# Final Mask — последний слой маскировки на клиенте (поле хоста «Final Mask» в панели). Здесь —
+# фрагментация TLS ClientHello: рукопожатие уходит несколькими мелкими пакетами, и DPI, который
+# ищет SNI в первом пакете, его не видит. Только для TCP-хостов (у Hysteria2 нет ClientHello по TCP).
+# Включить: FINAL_MASK=1. Свой JSON: FINAL_MASK_JSON='{"tcp":[...]}'.
+# В текущих версиях Xray поля называются lengths/delays/maxSplit (xtls.github.io → FinalMask),
+# а в совете из Telegram — length/interval: какой вариант примет ядро клиента, зависит от его версии.
+FINAL_MASK_DEFAULT='{"tcp":[{"type":"fragment","settings":{"length":"10-20","packets":"tlshello","interval":"10-20"}}]}'
+
 host_body() {  # host_body <proto> — JSON хоста для API
-  local p="$1" d fp tag
+  local p="$1" d fp tag fm=""
   d="${PDOM[$p]}"; tag="${P_TAG[$p]}"; fp="$(st_get ".protocols.${p}.fingerprint")"
+  if [ "$p" != "hy2" ] && [ "${FINAL_MASK:-0}" = "1" ]; then
+    fm="${FINAL_MASK_JSON:-$FINAL_MASK_DEFAULT}"
+    jq -e . >/dev/null 2>&1 <<<"$fm" || { warn "FINAL_MASK_JSON — невалидный JSON, беру значение по умолчанию."; fm="$FINAL_MASK_DEFAULT"; }
+  fi
+  # Если фрагментация выключена, поле finalMask НЕ отправляем: так не затираем маску, заданную в панели вручную.
   jq -nc --arg cp "$PROFILE_UUID" --arg ib "${IB_UUID[$tag]}" --arg remark "${P_REMARK[$p]}" --arg addr "$d" \
-         --arg fp "$fp" --arg path "$(st_get '.protocols.xhttp.path')" --arg proto "$p" '
+         --arg fp "$fp" --arg path "$(st_get '.protocols.xhttp.path')" --arg proto "$p" --arg fm "$fm" '
     {inbound:{configProfileUuid:$cp, configProfileInboundUuid:$ib}, remark:$remark, address:$addr, port:443, sni:$addr}
     + (if $proto=="hy2" then {alpn:"h3"} else {fingerprint:$fp} end)
-    + (if $proto=="xhttp" then {host:$addr, path:$path} else {} end)'
+    + (if $proto=="xhttp" then {host:$addr, path:$path} else {} end)
+    + (if $fm != "" then {finalMask:($fm | fromjson)} else {} end)'
 }
 
 upsert_hosts() {
@@ -470,6 +485,11 @@ profile_collect_params() {
   if [ -z "${PSIPHON:-}" ]; then
     if ask_yes_no "Маршрут Gemini/AI Studio через psiphon (172.17.0.1:1080, как в вашем конфиге)?" "1"; then PSIPHON=1; else PSIPHON=0; fi
   fi
+  if [ -z "${FINAL_MASK:-}" ]; then
+    # Без вопросов (cloud-init) по умолчанию выключено: не меняем поведение уже настроенных серверов.
+    if ask_yes_no "Фрагментация ClientHello (Final Mask) на TCP-хостах? Мешает DPI видеть SNI; клиенты с очень старым ядром Xray могут её не понять" "$([ "${ASSUME_YES:-0}" = "1" ] && echo 2 || echo 1)"; then FINAL_MASK=1; else FINAL_MASK=0; fi
+  fi
+  export FINAL_MASK
   # Нода создаётся на панели сама (SECRET_KEY панель выдаёт по API — вручную ничего копировать не нужно).
   # Не создавать: PROFILE_CREATE_NODE=0.
   PROFILE_CREATE_NODE="${PROFILE_CREATE_NODE:-1}"
