@@ -70,11 +70,22 @@ rw_api() {  # rw_api <METHOD> <path> [json-тело] — тело ответа �
     [ -n "$RW_COOKIE" ] && echo "Cookie: ${RW_COOKIE}"
     case "$RW_BASE" in http://*) echo 'X-Forwarded-For: 127.0.0.1'; echo 'X-Forwarded-Proto: https' ;; esac
   } > "$hdr"
-  local -a args=(-sS --max-time 40 -X "$m" -H "@${hdr}" -H 'Content-Type: application/json')
+  # --connect-timeout 10: недоступная панель определяется за 10 секунд, а не за 40.
+  local -a args=(-sS --connect-timeout 10 --max-time 40 -X "$m" -H "@${hdr}" -H 'Content-Type: application/json')
   # shellcheck disable=SC2206
   [ -n "${RW_CURL_OPTS:-}" ] && args+=($RW_CURL_OPTS)
   [ -n "$body" ] && args+=(--data-binary "$body")
+  [ "${RW_FORCE4:-0}" = "1" ] && args+=(-4)
   out="$(curl "${args[@]}" -w $'\n%{http_code}' "${RW_BASE}${p}" 2>&1)"; rc=$?
+  # Не соединились/таймаут: у домена часто есть AAAA-запись, а IPv6 с этого сервера не работает.
+  # Пробуем IPv4 и, если сработало, дальше ходим только по нему.
+  if { [ "$rc" -eq 28 ] || [ "$rc" -eq 7 ]; } && [ "${RW_FORCE4:-0}" != "1" ]; then
+    out="$(curl "${args[@]}" -4 -w $'\n%{http_code}' "${RW_BASE}${p}" 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+      RW_FORCE4=1
+      warn "До панели не отвечает IPv6 — перешёл на IPv4 (проверьте, что у сервера работает IPv6 или уберите AAAA-запись домена панели)."
+    fi
+  fi
   rm -f "$hdr"
   if [ "$rc" -ne 0 ]; then
     RW_LAST_CODE=000; RW_BODY="$out"; return 1
@@ -86,7 +97,17 @@ rw_api() {  # rw_api <METHOD> <path> [json-тело] — тело ответа �
 rw_fail() {  # rw_fail <что делали> — понятное сообщение об ошибке API
   local msg
   if [ "$RW_LAST_CODE" = "000" ]; then
+    local host ips
+    host="${RW_BASE#*://}"; host="${host%%[:/]*}"
+    ips="$(getent ahosts "$host" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')"
     err "$1: панель недоступна по ${RW_BASE} (${RW_BODY:0:120})"
+    if [ -z "$ips" ]; then
+      err "Имя ${host} не разрешается в IP: проверьте DNS-запись домена панели."
+    else
+      err "${host} → ${ips}"
+      err "С ЭТОГО сервера до панели нет соединения: панель должна быть доступна с IP ноды (firewall панели или хостера, Cloudflare, блокировка по IP/стране, блок-лист сетей на сервере панели)."
+      err "Проверка вручную:  curl -4 -vI --max-time 10 ${RW_BASE}    и    curl -6 -vI --max-time 10 ${RW_BASE}"
+    fi
     return 1
   fi
   msg="$(jq -r '[.message // empty, (.errors[]? | "\(.path|join(".")): \(.message)")] | map(select(. != null)) | .[0:3] | join("; ")' <<<"$RW_BODY" 2>/dev/null)"

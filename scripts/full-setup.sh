@@ -323,11 +323,29 @@ if [ "$ROLE" = "1" ]; then
   [ -f "$NODE_DIR/docker-compose.yml" ] && \
     OLD_KEY=$(grep -oE 'SECRET_KEY=.*' "$NODE_DIR/docker-compose.yml" | head -1 | sed 's/SECRET_KEY=//')
   if [ "$USE_API" = "1" ]; then
-    # Ключ ноды общий для панели — берём по API, вставлять вручную не нужно.
-    SECRET_KEY="$(fetch_secret_key)" || exit 1
-    [ -n "$SECRET_KEY" ] || { err "Панель не вернула SECRET_KEY."; exit 1; }
-    ok "SECRET_KEY получен от панели по API"
-  else
+    # Ключ ноды общий для панели — берём по API, вставлять вручную не нужно. Панель может быть
+    # временно недоступна — пробуем трижды, а если не вышло, предлагаем ввести ключ вручную
+    # (тогда профиль на панели по API не создаётся — его и ноду добавите в панели сами).
+    SECRET_KEY=""
+    for try in 1 2 3; do
+      SECRET_KEY="$(fetch_secret_key)" && [ -n "$SECRET_KEY" ] && break
+      SECRET_KEY=""
+      [ "$try" -lt 3 ] && { warn "Не получилось (попытка ${try}/3), повторяю через 5 с..."; sleep 5; }
+    done
+    if [ -n "$SECRET_KEY" ]; then
+      ok "SECRET_KEY получен от панели по API"
+    else
+      err "Не удалось получить SECRET_KEY от панели."
+      [ "${ASSUME_YES:-0}" = "1" ] && exit 1
+      if ask_yes_no "Продолжить без API: ввести SECRET_KEY вручную и создать профиль и хосты в панели самому?" "1"; then
+        USE_API=0; PROFILE_CREATE_NODE=0
+        warn "Профиль, хосты и нода на панели по API не создаются: добавите их в панели сами."
+      else
+        err "Отменено пользователем."; exit 1
+      fi
+    fi
+  fi
+  if [ "$USE_API" != "1" ]; then
     while true; do
       if [ -n "$OLD_KEY" ]; then
         SECRET_KEY=$(ask_value "SECRET_KEY ноды (Enter — оставить текущий)" "${SECRET_KEY:-}")
