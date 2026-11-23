@@ -165,7 +165,9 @@ dns_preflight() {
     bad=0
     for d in "$DOMAIN_TCP" "$DOMAIN_GRPC" "$DOMAIN_XHTTP" "$DOMAIN_HY2" "$DOMAIN_TG" "$DOMAIN_WEB"; do
       [ -z "$d" ] && continue
-      if dns_points_here "$d" "$PREFLIGHT_PUB_IP"; then
+      if cert_is_valid "$d" && [ -s "/etc/letsencrypt/live/$d/privkey.pem" ]; then
+        ok "${d}: действующий сертификат уже установлен."
+      elif dns_points_here "$d" "$PREFLIGHT_PUB_IP"; then
         ok "${d}: DNS указывает на этот сервер."
       else
         resolved="$(resolve_a "$d")"
@@ -242,19 +244,30 @@ _all_domains() { echo "${DOMAIN_TCP:-}" "${DOMAIN_GRPC:-}" "${DOMAIN_XHTTP:-}" "
 # Для отпечатка домены идут через «|» с пустыми полями: иначе «tcp пуст, grpc=a» совпало бы с «tcp=a, grpc пуст».
 _domains_fp()  { echo "${DOMAIN_TCP:-}|${DOMAIN_GRPC:-}|${DOMAIN_XHTTP:-}|${DOMAIN_HY2:-}|${DOMAIN_TG:-}|${DOMAIN_WEB:-}"; }
 fp_apt()       { date +%Y%m%d; }
-fp_ssh()       { fp_make "${NEW_SSH_PORT:-}" "${ROLE:-}" "${USE_HY2:-}" "$(hy2_port)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${PANEL_IP:-}" "${ENABLE_REBOOT:-}"; }
-fp_web()       { fp_make "${WEB_SERVER:-}" "${INSTALL_DECOY:-}" "${SCAN_PROTECT:-}" "${USE_HY2:-}" "${USE_TG:-}" "${USE_WEB:-}" "$(_domains_fp)"; }
+fp_ssh()       { fp_make "${NEW_SSH_PORT:-}" "${ROLE:-}" "${USE_HY2:-}" "$(hy2_port)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${PANEL_IP:-}" "${ENABLE_REBOOT:-}" "$(tcp_public_port)"; }
+fp_web()       { fp_make "${WEB_SERVER:-}" "${INSTALL_DECOY:-}" "${SCAN_PROTECT:-}" "${USE_HY2:-}" "${USE_TG:-}" "${USE_WEB:-}" "$(_domains_fp)" "tls-site-v2" "$(tcp_public_port)"; }
 fp_bbr()       { fp_make "${USE_BBR:-}"; }
-fp_profile()   { fp_make "$(_domains_fp)" "$(hy2_port)" "${PROFILE_PREFIX:-}" "${PROFILE_NAME:-}" "${COUNTRY_CODE:-}" "${PSIPHON:-}" "${FINAL_MASK:-}" "${SCAN_PROTECT:-}" "${PROFILE_CREATE_NODE:-}" "${NODE_PORT:-}"; }
+fp_profile() {
+  local -a route=()
+  if [ "${PROFILE_ROUTE:-direct}" != direct ]; then
+    local hash
+    hash="$(sha256sum -- "${PROFILE_EXIT_FILE:-/etc/dorik/exit.json}" 2>/dev/null)"
+    route=("$PROFILE_ROUTE" "${PROFILE_EXIT_FILE:-}" "${hash%% *}")
+  fi
+  fp_make "$(_domains_fp)" "$(hy2_port)" "${PROFILE_PREFIX:-}" "${PROFILE_NAME:-}" "${COUNTRY_CODE:-}" \
+    "${PSIPHON:-}" "${FINAL_MASK:-}" "${SCAN_PROTECT:-}" "${PROFILE_CREATE_NODE:-}" "${NODE_PORT:-}" "${route[@]}" \
+    "doh-v2" "$(tcp_public_port)" "${HOST_CONNECT_ADDRESS:-}" ${SQUAD_NAME:+"${SQUAD_NAME}"}
+}
 fp_node()      { fp_make "${NODE_PORT:-}" "${USE_HY2:-}" "${DOMAIN_HY2:-}"; }
 fp_nodelink()  { fp_make "$(fp_profile)" "$(fp_node)"; }
-fp_webproxy()  { fp_make "${DOMAIN_WEB:-}" "${WEB_AD_TAG:-}"; }
-fp_harden()    { fp_make "${NEW_SSH_PORT:-}" "${USE_HY2:-}" "$(hy2_port)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${SSH_PW_OFF:-}" "${SCAN_PROTECT:-}" "${ROLE:-}"; }
+fp_webproxy()  { fp_make "${DOMAIN_WEB:-}" "${WEB_AD_TAG:-}" "$(tcp_public_port)"; }
+fp_harden()    { fp_make "${NEW_SSH_PORT:-}" "${USE_HY2:-}" "$(hy2_port)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${SSH_PW_OFF:-}" "${SCAN_PROTECT:-}" "${ROLE:-}" "$(tcp_public_port)"; }
 fp_scanblock() { fp_make "${SCAN_BLOCKLIST:-}" "${PANEL_IP:-}"; }
 
 live_web() {
   local d
   svc_active haproxy && svc_active "${WEB_SERVER:-nginx}" && [ -s /etc/dorik/decoys.conf ] || return 1
+  [ -s "$TCP_PORT_FILE" ] && [ "$(cat "$TCP_PORT_FILE")" = "$(tcp_public_port)" ] || return 1
   for d in $(_all_domains); do
     cert_is_valid "$d" && grep -q "|${d}|" /etc/dorik/decoys.conf || return 1
   done
@@ -280,7 +293,7 @@ resume_secrets() {
   if [ "$need_api" = "1" ]; then
     info "Часть этапов панели не выполнена — нужен доступ к панели (токен в файле не хранится)."
     wait_prefetch                          # для работы с API нужен jq из базовых пакетов
-    profile_collect_params || exit 1
+    profile_collect_params resume || exit 1
   fi
   if [ "$need_key" = "1" ]; then acquire_secret_key; fi
 }
@@ -347,7 +360,9 @@ if [ "$RESUME_MODE" = "continue" ] || [ "$RESUME_MODE" = "domains" ]; then
   step "Продолжаю прошлый запуск"
   ROLE="${ROLE:-1}"
   if [ "$ROLE" = "1" ]; then
-    preflight_run --docker --certs --ports "80 443" || exit 1
+    TCP_PORT="$(tcp_public_port)"
+    is_proxy_tcp_port "$TCP_PORT" || { err "Недопустимый TCP_PORT: $TCP_PORT"; exit 1; }
+    preflight_run --docker --certs --ports "80 $TCP_PORT" || exit 1
   else
     preflight_run || exit 1
   fi
@@ -355,9 +370,13 @@ if [ "$RESUME_MODE" = "continue" ] || [ "$RESUME_MODE" = "domains" ]; then
   CUR_SSH_PORT=${CUR_SSH_PORT:-$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')}
   CUR_SSH_PORT=${CUR_SSH_PORT:-22}
   NEW_SSH_PORT="${NEW_SSH_PORT:-$CUR_SSH_PORT}"
+  if [ "$ROLE" = "1" ] && { [ "$TCP_PORT" = "$NEW_SSH_PORT" ] || [ "$TCP_PORT" = "${NODE_PORT:-}" ]; }; then
+    err "Клиентский TCP-порт совпадает с портом SSH или Remnanode."; exit 1
+  fi
   # Чего нет в сохранённом файле (он мог быть записан старой версией) — значения по умолчанию.
   : "${INSTALL_DECOY:=1}" "${USE_BBR:=0}" "${USE_API:=0}" "${OPEN_NODE_PORT:=0}" "${ENABLE_REBOOT:=1}"
   : "${DO_HARDEN:=1}" "${SSH_PW_OFF:=0}" "${SCAN_PROTECT:=1}" "${SCAN_BLOCKLIST:=0}" "${PROFILE_CREATE_NODE:=0}"
+  : "${PROFILE_ROUTE:=direct}"
   : "${PANEL_IP:=}" "${NODE_PORT:=}" "${WEB_AD_TAG:=}" "${WEB_SERVER:=$(ws_current)}"
   SECRET_KEY="${SECRET_KEY:-}"; WEB_SECRET="${WEB_SECRET:-}"
   export SCAN_PROTECT SCAN_BLOCKLIST WEB_SERVER HY2_PORT FINAL_MASK PSIPHON
@@ -383,12 +402,15 @@ ask_choice "РОЛЬ СЕРВЕРА" "$ROLE" \
   "Сервер панели|Только защита сервера, на котором работает панель Remnawave: SSH, firewall (открыты SSH, 80 и 443), fail2ban, укрепление. Саму панель ставит пункт меню «Панель Remnawave»." \
   || { err "Отменено пользователем."; exit 1; }
 ROLE="$CHOICE"
+TCP_PORT="$(tcp_public_port)"
 
 # Роль известна — проверяем окружение до остальных вопросов, чтобы не гонять
 # пользователя по вопросам, если установка всё равно невозможна.
 if [ "$ROLE" = "1" ]; then
-  preflight_run --docker --certs --ports "80 443" || exit 1
+  TCP_PORT="$(ask_valid "TCP-порт для клиентов (443 или 5000–65535)" "$TCP_PORT" is_proxy_tcp_port)" || exit 1
+  preflight_run --docker --certs --ports "80 $TCP_PORT" || exit 1
 else
+  TCP_PORT=443
   preflight_run || exit 1
 fi
 
@@ -398,7 +420,7 @@ CUR_SSH_PORT=${CUR_SSH_PORT:-22}
 info "Текущий SSH порт: ${CUR_SSH_PORT}"
 NEW_SSH_PORT=$(ask_valid "Новый SSH порт (Enter — оставить как есть)" "${NEW_SSH_PORT:-$CUR_SSH_PORT}" is_valid_port) || exit 1
 # 80/443 заняты под certbot/HAProxy — SSH на них посадить нельзя.
-while [ "$NEW_SSH_PORT" = "80" ] || [ "$NEW_SSH_PORT" = "443" ]; do
+while [ "$NEW_SSH_PORT" = "80" ] || [ "$NEW_SSH_PORT" = "$TCP_PORT" ]; do
   err "Порт ${NEW_SSH_PORT} нужен под HTTPS/сертификаты — выберите другой порт для SSH."
   [ "${ASSUME_YES:-0}" = "1" ] && exit 1
   NEW_SSH_PORT=$(ask_valid "Новый SSH порт" "" is_valid_port) || exit 1
@@ -475,7 +497,7 @@ if [ "$ROLE" = "1" ]; then
     box_top "Реклама канала: регистрация в @MTProxybot (по желанию)"
     box_row "Бот: ${C_BOLD}https://t.me/MTProxybot${C_RESET}"
     box_row "1. Отправьте боту: /newproxy"
-    box_row "2. Адрес:  ${C_BOLD}${DOMAIN_WEB}:443${C_RESET}"
+    box_row "2. Адрес:  ${C_BOLD}${DOMAIN_WEB}:${TCP_PORT}${C_RESET}"
     box_row "3. Ключ:   ${C_BOLD}${WEB_SECRET}${C_RESET}"
     box_row "4. Тег из бота (32 символа) введите ниже; пропустить можно"
     box_bottom
@@ -525,7 +547,7 @@ if [ "$ROLE" = "1" ]; then
   NODE_PORT=$(ask_valid "Порт remnanode (для связи с панелью)" "${NODE_PORT:-${EXISTING_NODE_PORT:-$DEFAULT_NODE_PORT}}" is_valid_port) || exit 1
   # Порт ноды не должен совпадать с SSH, 80 и 443: иначе один из сервисов не поднимется,
   # а проверка «порт слушает» ошибочно сочтёт успехом чужой процесс.
-  while [ "$NODE_PORT" = "$NEW_SSH_PORT" ] || [ "$NODE_PORT" = "80" ] || [ "$NODE_PORT" = "443" ]; do
+  while [ "$NODE_PORT" = "$NEW_SSH_PORT" ] || [ "$NODE_PORT" = "80" ] || [ "$NODE_PORT" = "$TCP_PORT" ]; do
     err "Порт ноды ${NODE_PORT} уже занят под SSH/HTTPS — выберите другой."
     [ "${ASSUME_YES:-0}" = "1" ] && exit 1
     NODE_PORT=$(ask_valid "Порт remnanode" "" is_valid_port) || exit 1
@@ -605,6 +627,7 @@ box_top "План выполнения"
 box_row "Роль:               $([ "$ROLE" = "1" ] && echo "нода" || echo "сервер панели (только защита)")"
 if [ "$ROLE" = "1" ]; then
   box_wrap "Протоколы:        " "$PROTO_LIST"
+  box_row "Клиентский порт:    $(tcp_public_port)/tcp"
   box_row "Веб-сервер:         $(ws_label "$WEB_SERVER") ${C_DIM}(заглушки self-steal)${C_RESET}"
 fi
 if [ "$NEW_SSH_PORT" != "$CUR_SSH_PORT" ]; then
@@ -615,6 +638,7 @@ fi
 if [ "$ROLE" = "1" ]; then
   box_wrap "Домены:           " "${DOMAIN_TCP:+${DOMAIN_TCP} }${DOMAIN_GRPC:+${DOMAIN_GRPC} }${DOMAIN_XHTTP:+${DOMAIN_XHTTP} }${DOMAIN_HY2:+${DOMAIN_HY2} }${DOMAIN_TG:+${DOMAIN_TG} }${DOMAIN_WEB:+${DOMAIN_WEB} (WEB-прокси)}"
   if [ "$USE_API" = "1" ]; then
+    box_wrap "Маршрут" "$(profile_route_label)"
     box_row "Профиль на панели: ${C_BOLD}${PROFILE_NAME}${C_RESET}  ${C_DIM}(хосты + SECRET_KEY по API)${C_RESET}"
     box_row "                    $([ "$PROFILE_CREATE_NODE" = "1" ] && echo "нода на панели создаётся" || echo "ноду на панели создадите сами")$([ -n "$DOMAIN_TG" ] && echo "; есть Telegram-хост")"
   elif [ "$HAS_XRAY" = "1" ]; then
@@ -767,7 +791,7 @@ do_protect_common() {
 
     if [ "$ROLE" = "1" ]; then
       ufw allow 80/tcp comment "HTTP (certbot)" &>/dev/null || true
-      ufw allow 443/tcp comment "HTTPS TCP" &>/dev/null || true
+      ufw allow "$(tcp_public_port)/tcp" comment "HTTPS TCP" &>/dev/null || true
       # Прежнее правило Hysteria2 (другой порт от прошлого запуска) убираем — иначе старый порт остался бы открытым.
       ufw_delete_matching 'Hysteria2'
       [ "$USE_HY2" = "1" ] && { ufw allow "$(hy2_port)/udp" comment "Hysteria2" &>/dev/null || true; }
@@ -850,7 +874,7 @@ if [ "$ROLE" = "1" ]; then
     DOMAIN_TCP="$DOMAIN_TCP" DOMAIN_GRPC="$DOMAIN_GRPC" DOMAIN_XHTTP="$DOMAIN_XHTTP" \
     DOMAIN_HY2="$DOMAIN_HY2" USE_HY2="$USE_HY2" DOMAIN_TG="$DOMAIN_TG" USE_TG="$USE_TG" \
     DOMAIN_WEB="$DOMAIN_WEB" USE_WEB="$USE_WEB" WEB_SERVER="$WEB_SERVER" \
-    INSTALL_DECOY="$INSTALL_DECOY" NONINTERACTIVE=1 bash "$src"
+    INSTALL_DECOY="$INSTALL_DECOY" TCP_PORT="$TCP_PORT" NONINTERACTIVE=1 bash "$src"
   }
   run_step "$(ws_label "$WEB_SERVER") (self-steal) + HAProxy + сертификаты" do_nginx_haproxy "" web fp_web live_web
 
@@ -908,12 +932,12 @@ fi
 if [ "$DO_HARDEN" = "1" ]; then
   # Нужные порты объявляем один раз на весь запуск: их используют и сам этап укрепления,
   # и итоговая перепроверка — иначе она «критиковала» бы результат, не зная выбранной роли.
-  HARDEN_EXPECT="${NEW_SSH_PORT}/tcp 80/tcp 443/tcp"
+  HARDEN_EXPECT="${NEW_SSH_PORT}/tcp 80/tcp ${TCP_PORT:-443}/tcp"
   if [ "$ROLE" = "1" ]; then
     [ "$USE_HY2" = "1" ] && HARDEN_EXPECT+=" $(hy2_port)/udp"
     [ "$OPEN_NODE_PORT" = "1" ] && HARDEN_EXPECT+=" ${NODE_PORT}/tcp"
   fi
-  export HARDEN_EXPECT
+  export HARDEN_EXPECT TCP_PORT
   do_harden() { SSH_DISABLE_PASSWORD="$SSH_PW_OFF" harden_run; }
   run_step "Закрытие лишних портов и укрепление" do_harden "" harden fp_harden live_harden
 fi

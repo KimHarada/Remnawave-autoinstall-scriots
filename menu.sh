@@ -153,7 +153,7 @@ case "$ARG" in
   --full)          run_script full-setup.sh; exit $? ;;
   --bbr)           run_script bbr-install.sh; exit $? ;;
   --doctor)        run_script doctor.sh; exit $? ;;
-  --profile)       run_script profile-setup.sh; exit $? ;;
+  --profile)       run_script profile-setup.sh "$@"; exit $? ;;
   --web)           run_script webproxy-setup.sh "$@"; exit $? ;;
   --harden)        run_script harden.sh; exit $? ;;
   --ports)         run_script harden.sh --audit; exit $? ;;
@@ -222,7 +222,7 @@ self_update() {
 main_menu() {
   local -a MM_L MM_D MM_K MM_M
   local sel=0 refresh=1
-  MM_L=("Полная настройка сервера" "Панель Remnawave" "Профиль и хосты на панели" "Обновить ноду" "Защита и порты"
+  MM_L=("Полная настройка сервера" "Панель Remnawave" "Профиль и маршрутизация" "Обновить ноду" "Защита и порты"
         "Проверка и исправление" "WEB-прокси Telegram" "Отчёт" "Дополнительно" "Состояние сервера" "Обновить тулкит")
   MM_K=(1 2 3 4 5 6 7 8 9 s u)
   while true; do
@@ -235,7 +235,7 @@ main_menu() {
     menu_desc "Установка и обновление панели Remnawave и страницы подписки. Перед панелью ставится Nginx или Caddy с сертификатом; панель можно скрыть за секретной ссылкой." \
       "Панель Remnawave" "Страница подп." "Docker"; MM_D+=("$REPLY")
     menu_mark "Панель Remnawave" "Страница подп."; MM_M+=("$REPLY")
-    menu_desc "Создаёт на панели профиль Xray с оптимизированным конфигом, хосты для каждого выбранного протокола и ноду этого сервера — по API, без ручного копирования. У каждого протокола свои ключи, shortId, отпечаток и заглушка." \
+    menu_desc "Создаёт профиль Xray и хосты в панели. Выберите прямой выход или каскад на отдельную ноду. Протокол между нодами задаётся независимо от протоколов клиентского подключения." \
       "Профиль панели" "Нода Remnanode"; MM_D+=("$REPLY")
     menu_mark "Профиль панели"; MM_M+=("$REPLY")
     menu_desc "Обновляет контейнер Remnanode до свежего образа и проверяет, что нода поднялась и слушает свой порт." \
@@ -338,8 +338,8 @@ web_menu() {
 advanced_menu() {
   local -a AM_L AM_D AM_K
   local did=1
-  AM_L=("Восстановить SSH-доступ" "Только BBR и сетевая оптимизация" "Только веб-сервер + HAProxy" "Только Remnanode" "Порт Hysteria2" "Ключ ноды (SECRET_KEY)")
-  AM_K=(1 2 3 4 5 6)
+  AM_L=("Восстановить SSH-доступ" "Только BBR и сетевая оптимизация" "Только веб-сервер + HAProxy" "Только Remnanode" "Порт Hysteria2" "Ключ ноды (SECRET_KEY)" "Файл выходной ноды")
+  AM_K=(1 2 3 4 5 6 7)
   AM_D=(
     "Экстренный случай: SSH перестал отвечать на нужном порту. Проверяет sshd, firewall и fail2ban и возвращает доступ."
     "Включает BBR и сетевые параметры ядра для ноды, ничего больше не трогая."
@@ -347,6 +347,7 @@ advanced_menu() {
     "Ставит или пересоздаёт только контейнер ноды Remnanode."
     "Меняет UDP-порт Hysteria2 на настроенной ноде: 443, случайный свободный или свой. Переносит правило firewall и предлагает обновить inbound и хост на панели по API; без этого нода останется на прежнем порту.${NL}${NL}@СЕЙЧАС${NL}$(hy2_port)/udp${NL}${NL}@КОМАНДА${NL}dorik hy2-port"
     "Меняет SECRET_KEY ноды без повторной установки. Нужен, если нода в панели «offline» с ошибкой «socket disconnected before secure TLS connection»: нода закрывает соединение, когда её ключ не совпадает с ключом панели. Новый ключ берут в панели (Ноды → нода → «Скопировать docker-compose.yml») либо запрашивают у панели по API. Заменяется только строка с ключом, прежний файл сохраняется, а если нода с новым ключом не поднялась — он возвращается.${NL}${NL}@КОМАНДЫ${NL}dorik node-key · dorik node-key api · dorik node-key show"
+    "Собирает файл подключения к этой выходной ноде по VLESS Reality TCP или Hysteria2. Понадобятся данные отдельного сервисного пользователя Remnawave. Получившийся файл укажите на входной ноде."
   )
   TUI_SEL=0
   while true; do
@@ -358,6 +359,7 @@ advanced_menu() {
       3) run_script remnanode-setup.sh ;;
       4) run_script hy2-port.sh ;;
       5) run_script node-key.sh ;;
+      6) run_script profile-setup.sh --exit-file ;;
     esac
     did=0
     pause

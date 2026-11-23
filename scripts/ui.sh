@@ -19,8 +19,9 @@ else
   C_RESET=""; C_BOLD=""; C_DIM=""; C_G=""; C_Y=""; C_R=""; C_B=""; C_M=""; C_W=""
 fi
 
-UI_W=64
 UI_COLS="$(tput cols 2>/dev/null || echo 80)"; [[ "$UI_COLS" =~ ^[0-9]+$ ]] || UI_COLS=80
+UI_W=64
+if [ "$UI_COLS" -ge 30 ] && [ "$UI_COLS" -lt "$UI_W" ]; then UI_W=$UI_COLS; fi
 SPIN_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 
 # Строка состояния для спиннера: функции, которые что-то ждут (например, освобождения apt),
@@ -67,11 +68,11 @@ step() {
   fi
 }
 
-# vlen <строка> — видимая длина без ANSI-кодов (для выравнивания рамок).
-vlen() {
-  local s
-  s="$(printf '%b' "$1" | sed -E 's/\x1b\[[0-9;?]*[A-Za-z]//g')"
-  echo "${#s}"
+# Видимая длина без ANSI-кодов, в переменной UI_TEXT_WIDTH.
+ui_text_width() {
+  local s="$1" ansi=$'\e\\[[0-9;?]*[A-Za-z]'
+  while [[ "$s" =~ $ansi ]]; do s="${s//"${BASH_REMATCH[0]}"/}"; done
+  UI_TEXT_WIDTH=${#s}
 }
 
 # ---- прогресс ----------------------------------------------------------------
@@ -146,7 +147,8 @@ _rep() { local n="$1" ch="$2" out="" i; for ((i=0; i<n; i++)); do out+="$ch"; do
 box_top() {  # box_top [заголовок]
   local t="${1:-}" fill
   if [ -n "$t" ]; then
-    fill=$(( UI_W - 5 - $(vlen "$t") ))
+    ui_text_width "$t"
+    fill=$(( UI_W - 5 - UI_TEXT_WIDTH ))
     echo -e "${C_DIM}╭─${C_RESET} ${C_BOLD}${C_W}${t}${C_RESET} ${C_DIM}$(_rep "$fill" ─)╮${C_RESET}"
   else
     echo -e "${C_DIM}╭$(_rep $((UI_W-2)) ─)╮${C_RESET}"
@@ -156,15 +158,19 @@ box_sep()    { echo -e "${C_DIM}├$(_rep $((UI_W-2)) ─)┤${C_RESET}"; }
 box_bottom() { echo -e "${C_DIM}╰$(_rep $((UI_W-2)) ─)╯${C_RESET}"; }
 box_row() {  # box_row <текст>
   local t="${1:-}" pad
-  pad=$(( UI_W - 4 - $(vlen "$t") ))
+  ui_text_width "$t"
+  pad=$(( UI_W - 4 - UI_TEXT_WIDTH ))
   [ "$pad" -lt 0 ] && pad=0
-  echo -e "${C_DIM}│${C_RESET} ${t}$(_rep "$pad" ' ') ${C_DIM}│${C_RESET}"
+  printf '%s│%s %s%*s %s│%s\n' "$C_DIM" "$C_RESET" "$t" "$pad" '' "$C_DIM" "$C_RESET"
 }
 
 # box_wrap <маркер> <текст> — длинный текст с переносом по словам внутри рамки.
 # Перенос свой, на bash: GNU fold считает байты, и кириллица переносилась бы вдвое раньше.
 box_wrap() {
-  local mark="$1" text="$2" line="" word first=1 max=$(( UI_W - 8 ))
+  local mark="$1" text="$2" line="" word first=1 max
+  ui_text_width "$mark"
+  max=$((UI_W - 5 - (UI_TEXT_WIDTH>2 ? UI_TEXT_WIDTH : 2)))
+  [ "$max" -ge 8 ] || max=8
   local -a words
   read -ra words <<<"$text"
   for word in "${words[@]}"; do
@@ -186,7 +192,8 @@ box_wrap() {
 dot_row() {
   local lvl="$1" name="$2" det="${3:-}" dot pad
   # printf '%-16s' считает байты, а не символы — для кириллицы колонки поплывут.
-  pad=$(( 17 - $(vlen "$name") )); [ "$pad" -lt 1 ] && pad=1
+  ui_text_width "$name"
+  pad=$(( 17 - UI_TEXT_WIDTH )); [ "$pad" -lt 1 ] && pad=1
   name="${name}$(_rep "$pad" ' ')"
   # деталь должна влезать в рамку: UI_W - 4 (поля) - 2 (точка) - 17 (название)
   local max=$(( UI_W - 4 - 2 - 17 ))

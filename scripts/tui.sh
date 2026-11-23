@@ -9,8 +9,8 @@
 # в обычные нумерованные вопросы — автоматический запуск (cloud-init) не ломается.
 
 if [ "${UI_TTY:-0}" = "1" ]; then
-  T_FR=$'\e[38;5;26m';  T_TI=$'\e[1;38;5;221m'; T_KEY=$'\e[38;5;81m'; T_PINK=$'\e[1;38;5;205m'
-  T_SEL=$'\e[48;5;25m\e[1;38;5;231m'; T_ORG=$'\e[38;5;215m'; T_MUT=$'\e[38;5;60m'; T_LBL=$'\e[38;5;110m'
+  T_FR=$'\e[38;5;67m';  T_TI=$'\e[1;38;5;117m'; T_KEY=$'\e[38;5;81m'; T_PINK=$'\e[1;38;5;205m'
+  T_SEL=$'\e[48;5;24m\e[1;38;5;231m'; T_ORG=$'\e[38;5;215m'; T_MUT=$'\e[38;5;103m'; T_LBL=$'\e[38;5;153m'
 else
   T_FR=""; T_TI=""; T_KEY=""; T_PINK=""; T_SEL=""; T_ORG=""; T_MUT=""; T_LBL=""
 fi
@@ -143,6 +143,8 @@ _tui_key() {  # TUI_KEY = up|down|enter|space|esc|<символ>
       case "$rest" in
         '[A'|'OA') TUI_KEY=up ;;
         '[B'|'OB') TUI_KEY=down ;;
+        '[C'|'OC') TUI_KEY=right ;;
+        '[D'|'OD') TUI_KEY=left ;;
         '')        TUI_KEY=esc ;;
         *)         # прочие последовательности (PgUp, Home, F-клавиши) дочитываем и пропускаем
                    IFS= read -rsn4 -t 0.02 rest <"$in" || true; TUI_KEY=none ;;
@@ -164,6 +166,7 @@ tui_run() {
   local -n _tl="$3" _td="$4" _tk="$5"
   local -n _tm="${6:-_TUI_EMPTY}" _tx="${7:-_TUI_EMPTY}"
   local n=${#_tl[@]} sel="${TUI_SEL:-0}" W LW RW H i buf cell rr key box mark syslen first=1 hit nl=$'\n'
+  local start=0 details=0 max_details row
   local -a R
   [ "$n" -gt 0 ] || return 1
   [ "$sel" -lt "$n" ] || sel=0
@@ -176,14 +179,18 @@ tui_run() {
     R=("${TW[@]}")
     H=$n; [ "${#R[@]}" -gt "$H" ] && H=${#R[@]}; [ "$H" -lt 10 ] && H=10
     [ "$H" -gt $((TUI_ROWS-6)) ] && H=$((TUI_ROWS-6))
-    [ "$H" -lt "$n" ] && H=$n
+    if [ "$sel" -lt "$start" ]; then start=$sel; fi
+    if [ "$sel" -ge $((start+H)) ]; then start=$((sel-H+1)); fi
+    max_details=$((${#R[@]} > H ? ${#R[@]} - H : 0))
+    if [ "$details" -gt "$max_details" ]; then details=$max_details; fi
 
     _tfit " ${T_TI}dorik${C_RESET} ${C_DIM}${DORIK_VERSION:-}${C_RESET} ${T_MUT}·${C_RESET} ${C_W}${HOSTNAME:-server}${C_RESET}" $((W - syslen))
     buf="${REPLY}${TUI_SYS}"$'\e[K'"${nl}"
     _tui_top "$title" "$LW"; buf+="$REPLY "
     _tstrip "${_tl[$sel]}"; _tui_top "$REPLY" "$RW"; buf+="${REPLY}"$'\e[K'"${nl}"
 
-    for ((i=0; i<H; i++)); do
+    for ((row=0; row<H; row++)); do
+      i=$((start+row))
       if [ "$i" -lt "$n" ]; then
         key="${_tk[$i]:- }"; box=""; mark=" "
         if [ "$mode" = "check" ]; then
@@ -203,16 +210,17 @@ tui_run() {
       else
         printf -v cell '%*s' "$LW" ''
       fi
-      rr="${R[$i]:-}"
+      rr="${R[$((details+row))]:-}"
       _tfit " ${rr}" "$RW"
       buf+="${T_FR}║${C_RESET}${cell}${T_FR}║${C_RESET} ${T_FR}║${C_RESET}${REPLY}${T_FR}║${C_RESET}"$'\e[K'"${nl}"
     done
     buf+="${T_FR}╚$(_rep "$LW" ═)╝ ╚$(_rep "$RW" ═)╝${C_RESET}"$'\e[K'"${nl}"
     if [ "$mode" = "check" ]; then
-      buf+=" ${T_KEY}↑↓${C_RESET} выбор  ${T_KEY}Пробел${C_RESET} отметить  ${T_KEY}a${C_RESET} все  ${T_KEY}n${C_RESET} снять  ${T_KEY}Enter${C_RESET} продолжить  ${T_KEY}0${C_RESET} отмена"
+      buf+=" ${T_KEY}↑↓${C_RESET} выбор  ${T_KEY}Пробел${C_RESET} отметить  ${T_KEY}a${C_RESET} все  ${T_KEY}n${C_RESET} снять  ${T_KEY}Enter${C_RESET} далее  ${T_KEY}0${C_RESET} назад"
     else
-      buf+=" ${T_KEY}↑↓${C_RESET} выбор  ${T_KEY}Enter${C_RESET} открыть  ${C_DIM}или сразу клавиша пункта${C_RESET}  ${T_KEY}0${C_RESET} назад"
+      buf+=" ${T_KEY}↑↓${C_RESET} выбор  ${T_KEY}Enter${C_RESET} открыть  ${T_KEY}0${C_RESET} назад"
     fi
+    if [ "$max_details" -gt 0 ]; then buf+="  ${T_KEY}←→${C_RESET} описание"; fi
     buf+=$'\e[K'
 
     if [ "$first" = "1" ]; then printf '\e[2J'; first=0; fi
@@ -224,14 +232,17 @@ tui_run() {
       [ -n "${_tk[$i]:-}" ] && [ "${_tk[$i]}" = "$TUI_KEY" ] && { hit=$i; break; }
     done
     if [ "$hit" -ge 0 ]; then
+      if [ "$sel" -ne "$hit" ]; then details=0; fi
       sel=$hit
       if [ "$mode" = "menu" ]; then TUI_SEL=$sel; break; fi
       [ "${_tx[$sel]:-0}" = "1" ] || _tm[$sel]=$(( 1 - ${_tm[$sel]:-0} ))
       continue
     fi
     case "$TUI_KEY" in
-      up)    sel=$(( (sel - 1 + n) % n )) ;;
-      down)  sel=$(( (sel + 1) % n )) ;;
+      up)    sel=$(( (sel - 1 + n) % n )); details=0 ;;
+      down)  sel=$(( (sel + 1) % n )); details=0 ;;
+      left)  [ "$details" -gt 0 ] && details=$((details-1)) ;;
+      right) [ "$details" -lt "$max_details" ] && details=$((details+1)) ;;
       enter) TUI_SEL=$sel; break ;;
       space)
         if [ "$mode" = "menu" ]; then TUI_SEL=$sel; break; fi
@@ -315,7 +326,7 @@ tui_logo() {
 '██   ██ ██    ██ ██   ██ ██ ██  ██ '
 '██████   ██████  ██   ██ ██ ██   ██'
   )
-  local -a col=(221 215 209 204 162) side=("" "" "" "" "")
+  local -a col=(153 117 81 75 69) side=("" "" "" "" "")
   local os="" i
   # shellcheck disable=SC1091
   [ -r /etc/os-release ] && os="$(. /etc/os-release; echo "${PRETTY_NAME:-}")"

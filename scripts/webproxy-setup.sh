@@ -64,7 +64,7 @@ wp_bot_info() {  # wp_bot_info <домен> <секрет 32hex>
   box_top "Регистрация в @MTProxybot (для рекламы канала)"
   box_row "Бот: ${C_BOLD}https://t.me/MTProxybot${C_RESET}"
   box_row "1. Отправьте боту: /newproxy"
-  box_row "2. Адрес:  ${C_BOLD}$1:443${C_RESET}"
+  box_row "2. Адрес:  ${C_BOLD}$1:$(tcp_public_port)${C_RESET}"
   box_row "3. Ключ:   ${C_BOLD}$2${C_RESET}  ${C_DIM}(без dd)${C_RESET}"
   box_row "4. Бот выдаст тег (32 символа) — его укажите скрипту"
   box_row "5. В боте: /myproxies → прокси → Set promotion → ваш канал"
@@ -260,7 +260,7 @@ decoy_fasttrack_mode = "off"
 ${limits_block}
 [[web.vhosts]]
 host = "${d}"
-public_addr = "${ip}:443"
+public_addr = "${ip}:$(tcp_public_port)"
 
 [web.vhosts.decoy]
 mode = "static_directory"
@@ -322,18 +322,19 @@ wp_wait_ready() {
 
 # ---- проверка результата -------------------------------------------------------------------------
 wp_verify() {  # wp_verify <домен>
-  local d="$1" code body h_dom
+  local d="$1" code body h_dom port
+  port="$(tcp_public_port)"
   VERIFY_FAIL=0
   systemctl is-active --quiet "$WP_SERVICE"; _chk $? "Telemt запущен (служба ${WP_SERVICE})" "служба ${WP_SERVICE} не запущена: journalctl -u ${WP_SERVICE} -n 30"
   ss -tln 2>/dev/null | grep -qE "127\.0\.0\.1:${WP_PORT_BACKEND}[[:space:]]"; _chk $? "Telemt слушает 127.0.0.1:${WP_PORT_BACKEND}" "Telemt не слушает 127.0.0.1:${WP_PORT_BACKEND}"
-  ss -tlnp 2>/dev/null | grep -E '[:.]443[[:space:]]' | grep -q haproxy; _chk $? "порт 443 держит HAProxy (общий с протоколами Xray)" "HAProxy не слушает 443"
+  ss -tlnp "sport = :${port}" 2>/dev/null | grep -q haproxy; _chk $? "порт $port держит HAProxy" "HAProxy не слушает $port"
   grep -q 'use_backend be_web' /etc/haproxy/haproxy.cfg 2>/dev/null; _chk $? "HAProxy направляет ${d} (по SNI) на WEB-прокси" "в HAProxy нет маршрута для ${d}"
   body="$(mktemp)"
-  code="$(curl -sk -o "$body" -w '%{http_code}' --max-time 8 --resolve "${d}:443:127.0.0.1" "https://${d}/" 2>/dev/null || echo 000)"
-  [ "$code" = "200" ]; _chk $? "https://${d}/ без ключа отдаёт страницу-заглушку (код 200)" "https://${d}/ вернул код ${code} (ожидался 200 — заглушку отдаёт Telemt)"
+  code="$(curl -sk -o "$body" -w '%{http_code}' --max-time 8 --resolve "${d}:${port}:127.0.0.1" "https://${d}:${port}/" 2>/dev/null || echo 000)"
+  [ "$code" = "200" ]; _chk $? "https://${d}:${port}/ без ключа отдаёт страницу-заглушку (код 200)" "https://${d}:${port}/ вернул код ${code} (ожидался 200)"
   rm -f "$body"
-  h_dom="$(echo | openssl s_client -connect 127.0.0.1:443 -servername "$d" 2>/dev/null | openssl x509 -noout -checkhost "$d" 2>/dev/null)"
-  echo "$h_dom" | grep -q 'does match'; _chk $? "по 443 с SNI ${d} отдаётся сертификат этого домена" "по 443 с SNI ${d} отдаётся чужой сертификат"
+  h_dom="$(echo | openssl s_client -connect "127.0.0.1:${port}" -servername "$d" 2>/dev/null | openssl x509 -noout -checkhost "$d" 2>/dev/null)"
+  echo "$h_dom" | grep -q 'does match'; _chk $? "по $port с SNI ${d} отдаётся сертификат этого домена" "по $port с SNI ${d} отдаётся чужой сертификат"
   return "$VERIFY_FAIL"
 }
 

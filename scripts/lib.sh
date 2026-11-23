@@ -362,6 +362,18 @@ resolve_a() {
   echo "$r"
 }
 
+TCP_PORT_FILE="${TCP_PORT_FILE:-/etc/dorik/tcp-port}"
+tcp_public_port() {
+  local port="${TCP_PORT:-}"
+  if [ -z "$port" ] && [ -r "$TCP_PORT_FILE" ]; then read -r port <"$TCP_PORT_FILE"; fi
+  printf '%s\n' "${port:-443}"
+}
+
+is_proxy_tcp_port() {
+  [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && is_valid_port "$1" &&
+    { [ "$1" = 443 ] || { [ "$1" -ge 5000 ] && [[ ! "$1" =~ ^567(89|90|91|92)$ ]]; }; }
+}
+
 # UDP-порт Hysteria2. По умолчанию 443; можно свой (HY2_PORT) — например, если 443/udp режут или
 # занят. Выбранный порт запоминается в /etc/dorik/hy2-port, чтобы firewall, укрепление, проверки и
 # профиль на панели везде брали одно и то же значение.

@@ -54,8 +54,17 @@ if [ -z "${DOMAIN_TCP}${DOMAIN_GRPC}${DOMAIN_XHTTP}${DOMAIN_HY2}${DOMAIN_TG}${DO
   exit 1
 fi
 
-# Основной протокол: к нему HAProxy отправляет всё, что пришло с неизвестным SNI или без него
-# (заход по IP, сканер). Это первый из выбранных протоколов Xray, который слушает TCP 443.
+TCP_PORT="$(tcp_public_port)"
+if [ "${NONINTERACTIVE:-0}" != "1" ]; then
+  TCP_PORT="$(ask_valid "TCP-порт для клиентов (443 или 5000–65535)" "$TCP_PORT" is_proxy_tcp_port)" || exit 1
+fi
+is_proxy_tcp_port "$TCP_PORT" || { err "Недопустимый TCP_PORT: $TCP_PORT"; exit 1; }
+if [ "$TCP_PORT" = "$(get_real_ssh_port)" ]; then
+  err "TCP-порт $TCP_PORT занят SSH."
+  exit 1
+fi
+
+# Основной домен определяет TLS-сайт для запросов с неизвестным SNI.
 declare -A XPORT=( [tcp]=56789 [grpc]=56790 [xhttp]=56791 [tg]=56792 )
 declare -A XDOM=( [tcp]="$DOMAIN_TCP" [grpc]="$DOMAIN_GRPC" [xhttp]="$DOMAIN_XHTTP" [tg]="$DOMAIN_TG" )
 PRIMARY=""; PRIMARY_DOMAIN=""
@@ -184,8 +193,7 @@ fi
 step "Настройка HAProxy"
 
 # ---- защита от сканеров ------------------------------------------------------------------
-# Любой заход (по IP, с чужим SNI) должен видеть обычный сайт-заглушку, как у настоящего сервера:
-# мёртвый порт для проверяющего (ТСПУ) подозрительнее. Поэтому лишнее НЕ рвём, а отдаём REALITY TCP.
+# Явно неизвестный SNI обрабатывает веб-сервер основного домена.
 # SCAN_PROTECT=1 добавляет: лимит новых соединений и одновременных соединений с одного IP.
 #   HAPROXY_RATE (300 новых за 10 с), HAPROXY_CONN_MAX (3000 одновременных) — под CGNAT/офисы
 #   с тысячами клиентов за одним адресом при необходимости поднимите.
@@ -209,8 +217,8 @@ defaults
     timeout server 1h
 
 frontend fe_443
-    bind *:443
 EOF
+printf '    bind *:%s\n' "$TCP_PORT"
 if [ "$SCAN_PROTECT" = "1" ]; then
   cat <<EOF
     # лимиты на один адрес источника
@@ -219,8 +227,7 @@ if [ "$SCAN_PROTECT" = "1" ]; then
     tcp-request connection reject if { sc_conn_rate(0) gt ${HAP_RATE} }
     tcp-request connection reject if { sc_conn_cur(0) gt ${HAP_CONN_MAX} }
     # ждём ClientHello недолго: молчащий сканер не должен занимать сокет.
-    # Неизвестный/пустой SNI и не-TLS НЕ отбрасываем: они уходят в REALITY TCP, а тот показывает
-    # заглушку, как настоящий сайт (иначе проверка по IP/чужому SNI видела бы «мёртвый» порт).
+    # Неполный ClientHello после таймаута передаётся основному обработчику.
     tcp-request inspect-delay 3s
     tcp-request content accept if { req.ssl_hello_type 1 }
 EOF
@@ -242,20 +249,24 @@ done
 # WEB-прокси Telegram: веб-сервер (TLS своего домена) -> Telemt; страницу для обычных посетителей отдаёт Telemt.
 [ -n "$DOMAIN_WEB" ] && { [ -z "$PRIMARY" ] || [ "$DOMAIN_WEB" != "$PRIMARY_DOMAIN" ]; } && BE[web]=1
 
-# Куда уходит всё неизвестное: основной протокол Xray; без него — заглушка Hysteria2 или WEB-прокси.
+# Для явно чужого SNI используем TLS-сайт. Если HAProxy не смог извлечь имя
+# (например, при фрагментации ClientHello), передаём поток основному протоколу.
 if [ -n "$PRIMARY" ]; then DEFAULT_BE="be_${PRIMARY}"
 elif [ -n "${BE[hy2]:-}" ]; then DEFAULT_BE="be_hy2"
 else DEFAULT_BE="be_web"; fi
 
+[ -n "$PRIMARY" ] && echo "    use_backend be_${PRIMARY} if { req.ssl_sni -i ${PRIMARY_DOMAIN} }"
 for p in grpc xhttp tg; do
   [ -n "${BE[$p]:-}" ] && echo "    use_backend be_${p} if { req.ssl_sni -i ${XDOM[$p]} }"
 done
 [ -n "${BE[hy2]:-}" ] && [ "$DEFAULT_BE" != "be_hy2" ] && echo "    use_backend be_hy2 if { req.ssl_sni -i ${DOMAIN_HY2} }"
 [ -n "${BE[web]:-}" ] && [ "$DEFAULT_BE" != "be_web" ] && echo "    use_backend be_web if { req.ssl_sni -i ${DOMAIN_WEB} }"
+[ -n "$PRIMARY" ] && echo "    use_backend be_default_tls if { req.ssl_sni -m found }"
 echo "    default_backend ${DEFAULT_BE}"
 
 if [ -n "$PRIMARY" ]; then
   printf '\nbackend be_%s\n    server %s1 127.0.0.1:%s\n' "$PRIMARY" "$PRIMARY" "${XPORT[$PRIMARY]}"
+  printf '\nbackend be_default_tls\n    server tls1 127.0.0.1:%s\n' "${DECOY_PORT[$PRIMARY]}"
 fi
 for p in grpc xhttp tg; do
   [ -n "${BE[$p]:-}" ] && printf '\nbackend be_%s\n    server %s1 127.0.0.1:%s\n' "$p" "$p" "${XPORT[$p]}"
@@ -269,16 +280,30 @@ fi
 } > "$HAP_NEW"
 
 if haproxy -c -f "$HAP_NEW" >/tmp/dorik_haproxy_check 2>&1; then
-  [ -f /etc/haproxy/haproxy.cfg ] && cp -f /etc/haproxy/haproxy.cfg "/etc/haproxy/haproxy.cfg.bak.$(date +%s)"
-  install -m 644 "$HAP_NEW" /etc/haproxy/haproxy.cfg
+  HAP_BACKUP=""
+  if [ -f /etc/haproxy/haproxy.cfg ]; then
+    HAP_BACKUP="/etc/haproxy/haproxy.cfg.bak.$(date +%s)"
+    cp -f /etc/haproxy/haproxy.cfg "$HAP_BACKUP" || exit 1
+  fi
+  install -m 644 "$HAP_NEW" /etc/haproxy/haproxy.cfg || exit 1
+  rm -f "$HAP_NEW"
   systemctl enable haproxy &>/dev/null || true
-  systemctl restart haproxy
+  if ! systemctl restart haproxy; then
+    err "HAProxy не запустился на ${TCP_PORT}/tcp."
+    if [ -n "$HAP_BACKUP" ]; then
+      install -m 644 "$HAP_BACKUP" /etc/haproxy/haproxy.cfg && systemctl restart haproxy
+    fi
+    exit 1
+  fi
+  mkdir -p -- "$(dirname "$TCP_PORT_FILE")" && printf '%s\n' "$TCP_PORT" > "$TCP_PORT_FILE" || exit 1
+  if have ufw; then ufw allow "${TCP_PORT}/tcp" comment "HTTPS TCP" || exit 1; fi
   ok "HAProxy настроен и перезапущен."
 else
   err "Новый конфиг HAProxy не прошёл проверку, старый оставлен без изменений:"
   head -n 10 /tmp/dorik_haproxy_check >&2
+  rm -f "$HAP_NEW"
+  exit 1
 fi
-rm -f "$HAP_NEW"
 
 # ---- certbot автопродление --------------------------------------------------
 # Пакет certbot уже приносит certbot.timer; отдельная запись в crontab root
@@ -301,10 +326,10 @@ CHECK_FAIL=0
 if systemctl is-active --quiet "$WS"; then ok "${WS}: активен"; else err "${WS}: НЕ активен"; CHECK_FAIL=1; fi
 if systemctl is-active --quiet haproxy; then ok "haproxy: активен"; else err "haproxy: НЕ активен"; CHECK_FAIL=1; fi
 
-if ss -tlnp 2>/dev/null | grep -E '[:.]443[[:space:]]' | grep -q haproxy; then
-  ok "haproxy: слушает 443/tcp"
+if ss -tlnp "sport = :${TCP_PORT}" 2>/dev/null | grep -q haproxy; then
+  ok "haproxy: слушает ${TCP_PORT}/tcp"
 else
-  err "haproxy: НЕ слушает 443/tcp — клиенты не смогут подключиться"; CHECK_FAIL=1
+  err "haproxy: НЕ слушает ${TCP_PORT}/tcp — клиенты не смогут подключиться"; CHECK_FAIL=1
 fi
 if haproxy -c -f /etc/haproxy/haproxy.cfg &>/dev/null; then
   ok "haproxy: конфигурация валидна"
