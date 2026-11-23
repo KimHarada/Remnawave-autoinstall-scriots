@@ -245,7 +245,17 @@ fp_apt()       { date +%Y%m%d; }
 fp_ssh()       { fp_make "${NEW_SSH_PORT:-}" "${ROLE:-}" "${USE_HY2:-}" "$(hy2_port)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${PANEL_IP:-}" "${ENABLE_REBOOT:-}"; }
 fp_web()       { fp_make "${WEB_SERVER:-}" "${INSTALL_DECOY:-}" "${SCAN_PROTECT:-}" "${USE_HY2:-}" "${USE_TG:-}" "${USE_WEB:-}" "$(_domains_fp)"; }
 fp_bbr()       { fp_make "${USE_BBR:-}"; }
-fp_profile()   { fp_make "$(_domains_fp)" "$(hy2_port)" "${PROFILE_PREFIX:-}" "${PROFILE_NAME:-}" "${COUNTRY_CODE:-}" "${PSIPHON:-}" "${FINAL_MASK:-}" "${SCAN_PROTECT:-}" "${PROFILE_CREATE_NODE:-}" "${NODE_PORT:-}"; }
+fp_profile() {
+  local -a route=()
+  if [ "${PROFILE_ROUTE:-direct}" != direct ]; then
+    local hash
+    hash="$(sha256sum -- "${PROFILE_EXIT_FILE:-/etc/dorik/exit.json}" 2>/dev/null)"
+    route=("$PROFILE_ROUTE" "${PROFILE_EXIT_FILE:-}" "${hash%% *}")
+  fi
+  fp_make "$(_domains_fp)" "$(hy2_port)" "${PROFILE_PREFIX:-}" "${PROFILE_NAME:-}" "${COUNTRY_CODE:-}" \
+    "${PSIPHON:-}" "${FINAL_MASK:-}" "${SCAN_PROTECT:-}" "${PROFILE_CREATE_NODE:-}" "${NODE_PORT:-}" "${route[@]}" \
+    ${SQUAD_NAME:+"${SQUAD_NAME}"}
+}
 fp_node()      { fp_make "${NODE_PORT:-}" "${USE_HY2:-}" "${DOMAIN_HY2:-}"; }
 fp_nodelink()  { fp_make "$(fp_profile)" "$(fp_node)"; }
 fp_webproxy()  { fp_make "${DOMAIN_WEB:-}" "${WEB_AD_TAG:-}"; }
@@ -280,7 +290,7 @@ resume_secrets() {
   if [ "$need_api" = "1" ]; then
     info "Часть этапов панели не выполнена — нужен доступ к панели (токен в файле не хранится)."
     wait_prefetch                          # для работы с API нужен jq из базовых пакетов
-    profile_collect_params || exit 1
+    profile_collect_params resume || exit 1
   fi
   if [ "$need_key" = "1" ]; then acquire_secret_key; fi
 }
@@ -358,6 +368,7 @@ if [ "$RESUME_MODE" = "continue" ] || [ "$RESUME_MODE" = "domains" ]; then
   # Чего нет в сохранённом файле (он мог быть записан старой версией) — значения по умолчанию.
   : "${INSTALL_DECOY:=1}" "${USE_BBR:=0}" "${USE_API:=0}" "${OPEN_NODE_PORT:=0}" "${ENABLE_REBOOT:=1}"
   : "${DO_HARDEN:=1}" "${SSH_PW_OFF:=0}" "${SCAN_PROTECT:=1}" "${SCAN_BLOCKLIST:=0}" "${PROFILE_CREATE_NODE:=0}"
+  : "${PROFILE_ROUTE:=direct}"
   : "${PANEL_IP:=}" "${NODE_PORT:=}" "${WEB_AD_TAG:=}" "${WEB_SERVER:=$(ws_current)}"
   SECRET_KEY="${SECRET_KEY:-}"; WEB_SECRET="${WEB_SECRET:-}"
   export SCAN_PROTECT SCAN_BLOCKLIST WEB_SERVER HY2_PORT FINAL_MASK PSIPHON
@@ -615,6 +626,7 @@ fi
 if [ "$ROLE" = "1" ]; then
   box_wrap "Домены:           " "${DOMAIN_TCP:+${DOMAIN_TCP} }${DOMAIN_GRPC:+${DOMAIN_GRPC} }${DOMAIN_XHTTP:+${DOMAIN_XHTTP} }${DOMAIN_HY2:+${DOMAIN_HY2} }${DOMAIN_TG:+${DOMAIN_TG} }${DOMAIN_WEB:+${DOMAIN_WEB} (WEB-прокси)}"
   if [ "$USE_API" = "1" ]; then
+    box_wrap "Маршрут" "$(profile_route_label)"
     box_row "Профиль на панели: ${C_BOLD}${PROFILE_NAME}${C_RESET}  ${C_DIM}(хосты + SECRET_KEY по API)${C_RESET}"
     box_row "                    $([ "$PROFILE_CREATE_NODE" = "1" ] && echo "нода на панели создаётся" || echo "ноду на панели создадите сами")$([ -n "$DOMAIN_TG" ] && echo "; есть Telegram-хост")"
   elif [ "$HAS_XRAY" = "1" ]; then

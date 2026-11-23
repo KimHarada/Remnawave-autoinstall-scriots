@@ -12,6 +12,7 @@
 #
 #   profile-setup.sh          — интерактивно (домены берутся из /etc/dorik/decoys.conf)
 #   profile-setup.sh --show   — показать сохранённые параметры профиля
+#   profile-setup.sh --exit-file — собрать параметры каскада на выходной ноде
 #
 # Без вопросов (ASSUME_YES=1):
 #   PANEL_URL        адрес панели; можно ссылку для входа с секретом (?ключ=значение) — он
@@ -19,6 +20,7 @@
 #   PANEL_API_TOKEN  токен (панель → Настройки → API-токены)
 #   PROFILE_PREFIX (NL) · PROFILE_NAME · COUNTRY_CODE · PSIPHON=1|0 · PROFILE_CREATE_NODE=1|0
 #   FINAL_MASK=1|0 (фрагментация ClientHello на TCP-хостах; своя маска: FINAL_MASK_JSON)
+#   PROFILE_ROUTE=direct|vless|hysteria2 · PROFILE_EXIT_FILE=/etc/dorik/exit.json
 #   NODE_ADDRESS (по умолчанию публичный IP) · TG_EXTRA_DOMAINS="a.com b.com"
 #   RW_CURL_OPTS — доп. параметры curl (например -k для самоподписанного сертификата)
 
@@ -64,7 +66,7 @@ rw_api() {  # rw_api <METHOD> <path> [json-тело] — тело ответа �
   local m="$1" p="$2" body="${3:-}" out hdr rc
   # Токен и секретный cookie передаём через файл заголовков (права 600), а не аргументами:
   # аргументы curl видны любому пользователю сервера в `ps`.
-  hdr="$(mktemp)"; chmod 600 "$hdr"
+  hdr="$(mktemp)" || return 1
   {
     echo "Authorization: Bearer ${RW_TOKEN}"
     [ -n "$RW_COOKIE" ] && echo "Cookie: ${RW_COOKIE}"
@@ -74,17 +76,21 @@ rw_api() {  # rw_api <METHOD> <path> [json-тело] — тело ответа �
   local -a args=(-sS --connect-timeout 10 --max-time 40 -X "$m" -H "@${hdr}" -H 'Content-Type: application/json')
   # shellcheck disable=SC2206
   [ -n "${RW_CURL_OPTS:-}" ] && args+=($RW_CURL_OPTS)
-  [ -n "$body" ] && args+=(--data-binary "$body")
+  [ "${PROFILE_ROUTE:-direct}" != direct ] && args+=(--no-insecure)
+  # В конфиге могут быть ключи REALITY и пароль выходной ноды. Передаём тело по stdin.
+  [ -n "$body" ] && args+=(--data-binary @-)
   [ "${RW_FORCE4:-0}" = "1" ] && args+=(-4)
-  out="$(curl "${args[@]}" -w $'\n%{http_code}' "${RW_BASE}${p}" 2>&1)"; rc=$?
-  # Не соединились/таймаут (код 28 или 7): повторяем до двух раз по IPv4 с паузой — сбой установки
+  out="$(curl "${args[@]}" -w $'\n%{http_code}' "${RW_BASE}${p}" 2>&1 <<<"$body")"; rc=$?
+  # Повторяем GET после таймаута, но для записи результат уже мог примениться на панели.
+  # При отказе соединения (код 7) запрос не дошёл до сервера, повтор безопасен.
+  # Повторяем до двух раз по IPv4 с паузой — сбой установки
   # соединения часто разовый (так и бывает с панелью за защитой хостера: первая попытка зависает,
   # вторая проходит сразу). Если у домена есть IPv6-адрес, а он не отвечает, дальше ходим только по IPv4.
   local attempt=1 host has6=0
-  while { [ "$rc" -eq 28 ] || [ "$rc" -eq 7 ]; } && [ "$attempt" -lt 3 ]; do
+  while { [ "$rc" -eq 7 ] || { [ "$m" = GET ] && [ "$rc" -eq 28 ]; }; } && [ "$attempt" -lt 3 ]; do
     attempt=$((attempt+1))
     sleep 2
-    out="$(curl "${args[@]}" -4 -w $'\n%{http_code}' "${RW_BASE}${p}" 2>&1)"; rc=$?
+    out="$(curl "${args[@]}" -4 -w $'\n%{http_code}' "${RW_BASE}${p}" 2>&1 <<<"$body")"; rc=$?
     if [ "$rc" -eq 0 ]; then
       host="${RW_BASE#*://}"; host="${host%%[:/]*}"
       getent ahostsv6 "$host" 2>/dev/null | awk '{print $1}' | grep -v '^::ffff:' | grep -q ':' && has6=1
@@ -147,11 +153,172 @@ gen_x25519() {  # печатает «приватный публичный» в 
 
 st_get() { jq -r "$1 // empty" "$PROFILE_STATE" 2>/dev/null; }
 st_set() {  # st_set <jq-фильтр с --arg/--argjson через переменные окружения не нужен: передаём готовый фильтр>
-  local tmp; tmp="$(mktemp)"
-  jq "$@" "$PROFILE_STATE" > "$tmp" && cat "$tmp" > "$PROFILE_STATE"; rm -f "$tmp"
+  local tmp
+  tmp="$(mktemp "${PROFILE_STATE}.XXXXXX")" || return 1
+  if jq "$@" "$PROFILE_STATE" > "$tmp" && mv -f -- "$tmp" "$PROFILE_STATE"; then return 0; fi
+  rm -f -- "$tmp"
+  return 1
 }
 
 # ---- сбор параметров --------------------------------------------------------------------------------
+profile_exit_config() {
+  local mode="${PROFILE_ROUTE:-direct}" file="${PROFILE_EXIT_FILE:-/etc/dorik/exit.json}" meta
+  case "$mode" in
+    direct) printf 'null\n'; return 0 ;;
+    vless|hysteria2) ;;
+    *) err "Неизвестный режим маршрутизации. Допустимы direct, vless и hysteria2."; return 1 ;;
+  esac
+
+  if [ ! -f "$file" ] || [ -L "$file" ]; then
+    err "Для каскада укажите обычный JSON-файл с параметрами выхода: $file"
+    return 1
+  fi
+  meta="$(stat -c '%u:%a' -- "$file" 2>/dev/null)" || return 1
+  if [ "$meta" != "$EUID:600" ] && [ "$meta" != "$EUID:400" ]; then
+    err "Файл выхода должен принадлежать пользователю, запустившему скрипт, и иметь права 600 или 400."
+    return 1
+  fi
+
+  jq -cse --arg mode "$mode" --arg self "${NODE_ADDRESS:-}" '
+    def dnsname: type=="string" and length<=253 and
+      test("^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\\.)+[a-zA-Z][a-zA-Z0-9-]{0,62}$");
+    def ipv4: type=="string" and test("^([0-9]{1,3}\\.){3}[0-9]{1,3}$") and
+      (split(".") | all(.[]; tostring == (tonumber|tostring) and tonumber<=255)) and
+      (split(".")[0] | tonumber | .>0 and .!=127 and .<224);
+    def port: type=="number" and floor==. and .>=1 and .<=65535;
+    def uuid: type=="string" and
+      test("^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$");
+    def short_id: type=="string" and test("^([0-9a-f]{2}){1,8}$");
+
+    if length!=1 then error("expected one object") else .[0] end
+    | select(type=="object" and .protocol==$mode and
+      (.address | dnsname or ipv4) and (.serverName | dnsname) and
+      (.port | port) and (.address|ascii_downcase)!=($self|ascii_downcase))
+    | if $mode=="vless" then
+        select((.uuid|uuid) and (.publicKey|type=="string" and test("^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$")) and
+          (.shortId|short_id))
+        | select((has("vision")|not) or (.vision|type=="boolean"))
+        | {tag:"EXIT", protocol:"vless",
+           settings:{vnext:[{address, port, users:[{id:.uuid, encryption:"none"}
+             + (if .vision then {flow:"xtls-rprx-vision"} else {} end)]}]},
+           streamSettings:{network:"raw", security:"reality",
+             realitySettings:{serverName, fingerprint:"chrome", password:.publicKey, shortId}}}
+      else
+        select(.auth|type=="string" and length>0 and length<=1024 and (test("[[:cntrl:]]")|not))
+        | {tag:"EXIT", protocol:"hysteria", settings:{address, port, version:2},
+           streamSettings:{network:"hysteria", security:"tls",
+             tlsSettings:{serverName, alpn:["h3"], minVersion:"1.3"},
+             hysteriaSettings:{version:2, auth}}}
+      end' 2>/dev/null <"$file" || {
+    err "Проверьте протокол, адрес, SNI, порт и данные доступа выходной ноды в $file."
+    return 1
+  }
+}
+
+profile_route_label() {
+  case "${PROFILE_ROUTE:-direct}" in
+    vless) printf 'Клиент → вход → выход по VLESS Reality\n' ;;
+    hysteria2) printf 'Клиент → вход → выход по Hysteria2\n' ;;
+    *) printf 'Клиент → нода → интернет\n' ;;
+  esac
+}
+
+profile_check_exit_address() {
+  local address local_address domain ip own_ips exit_ips
+  address="$(jq -r '.settings.address // .settings.vnext[0].address // empty')"
+  [ -n "$address" ] || return 0
+  local_address="${SELF_IP:-${NODE_ADDRESS:-}}"
+  for domain in "${PDOM[@]}" "$local_address"; do
+    if [ "${address,,}" = "${domain,,}" ]; then
+      err "Адрес выхода совпадает с адресом входной ноды: $address"
+      return 1
+    fi
+  done
+  exit_ips="$(getent ahosts "$address" | awk '{print $1}' | sort -u)"
+  own_ips="$(ip -o addr show | awk '{split($4, address, "/"); print address[1]}')"
+  own_ips+=$'\n'"${local_address:-$(get_public_ip)}"
+  while IFS= read -r ip; do
+    if [ -n "$ip" ] && [[ $'\n'"${own_ips}"$'\n' == *$'\n'"${ip}"$'\n'* ]]; then
+      err "Выходная нода разрешается в IP входной ноды: $ip"
+      return 1
+    fi
+  done <<<"$exit_ips"
+}
+
+profile_collect_route() {
+  local mode="${PROFILE_ROUTE:-$(st_get '.route.mode')}" def=1
+  if [ "${ASSUME_YES:-0}" != "1" ] && [ "${1:-}" != resume ]; then
+    case "$mode" in vless) def=2 ;; hysteria2) def=3 ;; esac
+    ask_choice "Маршрут трафика" "$def" \
+      "Одна нода|Этот сервер принимает подключения клиентов и выходит в интернет." \
+      "Каскад · VLESS Reality|Эта нода принимает подключения. До отдельной выходной ноды трафик идёт по TCP через VLESS Reality." \
+      "Каскад · Hysteria2|Эта нода принимает подключения. До отдельной выходной ноды трафик идёт по QUIC через Hysteria2." || return 1
+    case "$CHOICE" in 1) mode=direct ;; 2) mode=vless ;; 3) mode=hysteria2 ;; esac
+  fi
+  PROFILE_ROUTE="${mode:-direct}"
+  if [ "$PROFILE_ROUTE" != direct ]; then
+    PROFILE_EXIT_FILE="${PROFILE_EXIT_FILE:-$(st_get '.route.file')}"
+    PROFILE_EXIT_FILE="${PROFILE_EXIT_FILE:-/etc/dorik/exit.json}"
+    if [ "${1:-}" != resume ]; then
+      PROFILE_EXIT_FILE="$(ask_value "JSON-файл с параметрами выходной ноды" "$PROFILE_EXIT_FILE")" || return 1
+    fi
+    [[ "$PROFILE_EXIT_FILE" = /* ]] || { err "Укажите абсолютный путь к файлу выходной ноды."; return 1; }
+  fi
+  profile_exit_config >/dev/null
+}
+
+profile_export_exit() {
+  local p mode domain address port public_key="" sid="" credential vision=false file tmp
+  have jq || { err "Для экспорта нужен jq."; return 1; }
+  [ "${ASSUME_YES:-0}" != "1" ] || { err "Для экспорта данных сервисного пользователя нужен терминал."; return 1; }
+  [ -s "$PROFILE_STATE" ] || { err "Сначала настройте профиль на выходной ноде."; return 1; }
+  case "$(st_get '.route.mode')" in
+    vless|hysteria2) err "Выберите «Одна нода» в профиле сервера, который будет выходить в интернет."; return 1 ;;
+  esac
+  ask_choice "Выходная нода" 1 \
+    "VLESS Reality|Экспорт данных настроенного входа VLESS Reality TCP и UUID сервисного пользователя." \
+    "Hysteria2|Экспорт настроенного порта, имени сертификата и пароля сервисного пользователя." || return 1
+  case "$CHOICE" in
+    1) p=tcp; mode=vless; port=443 ;;
+    2) p=hy2; mode=hysteria2; port="$(hy2_port)" ;;
+  esac
+  load_domains && domain="${PDOM[$p]:-}"
+  [ -n "${domain:-}" ] && [ "$domain" = "$(st_get ".protocols.$p.domain")" ] || {
+    err "Выбранный протокол отсутствует в текущем профиле этой ноды."
+    return 1
+  }
+  address="$(ask_value "Адрес выходной ноды (домен или IPv4)" "$domain")" || return 1
+  port="$(ask_valid "Внешний порт выходной ноды" "$port" is_valid_port)" || return 1
+  if [ "$mode" = vless ]; then
+    public_key="$(st_get '.protocols.tcp.publicKey')"
+    sid="$(st_get '.protocols.tcp.shortIds[0]')"
+    if ask_yes_no "У сервисного пользователя на выходе включён XTLS Vision?" 2; then vision=true; fi
+    read -rs -p "  VLESS UUID сервисного пользователя: " credential <"$(prompt_input)" || return 1
+  else
+    read -rs -p "  Пароль Hysteria2 сервисного пользователя: " credential <"$(prompt_input)" || return 1
+  fi
+  printf '\n' >&2
+  file="$(ask_value "Куда записать параметры выхода" /etc/dorik/exit.json)" || return 1
+  [[ "$file" == /* ]] || { err "Укажите абсолютный путь для файла."; return 1; }
+  tmp="$(mktemp "${file}.XXXXXX")" || return 1
+  if printf '%s\n' "$credential" |
+      jq -R --arg protocol "$mode" --arg address "$address" --arg sni "$domain" --arg port "$port" \
+        --arg key "$public_key" --arg sid "$sid" --argjson vision "$vision" '
+          . as $credential | {protocol:$protocol, address:$address, port:($port|tonumber), serverName:$sni}
+          + (if $protocol=="vless" then {uuid:$credential, publicKey:$key, shortId:$sid, vision:$vision}
+             else {auth:$credential} end)' > "$tmp" &&
+      PROFILE_ROUTE="$mode" PROFILE_EXIT_FILE="$tmp" NODE_ADDRESS= profile_exit_config >/dev/null &&
+      ln -T -- "$tmp" "$file"; then
+    rm -f -- "$tmp"
+    ok "Файл создан с правами 600: $file"
+    info "Передайте его по SSH на входную ноду и укажите путь в меню маршрутизации."
+    return 0
+  fi
+  rm -f -- "$tmp"
+  err "Файл выхода не создан. Проверьте параметры и укажите свободный путь."
+  return 1
+}
+
 # Домены протоколов: из /etc/dorik/decoys.conf (их уже настроил haproxy-setup) либо из DOMAIN_*.
 load_domains() {
   PDOM=()
@@ -181,11 +348,10 @@ define_protocols() {
 # Создаёт состояние (если нет) и доводит его до полного: недостающим протоколам — свои ключи,
 # shortId, fingerprint. Уже сохранённое НЕ меняется: ключи привязаны к выданным клиентам.
 state_prepare() {
-  local px="$1" name="$2" p fp key pair used
-  mkdir -p "$(dirname "$PROFILE_STATE")"
-  [ -s "$PROFILE_STATE" ] || echo '{"protocols":{}}' > "$PROFILE_STATE"
-  chmod 600 "$PROFILE_STATE"
-  st_set --arg px "$px" --arg name "$name" '.prefix=$px | .name=$name'
+  local px="$1" name="$2" p fp pair used s1 s2 s3
+  [ -s "$PROFILE_STATE" ] || (umask 077; printf '%s\n' '{"protocols":{}}' > "$PROFILE_STATE") || return 1
+  chmod 600 "$PROFILE_STATE" || return 1
+  st_set --arg px "$px" --arg name "$name" '.prefix=$px | .name=$name' || return 1
 
   used=" $(jq -r '[.protocols[]?.fingerprint // empty] | join(" ")' "$PROFILE_STATE") "
   local -a pool=()
@@ -194,26 +360,29 @@ state_prepare() {
 
   for p in "${PROTO_ORDER[@]}"; do
     [ -n "${PDOM[$p]:-}" ] || continue
-    st_set --arg p "$p" --arg d "${PDOM[$p]}" --arg t "${P_TAG[$p]}" '.protocols[$p].domain=$d | .protocols[$p].tag=$t'
+    st_set --arg p "$p" --arg d "${PDOM[$p]}" --arg t "${P_TAG[$p]}" '.protocols[$p].domain=$d | .protocols[$p].tag=$t' || return 1
     [ "$p" = "hy2" ] && continue                                      # у Hysteria2 нет Reality-ключей
     if [ -z "$(st_get ".protocols.${p}.privateKey")" ]; then
       pair="$(gen_x25519)" || { err "Не удалось сгенерировать ключ x25519 (openssl)"; return 1; }
-      st_set --arg p "$p" --arg k "${pair%% *}" --arg pub "${pair##* }" \
-        --arg s1 "$(openssl rand -hex 8)" --arg s2 "$(openssl rand -hex 4)" --arg s3 "$(openssl rand -hex 6)" \
-        '.protocols[$p].privateKey=$k | .protocols[$p].publicKey=$pub | .protocols[$p].shortIds=[$s1,$s2,$s3]'   # разной длины
+      s1="$(openssl rand -hex 8)" && s2="$(openssl rand -hex 4)" && s3="$(openssl rand -hex 6)" || return 1
+      st_set --arg p "$p" --rawfile pair /dev/stdin --arg s1 "$s1" --arg s2 "$s2" --arg s3 "$s3" '
+        ($pair | rtrimstr("\n") | split(" ")) as [$private, $public]
+        | .protocols[$p] += {privateKey:$private, publicKey:$public, shortIds:[$s1,$s2,$s3]}' <<<"$pair" || return 1
     fi
     local cur_fp bad
     cur_fp="$(st_get ".protocols.${p}.fingerprint")"
     for bad in "${BAD_FINGERPRINTS[@]}"; do [ "$cur_fp" = "$bad" ] && cur_fp=""; done
     if [ -z "$cur_fp" ]; then
       fp="${pool[0]}"; pool=("${pool[@]:1}"); [ "${#pool[@]}" -gt 0 ] || pool=("${FINGERPRINTS[@]}")
-      st_set --arg p "$p" --arg f "$fp" '.protocols[$p].fingerprint=$f'
+      st_set --arg p "$p" --arg f "$fp" '.protocols[$p].fingerprint=$f' || return 1
     fi
   done
-  [ -n "$(st_get '.protocols.grpc.domain')" ] && [ -z "$(st_get '.protocols.grpc.serviceName')" ] && \
-    st_set --arg v "$(openssl rand -hex 8)" '.protocols.grpc.serviceName=$v'
-  [ -n "$(st_get '.protocols.xhttp.domain')" ] && [ -z "$(st_get '.protocols.xhttp.path')" ] && \
-    st_set --arg v "/api/v2/sync-$(openssl rand -hex 6)" '.protocols.xhttp.path=$v'
+  if [ -n "${PDOM[grpc]:-}" ] && [ -z "$(st_get '.protocols.grpc.serviceName')" ]; then
+    st_set --arg v "$(openssl rand -hex 8)" '.protocols.grpc.serviceName=$v' || return 1
+  fi
+  if [ -n "${PDOM[xhttp]:-}" ] && [ -z "$(st_get '.protocols.xhttp.path')" ]; then
+    st_set --arg v "/api/v2/sync-$(openssl rand -hex 6)" '.protocols.xhttp.path=$v' || return 1
+  fi
   return 0
 }
 
@@ -221,8 +390,6 @@ state_prepare() {
 build_inbound() {  # build_inbound <proto> — JSON одного inbound'а
   local p="$1" d tag fp priv serv path
   d="${PDOM[$p]}"; tag="${P_TAG[$p]}"
-  fp="$(st_get ".protocols.${p}.fingerprint")"; priv="$(st_get ".protocols.${p}.privateKey")"
-  local sids; sids="$(jq -c ".protocols.${p}.shortIds // []" "$PROFILE_STATE")"
   case "$p" in
     hy2)
       jq -n --arg tag "$tag" --arg dir "$(decoy_root hy2)" --argjson port "$(hy2_port)" '{
@@ -230,11 +397,11 @@ build_inbound() {  # build_inbound <proto> — JSON одного inbound'а
         settings:{clients:[], version:2},
         sniffing:{enabled:true, routeOnly:true, destOverride:["http","tls","quic"]},
         streamSettings:{network:"hysteria", security:"tls",
-          tlsSettings:{alpn:["h3"], certificates:[{keyFile:"/etc/hysteria/privkey.pem", certificateFile:"/etc/hysteria/fullchain.pem"}]},
+          tlsSettings:{minVersion:"1.3", alpn:["h3"], certificates:[{keyFile:"/etc/hysteria/privkey.pem", certificateFile:"/etc/hysteria/fullchain.pem"}]},
           hysteriaSettings:{version:2, masquerade:{dir:$dir, type:"file"}}}}' ;;
     *)
-      local net="raw" extra='{}' key="" hard='{}' spx
-      spx="$(st_get ".protocols.${p}.spiderX")"; spx="${spx:-/}"
+      local net="raw" extra='{}' key="" hard='{}' settings
+      settings="$(jq -ce --arg p "$p" '.protocols[$p] | select(.privateKey and (.shortIds|length>0))' "$PROFILE_STATE")" || return 1
       # Защита от активного зондирования (SCAN_PROTECT=1):
       #  - maxTimeDiff (по умолчанию ВЫКЛЮЧЕН): отбрасывает рукопожатие, если часы клиента расходятся с
       #    сервером больше заданного (мс). Защищает от повтора перехваченного ClientHello, но у части
@@ -245,24 +412,23 @@ build_inbound() {  # build_inbound <proto> — JSON одного inbound'а
         hard="$(jq -nc --argjson t "${REALITY_MAXTIMEDIFF:-0}" '
           (if $t > 0 then {maxTimeDiff:$t} else {} end)
           + {limitFallbackUpload:{afterBytes:65536, bytesPerSec:16384, burstBytesPerSec:65536},
-             limitFallbackDownload:{afterBytes:65536, bytesPerSec:16384, burstBytesPerSec:65536}}')"
+             limitFallbackDownload:{afterBytes:65536, bytesPerSec:16384, burstBytesPerSec:65536}}')" || return 1
       fi
       if [ "$p" = "grpc" ]; then
-        serv="$(st_get '.protocols.grpc.serviceName')"
+        serv="$(jq -er '.serviceName | select(length>0)' <<<"$settings")" || return 1
         net="grpc"; key="grpcSettings"; extra="$(jq -n --arg s "$serv" '{multiMode:true, serviceName:$s}')"
       elif [ "$p" = "xhttp" ]; then
-        path="$(st_get '.protocols.xhttp.path')"
+        path="$(jq -er '.path | select(length>0)' <<<"$settings")" || return 1
         net="xhttp"; key="xhttpSettings"; extra="$(jq -n --arg h "$d" --arg pa "$path" '{host:$h, mode:"auto", path:$pa}')"
       fi
-      jq -n --arg tag "$tag" --argjson port "${P_PORT[$p]}" --arg target "${P_TARGET[$p]}" --arg priv "$priv" \
-            --arg fp "$fp" --arg sn "$d" --argjson sids "$sids" --arg net "$net" --arg key "$key" --argjson extra "$extra" \
-            --arg spx "$spx" --argjson hard "$hard" '
+      jq --arg tag "$tag" --argjson port "${P_PORT[$p]}" --arg target "${P_TARGET[$p]}" \
+            --arg sn "$d" --arg net "$net" --arg key "$key" --argjson extra "$extra" --argjson hard "$hard" '
         {tag:$tag, port:$port, listen:"127.0.0.1", protocol:"vless",
          settings:{clients:[], decryption:"none"},
          sniffing:{enabled:true, routeOnly:true, destOverride:["http","tls","quic"]},
          streamSettings: ({network:$net, security:"reality",
-           realitySettings:({target:$target, spiderX:$spx, shortIds:$sids, privateKey:$priv, fingerprint:$fp, serverNames:[$sn]} + $hard)}
-           + (if $key != "" then {($key): $extra} else {} end))}' ;;
+           realitySettings:({target:$target, spiderX:(.spiderX // "/"), shortIds, privateKey, fingerprint, serverNames:[$sn]} + $hard)}
+           + (if $key != "" then {($key): $extra} else {} end))}' <<<"$settings" ;;
   esac
 }
 
@@ -272,42 +438,49 @@ _self_ip() {  # публичный IPv4 ноды для правила «на с
   return 0
 }
 
-build_config() {  # печатает полный конфиг Xray
-  local p inbounds="[]" all_tags="[]" tg_tag="" tgdomains
+build_config() {  # stdin: объект выхода или null; stdout: конфиг Xray
+  local p inbound exit_config tg_tag=""
+  local -a inbounds=()
+  IFS= read -r exit_config || return 1
   for p in "${PROTO_ORDER[@]}"; do
     [ -n "${PDOM[$p]:-}" ] || continue
-    inbounds="$(jq -c --argjson ib "$(build_inbound "$p")" '. + [$ib]' <<<"$inbounds")"
-    if [ "$p" = "tg" ]; then tg_tag="${P_TAG[tg]}"; else all_tags="$(jq -c --arg t "${P_TAG[$p]}" '. + [$t]' <<<"$all_tags")"; fi
+    inbound="$(build_inbound "$p")" || return 1
+    inbounds+=("$inbound")
+    [ "$p" = "tg" ] && tg_tag="${P_TAG[tg]}"
   done
-  # Что пропускает Telegram-хост: Telegram + ЮKassa/ЮMoney (+ свои домены). Всё остальное — в BLOCK.
-  tgdomains="$(jq -nc --arg extra "${TG_EXTRA_DOMAINS:-}" '
-    ["geosite:telegram","domain:telegram.org","domain:t.me","domain:telegra.ph","domain:yookassa.ru","domain:yoomoney.ru",
-     "full:cp.cloudflare.com","full:www.gstatic.com","full:connectivitycheck.gstatic.com","full:clients3.google.com","full:www.google.com"]   # + адреса проверки задержки в клиентах (generate_204), иначе у хоста нет «пинга»
-    + ($extra | split(" ") | map(select(length>0) | "domain:" + .))')"
-  jq -n --argjson inbounds "$inbounds" --argjson tags "$all_tags" --arg tg "$tg_tag" --argjson tgd "$tgdomains" \
+  [ "${#inbounds[@]}" -gt 0 ] || return 1
+  printf '%s\n' "$exit_config" "${inbounds[@]}" |
+  jq -s --arg tg "$tg_tag" --arg extra "${TG_EXTRA_DOMAINS:-}" \
         --arg psiphon "${PSIPHON:-1}" --arg ll "${XRAY_LOGLEVEL:-warning}" \
         --arg self "$(_self_ip)" --arg prot "${SCAN_PROTECT:-1}" \
         --arg opt "${XRAY_OPTIMIZE:-1}" --arg ads "${BLOCK_ADS:-0}" '
     # XRAY_OPTIMIZE=1 (по умолчанию):
-    #  - routing.domainStrategy=IPIfNonMatch: правила по IP (частные сети, сам сервер) действуют и на
-    #    запросы по доменному имени — иначе домен, указывающий на 127.0.0.1 или на адрес сервера,
-    #    обходил бы блокировку;
+    #  - IPOnDemand проверяет IP домена до завершающего правила по тегу входа.
     #  - DNS: ответы кэшируются, просроченный ответ отдаётся сразу и обновляется в фоне (serveStale) —
     #    повторные подключения не ждут резолвера;
     #  - исходящие соединения: keepalive (зависшие соединения закрываются, а не копятся) и TCP Fast Open.
     # BLOCK_ADS=1 — рекламные и трекерные домены в BLOCK (geosite:category-ads-all).
-    {log:{loglevel:$ll},
-     dns:({servers:["https+local://1.1.1.1/dns-query","https+local://8.8.8.8/dns-query","localhost"], queryStrategy:"UseIPv4"}
+    .[0] as $exit | .[1:] as $inbounds
+    | [$inbounds[] | .tag | select(.!=$tg)] as $tags
+    | (if $exit then "EXIT" else "DIRECT" end) as $out
+    | ($exit==null and $psiphon=="1") as $use_psiphon
+    | (["geosite:telegram","domain:telegram.org","domain:t.me","domain:telegra.ph","domain:yookassa.ru","domain:yoomoney.ru",
+        "full:cp.cloudflare.com","full:www.gstatic.com","full:connectivitycheck.gstatic.com","full:clients3.google.com","full:www.google.com"]
+        + ($extra | split(" ") | map(select(length>0) | "domain:" + .))) as $tgd
+    | {log:{loglevel:$ll},
+     dns:({servers:["https+local://1.1.1.1/dns-query","https+local://8.8.8.8/dns-query","localhost"]}
        + (if $opt=="1" then {serveStale:true, serveExpiredTTL:3600} else {} end)),
      inbounds:$inbounds,
-     outbounds:([({tag:"DIRECT", protocol:"freedom", settings:{domainStrategy:"UseIP"}}
+     outbounds:(if $exit then [{tag:"BLOCK", protocol:"blackhole"}, $exit]
+       else [({tag:"DIRECT", protocol:"freedom", settings:{domainStrategy:"UseIP"}}
           + (if $opt=="1" then {streamSettings:{sockopt:{tcpFastOpen:true, tcpKeepAliveIdle:120, tcpKeepAliveInterval:30}}} else {} end)),
         {tag:"BLOCK", protocol:"blackhole"}]
-       + (if $psiphon=="1" then [{tag:"psiphon-out", protocol:"socks", settings:{port:1080, address:"172.17.0.1"}}] else [] end)),
-     routing:((if $opt=="1" then {domainStrategy:"IPIfNonMatch"} else {} end) + {rules:(
-       [{ip:["geoip:private"], outboundTag:"BLOCK"},
-        {domain:["geosite:private"], outboundTag:"BLOCK"},
-        {protocol:["bittorrent"], outboundTag:"BLOCK"},
+       + (if $use_psiphon then [{tag:"psiphon-out", protocol:"socks", settings:{port:1080, address:"172.17.0.1"}}] else [] end)
+       end),
+     routing:((if $opt=="1" or $exit then {domainStrategy:"IPOnDemand"} else {} end) + {rules:(
+       [{type:"field", domain:["geosite:private"], outboundTag:"BLOCK"},
+        {type:"field", ip:["geoip:private"], outboundTag:"BLOCK"},
+        {type:"field", protocol:["bittorrent"], outboundTag:"BLOCK"},
         {port:"25", type:"field", network:"tcp", outboundTag:"BLOCK"}]
        + (if $ads=="1" then [{type:"field", domain:["geosite:category-ads-all"], outboundTag:"BLOCK"}] else [] end)
        # Через прокси нельзя ходить на сам сервер (SSH/панель/внутренние сервисы по публичному IP)
@@ -315,20 +488,20 @@ build_config() {  # печатает полный конфиг Xray
        + (if $prot == "1" and $self != "" then [{type:"field", ip:[$self], outboundTag:"BLOCK"}] else [] end)
        + (if $prot == "1" then [{type:"field", port:"23,135-139,445,3389", outboundTag:"BLOCK"}] else [] end)
        + (if $tg != "" then
-            [{type:"field", inboundTag:[$tg], domain:$tgd, outboundTag:"DIRECT"},
-             {type:"field", inboundTag:[$tg], ip:["geoip:telegram"], outboundTag:"DIRECT"},
+            [{type:"field", inboundTag:[$tg], domain:$tgd, outboundTag:$out},
+             {type:"field", inboundTag:[$tg], ip:["geoip:telegram"], outboundTag:$out},
              {type:"field", inboundTag:[$tg], outboundTag:"BLOCK"}]
           else [] end)
-       + (if $psiphon=="1" then
+       + (if $use_psiphon then
             [{type:"field", domain:["domain:gemini.google.com","domain:generativelanguage.googleapis.com","domain:ai.google.dev","domain:aistudio.google.com","domain:alkalimakersuite-pa.clients6.google.com","geosite:google-deepmind"], outboundTag:"psiphon-out"}]
           else [] end)
-       + [{port:"443", type:"field", domain:["geosite:facebook","geosite:instagram","domain:fbcdn.net","domain:cdninstagram.com"], network:"udp", outboundTag:"BLOCK"},
-          {inboundTag:$tags, outboundTag:"DIRECT"}])})}'
+       + [{port:"443", type:"field", domain:["geosite:facebook","geosite:instagram","domain:fbcdn.net","domain:cdninstagram.com"], network:"udp", outboundTag:"BLOCK"}]
+       + (if $tags!=[] then [{type:"field", inboundTag:$tags, outboundTag:$out}] else [] end))})}'
 }
 
 # ---- профиль, хосты, сквад, нода -------------------------------------------------------------------
 upsert_profile() {  # upsert_profile <имя> <json-конфиг> → PROFILE_UUID
-  local name="$1" cfg="$2" uuid
+  local name="$1" cfg="$2" uuid payload
   uuid="$(st_get '.profileUuid')"
   if [ -n "$uuid" ] && rw_api GET "/api/config-profiles/${uuid}"; then :; else
     uuid=""
@@ -337,16 +510,18 @@ upsert_profile() {  # upsert_profile <имя> <json-конфиг> → PROFILE_UU
   fi
   if [ -n "$uuid" ]; then
     info "Профиль «${name}» уже есть на панели — обновляю конфиг (ключи сохраняются)."
-    rw_api PATCH /api/config-profiles "$(jq -nc --arg u "$uuid" --argjson c "$cfg" '{uuid:$u, config:$c}')" \
-      || { rw_fail "Обновление профиля"; return 1; }
+    payload="$(jq -c --arg u "$uuid" '{uuid:$u, config:.}' <<<"$cfg")" || return 1
+    rw_api PATCH /api/config-profiles "$payload" \
+      || { err "Не удалось обновить профиль (HTTP ${RW_LAST_CODE}). Проверьте профиль на панели и версию Xray ноды."; return 1; }
   else
-    rw_api POST /api/config-profiles "$(jq -nc --arg n "$name" --argjson c "$cfg" '{name:$n, config:$c}')" \
-      || { rw_fail "Создание профиля"; return 1; }
+    payload="$(jq -c --arg n "$name" '{name:$n, config:.}' <<<"$cfg")" || return 1
+    rw_api POST /api/config-profiles "$payload" \
+      || { err "Не удалось создать профиль (HTTP ${RW_LAST_CODE}). Проверьте список профилей на панели и версию Xray ноды."; return 1; }
     uuid="$(jq -r '.response.uuid // empty' <<<"$RW_BODY")"
   fi
   [ -n "$uuid" ] || { err "Панель не вернула uuid профиля."; return 1; }
   PROFILE_UUID="$uuid"
-  st_set --arg u "$uuid" '.profileUuid=$u'
+  st_set --arg u "$uuid" '.profileUuid=$u' || return 1
   ok "Профиль «${name}» готов (${uuid:0:8}…)"
 }
 
@@ -413,7 +588,11 @@ attach_squad() {  # добавляет inbound'ы профиля в сквад (
   else
     sq="$(jq -r '[.response.internalSquads[]? | .uuid][0] // empty' <<<"$RW_BODY")"
   fi
-  if [ -z "$sq" ]; then warn "Сквад не найден — inbound'ы не привязаны (создайте сквад в панели и добавьте их)."; return 0; fi
+  if [ -z "$sq" ]; then
+    if [ -n "${SQUAD_NAME:-}" ]; then err "Сквад «${SQUAD_NAME}» не найден."; return 1; fi
+    warn "Сквад не найден — inbound'ы не привязаны (создайте сквад в панели и добавьте их)."
+    return 0
+  fi
   name="$(jq -r --arg u "$sq" '.response.internalSquads[] | select(.uuid==$u) | .name' <<<"$RW_BODY")"
   current="$(jq -c --arg u "$sq" '[.response.internalSquads[] | select(.uuid==$u) | .info.inbounds[]? // .inbounds[]? | (.uuid // .)] | unique' <<<"$RW_BODY")"
   want="$(printf '%s\n' "${IB_UUID[@]}" | jq -R . | jq -sc .)"
@@ -466,7 +645,10 @@ wait_node_connected() {  # wait_node_connected [секунд]
 print_summary() {
   local p
   echo
-  box_top "Профиль «$(st_get '.name')» на панели"
+  box_top "Профиль Xray"
+  box_wrap "Имя" "$(st_get '.name')"
+  box_wrap "Маршрут" "$(profile_route_label)"
+  box_sep
   for p in "${PROTO_ORDER[@]}"; do
     [ -n "${PDOM[$p]:-}" ] || continue
     box_row "${C_B}${P_REMARK[$p]}${C_RESET}"
@@ -478,7 +660,7 @@ print_summary() {
     fi
   done
   box_sep
-  box_wrap "${C_DIM}•${C_RESET}" "У каждого протокола свои приватный ключ, shortId, fingerprint, SNI и заглушка. Секреты сохранены в ${PROFILE_STATE} (права 600)."
+  box_wrap "${C_DIM}•${C_RESET}" "Ключи REALITY сохранены в ${PROFILE_STATE} (права 600)."
   box_bottom
 }
 
@@ -489,9 +671,17 @@ _is_panel_addr() {  # домен/IP[:порт][/путь?запрос] с http(s
   is_valid_url "$a"
 }
 
+profile_check_panel_transport() {
+  [ "${PROFILE_ROUTE:-direct}" = direct ] && return 0
+  case "$RW_BASE" in https://*|http://127.0.0.1|http://127.0.0.1:*) return 0 ;; esac
+  err "В режиме каскада укажите HTTPS-адрес панели. Локальная панель может использовать HTTP на 127.0.0.1."
+  return 1
+}
+
 profile_collect_params() {
   local px pname
 
+  profile_collect_route "${1:-}" || return 1
   # адрес панели и токен
   RW_TOKEN="${PANEL_API_TOKEN:-${REMNAWAVE_API_TOKEN:-}}"
   local url="${PANEL_URL:-}"
@@ -500,9 +690,12 @@ profile_collect_params() {
     url=$(ask_valid "Адрес панели (домен или ссылка для входа; https:// можно не писать)" "$url" _is_panel_addr) || return 1
     [[ "$url" =~ ^https?:// ]] || url="https://${url}"
     rw_parse_url "$url" || { err "Не удалось разобрать адрес панели."; [ "${ASSUME_YES:-0}" = "1" ] && return 1; url=""; continue; }
+    profile_check_panel_transport || { [ "${ASSUME_YES:-0}" = "1" ] && return 1; url=""; continue; }
     if [ -z "$RW_TOKEN" ]; then
+      if [ "${ASSUME_YES:-0}" = "1" ]; then err "Задайте PANEL_API_TOKEN."; return 1; fi
       info "Токен: панель → Настройки → API-токены → создать."
-      RW_TOKEN=$(ask_value "API-токен панели" "")
+      read -rs -p "  API-токен панели: " RW_TOKEN <"$(prompt_input)" || return 1
+      printf '\n' >&2
       RW_TOKEN="$(printf '%s' "$RW_TOKEN" | tr -d ' \r\n"')"
     fi
     if rw_check; then break; fi
@@ -516,7 +709,7 @@ profile_collect_params() {
   PROFILE_PREFIX="$px"; PROFILE_NAME="$pname"
   COUNTRY_CODE=$(ask_value "Код страны ноды (2 буквы, как в панели)" "${COUNTRY_CODE:-$([ "${#px}" -eq 2 ] && echo "${px^^}" || echo XX)}")
   if [ -z "${PSIPHON:-}" ]; then
-    if ask_yes_no "Маршрут Gemini/AI Studio через psiphon (172.17.0.1:1080, как в вашем конфиге)?" "1"; then PSIPHON=1; else PSIPHON=0; fi
+    if [ "${PROFILE_ROUTE:-direct}" = direct ] && ask_yes_no "Маршрут Gemini/AI Studio через psiphon (172.17.0.1:1080, как в вашем конфиге)?" "1"; then PSIPHON=1; else PSIPHON=0; fi
   fi
   if [ -z "${FINAL_MASK:-}" ]; then
     # Без вопросов (cloud-init) по умолчанию выключено: не меняем поведение уже настроенных серверов.
@@ -534,6 +727,14 @@ profile_collect_params() {
 # параметры собираются на этапе вопросов, а применяется профиль отдельным этапом конвейера —
 # когда заглушки и сертификаты уже готовы.
 profile_apply() {
+  mkdir -p -- "$(dirname "$PROFILE_STATE")" || return 1
+  {
+    flock -n 9 || { err "На этом сервере профиль уже настраивается другим процессом."; return 1; }
+    profile_apply_locked
+  } 9>"${PROFILE_STATE}.lock"
+}
+
+profile_apply_locked() {
   step "Профиль и хосты на панели (API)"
   have jq || { apt_install jq || { err "jq нужен для работы с API."; return 1; }; }
   have openssl || { err "openssl не найден."; return 1; }
@@ -543,15 +744,19 @@ profile_apply() {
   for _p in "${PROTO_ORDER[@]}"; do [ -n "${PDOM[$_p]:-}" ] && { _first="$_p"; break; }; done
   [ -n "$_first" ] || { err "Не выбран ни один протокол Xray (REALITY TCP, gRPC, XHTTP, Hysteria2, Telegram) — профиль создавать не из чего."; return 1; }
   [ -n "$RW_BASE" ] && [ -n "$RW_TOKEN" ] || { err "Не заданы адрес панели и токен."; return 1; }
+  profile_check_panel_transport || return 1
   define_protocols "${PROFILE_PREFIX:-NL}"
 
   state_prepare "$PROFILE_PREFIX" "$PROFILE_NAME" || return 1
-  local cfg
-  cfg="$(build_config)" || { err "Не удалось собрать конфиг Xray."; return 1; }
+  local cfg exit_config
+  exit_config="$(profile_exit_config)" || return 1
+  profile_check_exit_address <<<"$exit_config" || return 1
+  cfg="$(build_config <<<"$exit_config")" || { err "Не удалось собрать конфиг Xray."; return 1; }
   jq -e . >/dev/null <<<"$cfg" || { err "Собранный конфиг не является валидным JSON."; return 1; }
   ok "Конфиг Xray собран: $(jq -r '[.inbounds[].tag] | join(", ")' <<<"$cfg")"
 
   upsert_profile "$PROFILE_NAME" "$cfg" || return 1
+  st_set --arg mode "${PROFILE_ROUTE:-direct}" --arg file "${PROFILE_EXIT_FILE:-}" '.route={mode:$mode, file:$file}' || return 1
   load_inbounds || return 1
   upsert_hosts || return 1
   attach_squad || return 1
@@ -582,7 +787,8 @@ if [ "$_profile_standalone" = "1" ]; then
   require_root
   case "${1:-}" in
     --show) [ -s "$PROFILE_STATE" ] && jq 'del(.protocols[]?.privateKey)' "$PROFILE_STATE" || echo "Профиль ещё не создавался."; exit 0 ;;
+    --exit-file) ensure_tty; banner; profile_export_exit; exit $? ;;
     "") ensure_tty; banner; ensure_base_packages || true; profile_run; exit $? ;;
-    *) echo "Использование: $0 [--show]" >&2; exit 2 ;;
+    *) echo "Использование: $0 [--show | --exit-file]" >&2; exit 2 ;;
   esac
 fi
