@@ -432,10 +432,14 @@ build_inbound() {  # build_inbound <proto> — JSON одного inbound'а
   esac
 }
 
-_self_ip() {  # публичный IPv4 ноды для правила «на сам сервер не ходить»; пусто, если неизвестен
+_self_ips() {
   local ip="${SELF_IP:-${NODE_ADDRESS:-}}"
-  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && printf '%s' "$ip"
-  return 0
+  {
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || ( "$ip" == *:* && "$ip" =~ ^[0-9a-fA-F:]+$ ) ]]; then
+      printf '%s\n' "$ip"
+    fi
+    ip -o addr show scope global 2>/dev/null | awk '{split($4, address, "/"); print address[1]}'
+  } | sort -u
 }
 
 build_config() {  # stdin: объект выхода или null; stdout: конфиг Xray
@@ -452,7 +456,7 @@ build_config() {  # stdin: объект выхода или null; stdout: кон
   printf '%s\n' "$exit_config" "${inbounds[@]}" |
   jq -s --arg tg "$tg_tag" --arg extra "${TG_EXTRA_DOMAINS:-}" \
         --arg psiphon "${PSIPHON:-1}" --arg ll "${XRAY_LOGLEVEL:-warning}" \
-        --arg self "$(_self_ip)" --arg prot "${SCAN_PROTECT:-1}" \
+        --arg self "$(_self_ips)" --arg prot "${SCAN_PROTECT:-1}" \
         --arg opt "${XRAY_OPTIMIZE:-1}" --arg ads "${BLOCK_ADS:-0}" '
     # XRAY_OPTIMIZE=1 (по умолчанию):
     #  - IPOnDemand проверяет IP домена до завершающего правила по тегу входа.
@@ -467,25 +471,36 @@ build_config() {  # stdin: объект выхода или null; stdout: кон
     | (["geosite:telegram","domain:telegram.org","domain:t.me","domain:telegra.ph","domain:yookassa.ru","domain:yoomoney.ru",
         "full:cp.cloudflare.com","full:www.gstatic.com","full:connectivitycheck.gstatic.com","full:clients3.google.com","full:www.google.com"]
         + ($extra | split(" ") | map(select(length>0) | "domain:" + .))) as $tgd
-    | {log:{loglevel:$ll},
-     dns:({servers:["https+local://1.1.1.1/dns-query","https+local://8.8.8.8/dns-query","localhost"]}
+    | (["1.1.1.1","8.8.8.8"]) as $resolver_ips
+    | (["geoip:private","100.64.0.0/10","169.254.0.0/16","fe80::/10","fc00::/7"]
+       + ($self | split("\n") | map(select(length>0)))) as $blocked_ips
+    | {log:{loglevel:$ll, access:"none", dnsLog:false, maskAddress:"full"},
+     dns:({tag:"DNS-RESOLVER", servers:[$resolver_ips[] | "https://" + . + "/dns-query"]}
        + (if $opt=="1" then {serveStale:true, serveExpiredTTL:3600} else {} end)),
      inbounds:$inbounds,
-     outbounds:(if $exit then [{tag:"BLOCK", protocol:"blackhole"}, $exit]
-       else [({tag:"DIRECT", protocol:"freedom", settings:{domainStrategy:"UseIP"}}
-          + (if $opt=="1" then {streamSettings:{sockopt:{tcpFastOpen:true, tcpKeepAliveIdle:120, tcpKeepAliveInterval:30}}} else {} end)),
+     outbounds:((if $exit then [{tag:"BLOCK", protocol:"blackhole"}, $exit]
+       else [{tag:"DIRECT", protocol:"freedom",
+          settings:{finalRules:[{action:"block", ip:$blocked_ips, blockDelay:"0"}]},
+          streamSettings:{sockopt:({domainStrategy:"ForceIP"}
+            + (if $opt=="1" then {tcpFastOpen:true, tcpKeepAliveIdle:120, tcpKeepAliveInterval:30} else {} end))}},
         {tag:"BLOCK", protocol:"blackhole"}]
        + (if $use_psiphon then [{tag:"psiphon-out", protocol:"socks", settings:{port:1080, address:"172.17.0.1"}}] else [] end)
-       end),
-     routing:((if $opt=="1" or $exit then {domainStrategy:"IPOnDemand"} else {} end) + {rules:(
-       [{type:"field", domain:["geosite:private"], outboundTag:"BLOCK"},
-        {type:"field", ip:["geoip:private"], outboundTag:"BLOCK"},
+       end) + [{tag:"DNS-FILTER", protocol:"dns", settings:{rules:[
+         {action:"hijack", qType:"1,28"},
+         {action:"return", rCode:5}
+       ]}}]),
+     routing:{domainStrategy:"IPOnDemand", rules:(
+       # DNS-правила идут до проверок IP, чтобы резолвер не вызывал сам себя.
+       [{type:"field", inboundTag:["DNS-RESOLVER"], ip:$resolver_ips, network:"tcp", port:"443", outboundTag:$out},
+        {type:"field", inboundTag:["DNS-RESOLVER"], outboundTag:"BLOCK"}]
+       + (if $tags!=[] then [{type:"field", inboundTag:$tags, network:"tcp,udp", port:"53", outboundTag:"DNS-FILTER"}] else [] end)
+       + [{type:"field", network:"tcp,udp", port:"53", outboundTag:"BLOCK"},
+        {type:"field", domain:["geosite:private"], outboundTag:"BLOCK"},
+        {type:"field", ip:$blocked_ips, outboundTag:"BLOCK"},
         {type:"field", protocol:["bittorrent"], outboundTag:"BLOCK"},
         {port:"25", type:"field", network:"tcp", outboundTag:"BLOCK"}]
        + (if $ads=="1" then [{type:"field", domain:["geosite:category-ads-all"], outboundTag:"BLOCK"}] else [] end)
-       # Через прокси нельзя ходить на сам сервер (SSH/панель/внутренние сервисы по публичному IP)
-       # и на порты, которые чаще всего используют для сканирования и брутфорса (telnet, NetBIOS/SMB, RDP).
-       + (if $prot == "1" and $self != "" then [{type:"field", ip:[$self], outboundTag:"BLOCK"}] else [] end)
+       # Отдельно от блокировки адресов ограничиваем порты telnet, NetBIOS/SMB и RDP.
        + (if $prot == "1" then [{type:"field", port:"23,135-139,445,3389", outboundTag:"BLOCK"}] else [] end)
        + (if $tg != "" then
             [{type:"field", inboundTag:[$tg], domain:$tgd, outboundTag:$out},
@@ -496,7 +511,7 @@ build_config() {  # stdin: объект выхода или null; stdout: кон
             [{type:"field", domain:["domain:gemini.google.com","domain:generativelanguage.googleapis.com","domain:ai.google.dev","domain:aistudio.google.com","domain:alkalimakersuite-pa.clients6.google.com","geosite:google-deepmind"], outboundTag:"psiphon-out"}]
           else [] end)
        + [{port:"443", type:"field", domain:["geosite:facebook","geosite:instagram","domain:fbcdn.net","domain:cdninstagram.com"], network:"udp", outboundTag:"BLOCK"}]
-       + (if $tags!=[] then [{type:"field", inboundTag:$tags, outboundTag:$out}] else [] end))})}'
+       + (if $tags!=[] then [{type:"field", inboundTag:$tags, outboundTag:$out}] else [] end))}}'
 }
 
 # ---- профиль, хосты, сквад, нода -------------------------------------------------------------------
@@ -534,18 +549,21 @@ load_inbounds() {  # заполняет IB_UUID[tag] из профиля
   [ "${#IB_UUID[@]}" -gt 0 ] || { err "В профиле не нашлось ни одного inbound'а — панель отклонила конфиг?"; return 1; }
 }
 
-# Final Mask — последний слой маскировки на клиенте (поле хоста «Final Mask» в панели). Здесь —
-# фрагментация TLS ClientHello: рукопожатие уходит несколькими мелкими пакетами, и DPI, который
-# ищет SNI в первом пакете, его не видит. Только для TCP-хостов (у Hysteria2 нет ClientHello по TCP).
+# Final Mask применяется к основному TCP-хосту: HAProxy может передать фрагментированный
+# ClientHello основному обработчику даже без SNI. Вторичные хосты требуют полного SNI.
 # Включить: FINAL_MASK=1. Свой JSON: FINAL_MASK_JSON='{"tcp":[...]}'.
-# В текущих версиях Xray поля называются lengths/delays/maxSplit (xtls.github.io → FinalMask),
-# а в совете из Telegram — length/interval: какой вариант примет ядро клиента, зависит от его версии.
-FINAL_MASK_DEFAULT='{"tcp":[{"type":"fragment","settings":{"length":"10-20","packets":"tlshello","interval":"10-20"}}]}'
+# Оба лимита заданы в формате FinalMask Xray 26.7.28. Ограничиваем число разбиений.
+FINAL_MASK_DEFAULT='{"tcp":[{"type":"fragment","settings":{"lengths":["16-32"],"packets":"tlshello","delays":["5-10"],"maxSplit":"3-5"}}]}'
 
 host_body() {  # host_body <proto> — JSON хоста для API
-  local p="$1" d fp tag fm=""
+  local p="$1" d fp tag fm="" primary=""
   d="${PDOM[$p]}"; tag="${P_TAG[$p]}"; fp="$(st_get ".protocols.${p}.fingerprint")"
-  if [ "$p" != "hy2" ] && [ "${FINAL_MASK:-0}" = "1" ]; then
+  if [ "${FINAL_MASK:-0}" = "1" ]; then
+    for primary in tcp grpc xhttp tg; do
+      [ -n "${PDOM[$primary]:-}" ] && break
+    done
+  fi
+  if [ "$p" = "$primary" ]; then
     fm="${FINAL_MASK_JSON:-$FINAL_MASK_DEFAULT}"
     jq -e . >/dev/null 2>&1 <<<"$fm" || { warn "FINAL_MASK_JSON — невалидный JSON, беру значение по умолчанию."; fm="$FINAL_MASK_DEFAULT"; }
   fi
@@ -648,6 +666,7 @@ print_summary() {
   box_top "Профиль Xray"
   box_wrap "Имя" "$(st_get '.name')"
   box_wrap "Маршрут" "$(profile_route_label)"
+  box_wrap "DNS" "$([ "${PROFILE_ROUTE:-direct}" = direct ] && echo "DoH через эту ноду" || echo "DoH через выходную ноду")"
   box_sep
   for p in "${PROTO_ORDER[@]}"; do
     [ -n "${PDOM[$p]:-}" ] || continue
@@ -709,11 +728,10 @@ profile_collect_params() {
   PROFILE_PREFIX="$px"; PROFILE_NAME="$pname"
   COUNTRY_CODE=$(ask_value "Код страны ноды (2 буквы, как в панели)" "${COUNTRY_CODE:-$([ "${#px}" -eq 2 ] && echo "${px^^}" || echo XX)}")
   if [ -z "${PSIPHON:-}" ]; then
-    if [ "${PROFILE_ROUTE:-direct}" = direct ] && ask_yes_no "Маршрут Gemini/AI Studio через psiphon (172.17.0.1:1080, как в вашем конфиге)?" "1"; then PSIPHON=1; else PSIPHON=0; fi
+    if [ "${PROFILE_ROUTE:-direct}" = direct ] && ask_yes_no "Маршрут Gemini/AI Studio через psiphon (172.17.0.1:1080)?" "2"; then PSIPHON=1; else PSIPHON=0; fi
   fi
   if [ -z "${FINAL_MASK:-}" ]; then
-    # Без вопросов (cloud-init) по умолчанию выключено: не меняем поведение уже настроенных серверов.
-    if ask_yes_no "Фрагментация ClientHello (Final Mask) на TCP-хостах? Мешает DPI видеть SNI; клиенты с очень старым ядром Xray могут её не понять" "$([ "${ASSUME_YES:-0}" = "1" ] && echo 2 || echo 1)"; then FINAL_MASK=1; else FINAL_MASK=0; fi
+    if ask_yes_no "Фрагментировать ClientHello на основном TCP-хосте (Final Mask)? Требуется совместимая версия Xray на клиентах" 2; then FINAL_MASK=1; else FINAL_MASK=0; fi
   fi
   export FINAL_MASK
   # Нода создаётся на панели сама (SECRET_KEY панель выдаёт по API — вручную ничего копировать не нужно).
@@ -749,6 +767,7 @@ profile_apply_locked() {
 
   state_prepare "$PROFILE_PREFIX" "$PROFILE_NAME" || return 1
   local cfg exit_config
+  local SELF_IP="${SELF_IP:-${NODE_ADDRESS:-$(get_public_ip)}}"
   exit_config="$(profile_exit_config)" || return 1
   profile_check_exit_address <<<"$exit_config" || return 1
   cfg="$(build_config <<<"$exit_config")" || { err "Не удалось собрать конфиг Xray."; return 1; }

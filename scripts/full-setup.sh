@@ -243,7 +243,7 @@ _all_domains() { echo "${DOMAIN_TCP:-}" "${DOMAIN_GRPC:-}" "${DOMAIN_XHTTP:-}" "
 _domains_fp()  { echo "${DOMAIN_TCP:-}|${DOMAIN_GRPC:-}|${DOMAIN_XHTTP:-}|${DOMAIN_HY2:-}|${DOMAIN_TG:-}|${DOMAIN_WEB:-}"; }
 fp_apt()       { date +%Y%m%d; }
 fp_ssh()       { fp_make "${NEW_SSH_PORT:-}" "${ROLE:-}" "${USE_HY2:-}" "$(hy2_port)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${PANEL_IP:-}" "${ENABLE_REBOOT:-}"; }
-fp_web()       { fp_make "${WEB_SERVER:-}" "${INSTALL_DECOY:-}" "${SCAN_PROTECT:-}" "${USE_HY2:-}" "${USE_TG:-}" "${USE_WEB:-}" "$(_domains_fp)"; }
+fp_web()       { fp_make "${WEB_SERVER:-}" "${INSTALL_DECOY:-}" "${SCAN_PROTECT:-}" "${USE_HY2:-}" "${USE_TG:-}" "${USE_WEB:-}" "$(_domains_fp)" "tls-site-v2"; }
 fp_bbr()       { fp_make "${USE_BBR:-}"; }
 fp_profile() {
   local -a route=()
@@ -254,7 +254,7 @@ fp_profile() {
   fi
   fp_make "$(_domains_fp)" "$(hy2_port)" "${PROFILE_PREFIX:-}" "${PROFILE_NAME:-}" "${COUNTRY_CODE:-}" \
     "${PSIPHON:-}" "${FINAL_MASK:-}" "${SCAN_PROTECT:-}" "${PROFILE_CREATE_NODE:-}" "${NODE_PORT:-}" "${route[@]}" \
-    ${SQUAD_NAME:+"${SQUAD_NAME}"}
+    "doh-v2" ${SQUAD_NAME:+"${SQUAD_NAME}"}
 }
 fp_node()      { fp_make "${NODE_PORT:-}" "${USE_HY2:-}" "${DOMAIN_HY2:-}"; }
 fp_nodelink()  { fp_make "$(fp_profile)" "$(fp_node)"; }

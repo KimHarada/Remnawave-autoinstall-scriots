@@ -54,8 +54,8 @@ if [ -z "${DOMAIN_TCP}${DOMAIN_GRPC}${DOMAIN_XHTTP}${DOMAIN_HY2}${DOMAIN_TG}${DO
   exit 1
 fi
 
-# Основной протокол: к нему HAProxy отправляет всё, что пришло с неизвестным SNI или без него
-# (заход по IP, сканер). Это первый из выбранных протоколов Xray, который слушает TCP 443.
+# Основной домен определяет TLS-сайт для запросов с неизвестным SNI.
+# Протоколы Xray доступны по своим SNI на TCP 443.
 declare -A XPORT=( [tcp]=56789 [grpc]=56790 [xhttp]=56791 [tg]=56792 )
 declare -A XDOM=( [tcp]="$DOMAIN_TCP" [grpc]="$DOMAIN_GRPC" [xhttp]="$DOMAIN_XHTTP" [tg]="$DOMAIN_TG" )
 PRIMARY=""; PRIMARY_DOMAIN=""
@@ -184,8 +184,7 @@ fi
 step "Настройка HAProxy"
 
 # ---- защита от сканеров ------------------------------------------------------------------
-# Любой заход (по IP, с чужим SNI) должен видеть обычный сайт-заглушку, как у настоящего сервера:
-# мёртвый порт для проверяющего (ТСПУ) подозрительнее. Поэтому лишнее НЕ рвём, а отдаём REALITY TCP.
+# Явно неизвестный SNI обрабатывает веб-сервер основного домена.
 # SCAN_PROTECT=1 добавляет: лимит новых соединений и одновременных соединений с одного IP.
 #   HAPROXY_RATE (300 новых за 10 с), HAPROXY_CONN_MAX (3000 одновременных) — под CGNAT/офисы
 #   с тысячами клиентов за одним адресом при необходимости поднимите.
@@ -219,8 +218,7 @@ if [ "$SCAN_PROTECT" = "1" ]; then
     tcp-request connection reject if { sc_conn_rate(0) gt ${HAP_RATE} }
     tcp-request connection reject if { sc_conn_cur(0) gt ${HAP_CONN_MAX} }
     # ждём ClientHello недолго: молчащий сканер не должен занимать сокет.
-    # Неизвестный/пустой SNI и не-TLS НЕ отбрасываем: они уходят в REALITY TCP, а тот показывает
-    # заглушку, как настоящий сайт (иначе проверка по IP/чужому SNI видела бы «мёртвый» порт).
+    # Неполный ClientHello после таймаута передаётся основному обработчику.
     tcp-request inspect-delay 3s
     tcp-request content accept if { req.ssl_hello_type 1 }
 EOF
@@ -242,20 +240,24 @@ done
 # WEB-прокси Telegram: веб-сервер (TLS своего домена) -> Telemt; страницу для обычных посетителей отдаёт Telemt.
 [ -n "$DOMAIN_WEB" ] && { [ -z "$PRIMARY" ] || [ "$DOMAIN_WEB" != "$PRIMARY_DOMAIN" ]; } && BE[web]=1
 
-# Куда уходит всё неизвестное: основной протокол Xray; без него — заглушка Hysteria2 или WEB-прокси.
+# Для явно чужого SNI используем TLS-сайт. Если HAProxy не смог извлечь имя
+# (например, при фрагментации ClientHello), передаём поток основному протоколу.
 if [ -n "$PRIMARY" ]; then DEFAULT_BE="be_${PRIMARY}"
 elif [ -n "${BE[hy2]:-}" ]; then DEFAULT_BE="be_hy2"
 else DEFAULT_BE="be_web"; fi
 
+[ -n "$PRIMARY" ] && echo "    use_backend be_${PRIMARY} if { req.ssl_sni -i ${PRIMARY_DOMAIN} }"
 for p in grpc xhttp tg; do
   [ -n "${BE[$p]:-}" ] && echo "    use_backend be_${p} if { req.ssl_sni -i ${XDOM[$p]} }"
 done
 [ -n "${BE[hy2]:-}" ] && [ "$DEFAULT_BE" != "be_hy2" ] && echo "    use_backend be_hy2 if { req.ssl_sni -i ${DOMAIN_HY2} }"
 [ -n "${BE[web]:-}" ] && [ "$DEFAULT_BE" != "be_web" ] && echo "    use_backend be_web if { req.ssl_sni -i ${DOMAIN_WEB} }"
+[ -n "$PRIMARY" ] && echo "    use_backend be_default_tls if { req.ssl_sni -m found }"
 echo "    default_backend ${DEFAULT_BE}"
 
 if [ -n "$PRIMARY" ]; then
   printf '\nbackend be_%s\n    server %s1 127.0.0.1:%s\n' "$PRIMARY" "$PRIMARY" "${XPORT[$PRIMARY]}"
+  printf '\nbackend be_default_tls\n    server tls1 127.0.0.1:%s\n' "${DECOY_PORT[$PRIMARY]}"
 fi
 for p in grpc xhttp tg; do
   [ -n "${BE[$p]:-}" ] && printf '\nbackend be_%s\n    server %s1 127.0.0.1:%s\n' "$p" "$p" "${XPORT[$p]}"

@@ -288,7 +288,11 @@ EOF
 # Поэтому каждая заглушка слушает TLS с сертификатом СВОЕГО домена.
 # Возвращает число заглушек, оставшихся без TLS (нет сертификата своего домена).
 decoys_write_nginx() {
-  local p d port root no_tls=0 keep=" "
+  local p d port root no_tls=0 keep=" " ngv h2_listen="http2" h2_dir=""
+  ngv="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+  if [ -n "$ngv" ] && [ "$(printf '%s\n1.25.1\n' "$ngv" | sort -V | head -1)" = "1.25.1" ]; then
+    h2_listen=""; h2_dir="http2 on;"
+  fi
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
   rm -f /etc/nginx/sites-enabled/decoy /etc/nginx/sites-available/decoy   # прежняя единая заглушка
   rm -f /etc/nginx/conf.d/dorik-web-upgrade.conf
@@ -301,15 +305,18 @@ decoys_write_nginx() {
       continue
     fi
     if cert_is_valid "$d"; then
+      # Сайт REALITY должен согласовывать HTTP/2 по ALPN.
       cat > "/etc/nginx/sites-available/decoy-$p" <<EOF
 # DORIK toolkit — заглушка протокола ${DECOY_LABEL[$p]} (${d})
 server {
-    listen 127.0.0.1:${port} ssl;
+    listen 127.0.0.1:${port} ssl ${h2_listen};
+    ${h2_dir}
     server_name ${d};
     server_tokens off;
     ssl_certificate /etc/letsencrypt/live/${d}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${d}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
+    access_log off;
     root ${root};
     index index.html;
     location / { try_files \$uri \$uri/ =404; }
@@ -421,7 +428,7 @@ decoys_write_sites() {
 # Для каждого протокола: отвечает 200, отдаёт сертификат СВОЕГО домена; страницы всех протоколов
 # различаются. Возвращает число провалов.
 decoys_verify() {
-  local p d port code body hash fails=0 tls other
+  local p d port code body hash fails=0 tls other handshake
   declare -A hash_of=()
   body="$(mktemp)"
   for p in $(decoy_protos); do
@@ -443,6 +450,18 @@ decoys_verify() {
     fi
     if [ "$code" = "200" ] && [ "$tls" = "ok" ]; then
       ok "заглушка ${DECOY_LABEL[$p]} (127.0.0.1:${port}): 200, сертификат ${d} верный"
+      case "$p" in
+        tcp|grpc|xhttp|tg)
+          handshake="$(timeout 5 openssl s_client -connect "127.0.0.1:${port}" \
+            -servername "$d" -tls1_3 -alpn h2 </dev/null 2>/dev/null)"
+          if grep -qx 'ALPN protocol: h2' <<<"$handshake"; then
+            ok "${d}: TLS 1.3 и HTTP/2 согласованы"
+          else
+            err "${d}: TLS-сайт REALITY не согласовал HTTP/2 по TLS 1.3"
+            fails=$((fails+1))
+          fi
+          ;;
+      esac
     elif [ "$code" = "200" ] && [ "$tls" = "none" ]; then
       err "заглушка ${DECOY_LABEL[$p]} (127.0.0.1:${port}): отвечает без TLS — нет сертификата ${d}"; fails=$((fails+1))
     elif [ "$code" = "200" ]; then
