@@ -279,7 +279,7 @@ profile_export_exit() {
     "VLESS Reality|Экспорт данных настроенного входа VLESS Reality TCP и UUID сервисного пользователя." \
     "Hysteria2|Экспорт настроенного порта, имени сертификата и пароля сервисного пользователя." || return 1
   case "$CHOICE" in
-    1) p=tcp; mode=vless; port=443 ;;
+    1) p=tcp; mode=vless; port="$(tcp_public_port)" ;;
     2) p=hy2; mode=hysteria2; port="$(hy2_port)" ;;
   esac
   load_domains && domain="${PDOM[$p]:-}"
@@ -287,7 +287,8 @@ profile_export_exit() {
     err "Выбранный протокол отсутствует в текущем профиле этой ноды."
     return 1
   }
-  address="$(ask_value "Адрес выходной ноды (домен или IPv4)" "$domain")" || return 1
+  address="$(ask_value "Адрес выходной ноды (домен или IPv4)" "$(st_get '.connectAddress // empty')")" || return 1
+  address="${address:-$domain}"
   port="$(ask_valid "Внешний порт выходной ноды" "$port" is_valid_port)" || return 1
   if [ "$mode" = vless ]; then
     public_key="$(st_get '.protocols.tcp.publicKey')"
@@ -568,12 +569,13 @@ host_body() {  # host_body <proto> — JSON хоста для API
     jq -e . >/dev/null 2>&1 <<<"$fm" || { warn "FINAL_MASK_JSON — невалидный JSON, беру значение по умолчанию."; fm="$FINAL_MASK_DEFAULT"; }
   fi
   # Если фрагментация выключена, поле finalMask НЕ отправляем: так не затираем маску, заданную в панели вручную.
-  jq -nc --arg cp "$PROFILE_UUID" --arg ib "${IB_UUID[$tag]}" --arg remark "${P_REMARK[$p]}" --arg addr "$d" \
+  jq -nc --arg cp "$PROFILE_UUID" --arg ib "${IB_UUID[$tag]}" --arg remark "${P_REMARK[$p]}" \
+         --arg addr "${HOST_CONNECT_ADDRESS:-$d}" --arg sni "$d" \
          --arg fp "$fp" --arg path "$(st_get '.protocols.xhttp.path')" --arg proto "$p" --arg fm "$fm" \
-         --argjson port "$([ "$p" = "hy2" ] && hy2_port || echo 443)" '
-    {inbound:{configProfileUuid:$cp, configProfileInboundUuid:$ib}, remark:$remark, address:$addr, port:$port, sni:$addr}
+         --argjson port "$([ "$p" = "hy2" ] && hy2_port || tcp_public_port)" '
+    {inbound:{configProfileUuid:$cp, configProfileInboundUuid:$ib}, remark:$remark, address:$addr, port:$port, sni:$sni}
     + (if $proto=="hy2" then {alpn:"h3"} else {fingerprint:$fp} end)
-    + (if $proto=="xhttp" then {host:$addr, path:$path} else {} end)
+    + (if $proto=="xhttp" then {host:$sni, path:$path} else {} end)
     + (if $fm != "" then {finalMask:($fm | fromjson)} else {} end)'
 }
 
@@ -697,10 +699,25 @@ profile_check_panel_transport() {
   return 1
 }
 
+profile_valid_connect_address() {
+  local part
+  is_valid_domain "$1" && return 0
+  [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local -a parts
+  IFS=. read -ra parts <<<"$1"
+  for part in "${parts[@]}"; do
+    [[ "$part" = 0 || "$part" != 0* ]] && [ "$part" -le 255 ] || return 1
+  done
+}
+
 profile_collect_params() {
   local px pname
 
   profile_collect_route "${1:-}" || return 1
+  if [ "${1:-}" != resume ]; then
+    HOST_CONNECT_ADDRESS="$(ask_valid "Общий адрес подключения (домен или IPv4). Пусто — использовать домен SNI для каждого хоста" \
+      "${HOST_CONNECT_ADDRESS-$(st_get '.connectAddress')}" profile_valid_connect_address 1)" || return 1
+  fi
   # адрес панели и токен
   RW_TOKEN="${PANEL_API_TOKEN:-${REMNAWAVE_API_TOKEN:-}}"
   local url="${PANEL_URL:-}"
@@ -763,6 +780,11 @@ profile_apply_locked() {
   [ -n "$_first" ] || { err "Не выбран ни один протокол Xray (REALITY TCP, gRPC, XHTTP, Hysteria2, Telegram) — профиль создавать не из чего."; return 1; }
   [ -n "$RW_BASE" ] && [ -n "$RW_TOKEN" ] || { err "Не заданы адрес панели и токен."; return 1; }
   profile_check_panel_transport || return 1
+  is_proxy_tcp_port "$(tcp_public_port)" || { err "Недопустимый порт TCP."; return 1; }
+  if [ -n "${HOST_CONNECT_ADDRESS:-}" ] && ! profile_valid_connect_address "$HOST_CONNECT_ADDRESS"; then
+    err "Недопустимый адрес подключения HOST_CONNECT_ADDRESS."
+    return 1
+  fi
   define_protocols "${PROFILE_PREFIX:-NL}"
 
   state_prepare "$PROFILE_PREFIX" "$PROFILE_NAME" || return 1
@@ -779,6 +801,7 @@ profile_apply_locked() {
   load_inbounds || return 1
   upsert_hosts || return 1
   attach_squad || return 1
+  st_set --arg addr "${HOST_CONNECT_ADDRESS:-}" '.connectAddress=$addr' || return 1
 
   if [ "${PROFILE_CREATE_NODE:-0}" = "1" ]; then
     local addr="${NODE_ADDRESS:-$(get_public_ip)}" nport nname

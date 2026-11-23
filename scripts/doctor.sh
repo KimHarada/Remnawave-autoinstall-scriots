@@ -219,8 +219,16 @@ fix_ufw_off() {
   ufw default deny incoming &>/dev/null; ufw default allow outgoing &>/dev/null
   ufw allow "${p}/tcp" comment "SSH" &>/dev/null; info "открыт SSH ${p}/tcp"
   if svc_active nginx || svc_active caddy || svc_active haproxy || [ -f "$PANEL_DIR/docker-compose.yml" ]; then
-    ufw allow 80/tcp comment "HTTP" &>/dev/null; ufw allow 443/tcp comment "HTTPS" &>/dev/null
-    info "открыты 80/tcp и 443/tcp (работают nginx/haproxy/панель)"
+    local https_port=443
+    if svc_active haproxy && grep -q 'fe_443' /etc/haproxy/haproxy.cfg 2>/dev/null; then
+      https_port="$(tcp_public_port)"
+    fi
+    ufw allow 80/tcp comment "HTTP" &>/dev/null
+    ufw allow "${https_port}/tcp" comment "HTTPS" &>/dev/null
+    if [ -f "$PANEL_DIR/docker-compose.yml" ] && [ "$https_port" != 443 ]; then
+      ufw allow 443/tcp comment "HTTPS panel" &>/dev/null
+    fi
+    info "открыты 80/tcp и ${https_port}/tcp"
   fi
   if [ -f "$NODE_DIR/docker-compose.yml" ]; then
     local np; np="$(grep -oE 'NODE_PORT=[0-9]+' "$NODE_DIR/docker-compose.yml" | head -1 | cut -d= -f2)"

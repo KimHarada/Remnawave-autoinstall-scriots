@@ -297,11 +297,12 @@ verify_ssh() {  # verify_ssh <порт>
 
 verify_firewall() {  # verify_firewall <ssh_port> <роль 1|2> <hy2 0|1> <node_port|""> <reboot 0|1>
   VERIFY_FAIL=0
-  local ssh="$1" role="$2" hy2="$3" nport="$4" reboot="$5"
+  local ssh="$1" role="$2" hy2="$3" nport="$4" reboot="$5" https_port=443
+  [ "$role" != 1 ] || https_port="$(tcp_public_port)"
   ufw status 2>/dev/null | grep -q '^Status: active'; _chk $? "ufw: активен" "ufw: не активен"
   ufw status verbose 2>/dev/null | grep -q 'deny (incoming)'; _chk $? "ufw: входящие закрыты по умолчанию" "ufw: политика входящих не deny"
   _ufw_open "${ssh}/tcp"; _chk $? "ufw: SSH ${ssh}/tcp открыт для всех" "ufw: SSH ${ssh}/tcp не открыт для всех (нет правила или оно только для одного IP)"
-  _ufw_open "443/tcp"; _chk $? "ufw: 443/tcp открыт" "ufw: нет правила для 443/tcp"
+  _ufw_open "$https_port/tcp"; _chk $? "ufw: $https_port/tcp открыт" "ufw: нет правила для $https_port/tcp"
   _ufw_open "80/tcp"; _chk $? "ufw: 80/tcp открыт" "ufw: нет правила для 80/tcp"
   if [ "$role" = "1" ]; then
     [ "$hy2" != "1" ] || { _ufw_open "$(hy2_port)/udp"; _chk $? "ufw: $(hy2_port)/udp открыт (Hysteria2)" "ufw: нет правила для $(hy2_port)/udp"; }

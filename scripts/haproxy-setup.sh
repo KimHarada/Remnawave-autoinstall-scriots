@@ -54,8 +54,17 @@ if [ -z "${DOMAIN_TCP}${DOMAIN_GRPC}${DOMAIN_XHTTP}${DOMAIN_HY2}${DOMAIN_TG}${DO
   exit 1
 fi
 
+TCP_PORT="$(tcp_public_port)"
+if [ "${NONINTERACTIVE:-0}" != "1" ]; then
+  TCP_PORT="$(ask_valid "TCP-порт для клиентов (443 или 5000–65535)" "$TCP_PORT" is_proxy_tcp_port)" || exit 1
+fi
+is_proxy_tcp_port "$TCP_PORT" || { err "Недопустимый TCP_PORT: $TCP_PORT"; exit 1; }
+if [ "$TCP_PORT" = "$(get_real_ssh_port)" ]; then
+  err "TCP-порт $TCP_PORT занят SSH."
+  exit 1
+fi
+
 # Основной домен определяет TLS-сайт для запросов с неизвестным SNI.
-# Протоколы Xray доступны по своим SNI на TCP 443.
 declare -A XPORT=( [tcp]=56789 [grpc]=56790 [xhttp]=56791 [tg]=56792 )
 declare -A XDOM=( [tcp]="$DOMAIN_TCP" [grpc]="$DOMAIN_GRPC" [xhttp]="$DOMAIN_XHTTP" [tg]="$DOMAIN_TG" )
 PRIMARY=""; PRIMARY_DOMAIN=""
@@ -208,8 +217,8 @@ defaults
     timeout server 1h
 
 frontend fe_443
-    bind *:443
 EOF
+printf '    bind *:%s\n' "$TCP_PORT"
 if [ "$SCAN_PROTECT" = "1" ]; then
   cat <<EOF
     # лимиты на один адрес источника
@@ -271,16 +280,30 @@ fi
 } > "$HAP_NEW"
 
 if haproxy -c -f "$HAP_NEW" >/tmp/dorik_haproxy_check 2>&1; then
-  [ -f /etc/haproxy/haproxy.cfg ] && cp -f /etc/haproxy/haproxy.cfg "/etc/haproxy/haproxy.cfg.bak.$(date +%s)"
-  install -m 644 "$HAP_NEW" /etc/haproxy/haproxy.cfg
+  HAP_BACKUP=""
+  if [ -f /etc/haproxy/haproxy.cfg ]; then
+    HAP_BACKUP="/etc/haproxy/haproxy.cfg.bak.$(date +%s)"
+    cp -f /etc/haproxy/haproxy.cfg "$HAP_BACKUP" || exit 1
+  fi
+  install -m 644 "$HAP_NEW" /etc/haproxy/haproxy.cfg || exit 1
+  rm -f "$HAP_NEW"
   systemctl enable haproxy &>/dev/null || true
-  systemctl restart haproxy
+  if ! systemctl restart haproxy; then
+    err "HAProxy не запустился на ${TCP_PORT}/tcp."
+    if [ -n "$HAP_BACKUP" ]; then
+      install -m 644 "$HAP_BACKUP" /etc/haproxy/haproxy.cfg && systemctl restart haproxy
+    fi
+    exit 1
+  fi
+  mkdir -p -- "$(dirname "$TCP_PORT_FILE")" && printf '%s\n' "$TCP_PORT" > "$TCP_PORT_FILE" || exit 1
+  if have ufw; then ufw allow "${TCP_PORT}/tcp" comment "HTTPS TCP" || exit 1; fi
   ok "HAProxy настроен и перезапущен."
 else
   err "Новый конфиг HAProxy не прошёл проверку, старый оставлен без изменений:"
   head -n 10 /tmp/dorik_haproxy_check >&2
+  rm -f "$HAP_NEW"
+  exit 1
 fi
-rm -f "$HAP_NEW"
 
 # ---- certbot автопродление --------------------------------------------------
 # Пакет certbot уже приносит certbot.timer; отдельная запись в crontab root
@@ -303,10 +326,10 @@ CHECK_FAIL=0
 if systemctl is-active --quiet "$WS"; then ok "${WS}: активен"; else err "${WS}: НЕ активен"; CHECK_FAIL=1; fi
 if systemctl is-active --quiet haproxy; then ok "haproxy: активен"; else err "haproxy: НЕ активен"; CHECK_FAIL=1; fi
 
-if ss -tlnp 2>/dev/null | grep -E '[:.]443[[:space:]]' | grep -q haproxy; then
-  ok "haproxy: слушает 443/tcp"
+if ss -tlnp "sport = :${TCP_PORT}" 2>/dev/null | grep -q haproxy; then
+  ok "haproxy: слушает ${TCP_PORT}/tcp"
 else
-  err "haproxy: НЕ слушает 443/tcp — клиенты не смогут подключиться"; CHECK_FAIL=1
+  err "haproxy: НЕ слушает ${TCP_PORT}/tcp — клиенты не смогут подключиться"; CHECK_FAIL=1
 fi
 if haproxy -c -f /etc/haproxy/haproxy.cfg &>/dev/null; then
   ok "haproxy: конфигурация валидна"
