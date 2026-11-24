@@ -69,11 +69,11 @@ PROTO_HOT=(1 2 3 4 5 6)
 PROTO_LABELS=("VLESS REALITY TCP" "VLESS REALITY gRPC" "VLESS REALITY XHTTP" "Hysteria2" "Telegram-хост" "WEB-прокси Telegram")
 declare -A PROTO_VAR=( [tcp]=DOMAIN_TCP [grpc]=DOMAIN_GRPC [xhttp]=DOMAIN_XHTTP [hy2]=DOMAIN_HY2 [tg]=DOMAIN_TG [web]=DOMAIN_WEB )
 PROTO_DESC=(
-  "Основной протокол: самый совместимый, работает во всех клиентах. Трафик выглядит как обычный HTTPS к вашему домену, чужим отдаётся страница-заглушка.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy${NL}${NL}@НУЖНО${NL}свой домен и сертификат"
-  "VLESS REALITY поверх gRPC. Запасной транспорт: помогает там, где обычный TCP режут по поведению соединения.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
-  "VLESS REALITY поверх XHTTP: запросы выглядят как обычная работа сайта, устойчив к обрывам длинных соединений.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
+  "Основной протокол: самый совместимый, работает во всех клиентах. Трафик выглядит как обычный HTTPS к вашему домену, чужим отдаётся страница-заглушка.${NL}${NL}@ПОРТ${NL}TCP, по умолчанию 443, через HAProxy${NL}${NL}@НУЖНО${NL}свой домен и сертификат"
+  "VLESS REALITY поверх gRPC. Запасной транспорт: помогает там, где обычный TCP режут по поведению соединения.${NL}${NL}@ПОРТ${NL}TCP, по умолчанию 443, через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
+  "VLESS REALITY поверх XHTTP: запросы выглядят как обычная работа сайта, устойчив к обрывам длинных соединений.${NL}${NL}@ПОРТ${NL}TCP, по умолчанию 443, через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
   "Быстрый протокол поверх QUIC (UDP). Хорош на плохих и мобильных сетях; там, где UDP режут, не работает — поэтому ставится вместе с TCP-протоколами.${NL}${NL}@ПОРТ${NL}UDP, по умолчанию 443; можно задать свой (его спросят позже)${NL}${NL}@НУЖНО${NL}отдельный домен и сертификат"
-  "Отдельный хост, через который ходят только Telegram и ЮKassa/ЮMoney — остальное на нём блокируется. Удобно для бесплатного или ограниченного тарифа.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
+  "Отдельный хост, через который ходят только Telegram и ЮKassa/ЮMoney — остальное на нём блокируется. Удобно для бесплатного или ограниченного тарифа.${NL}${NL}@ПОРТ${NL}TCP, по умолчанию 443, через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
   "Прокси Telegram типа «WEB» (Telemt) с рекламой вашего канала через @MTProxybot. К Xray и подпискам не относится — это отдельная служба.${NL}${NL}@ПОРТ${NL}443/tcp через HAProxy (по SNI)${NL}${NL}@НУЖНО${NL}отдельный домен"
 )
 declare -A SEL=()
@@ -242,14 +242,14 @@ _all_domains() { echo "${DOMAIN_TCP:-}" "${DOMAIN_GRPC:-}" "${DOMAIN_XHTTP:-}" "
 # Для отпечатка домены идут через «|» с пустыми полями: иначе «tcp пуст, grpc=a» совпало бы с «tcp=a, grpc пуст».
 _domains_fp()  { echo "${DOMAIN_TCP:-}|${DOMAIN_GRPC:-}|${DOMAIN_XHTTP:-}|${DOMAIN_HY2:-}|${DOMAIN_TG:-}|${DOMAIN_WEB:-}"; }
 fp_apt()       { date +%Y%m%d; }
-fp_ssh()       { fp_make "${NEW_SSH_PORT:-}" "${ROLE:-}" "${USE_HY2:-}" "$(hy2_port)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${PANEL_IP:-}" "${ENABLE_REBOOT:-}"; }
-fp_web()       { fp_make "${WEB_SERVER:-}" "${INSTALL_DECOY:-}" "${SCAN_PROTECT:-}" "${USE_HY2:-}" "${USE_TG:-}" "${USE_WEB:-}" "$(_domains_fp)"; }
+fp_ssh()       { fp_make "${NEW_SSH_PORT:-}" "${ROLE:-}" "${USE_HY2:-}" "$(hy2_port)" "$(public_tcp_ports)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${PANEL_IP:-}" "${ENABLE_REBOOT:-}"; }
+fp_web()       { fp_make "${PORT_TCP:-}" "${PORT_GRPC:-}" "${PORT_XHTTP:-}" "${PORT_TG:-}" "${PORT_HY2:-}" "${PORT_WEB:-}" "${WEB_SERVER:-}" "${INSTALL_DECOY:-}" "${SCAN_PROTECT:-}" "${USE_HY2:-}" "${USE_TG:-}" "${USE_WEB:-}" "$(_domains_fp)"; }
 fp_bbr()       { fp_make "${USE_BBR:-}"; }
-fp_profile()   { fp_make "$(_domains_fp)" "$(hy2_port)" "${PROFILE_PREFIX:-}" "${PROFILE_NAME:-}" "${COUNTRY_CODE:-}" "${PSIPHON:-}" "${FINAL_MASK:-}" "${SCAN_PROTECT:-}" "${PROFILE_CREATE_NODE:-}" "${NODE_PORT:-}"; }
+fp_profile()   { fp_make "$(_domains_fp)" "${PORT_TCP:-}" "${PORT_GRPC:-}" "${PORT_XHTTP:-}" "${PORT_TG:-}" "$(hy2_port)" "${PROFILE_PREFIX:-}" "${PROFILE_NAME:-}" "${COUNTRY_CODE:-}" "${PSIPHON:-}" "${FINAL_MASK:-}" "${SCAN_PROTECT:-}" "${PROFILE_CREATE_NODE:-}" "${NODE_PORT:-}"; }
 fp_node()      { fp_make "${NODE_PORT:-}" "${USE_HY2:-}" "${DOMAIN_HY2:-}"; }
 fp_nodelink()  { fp_make "$(fp_profile)" "$(fp_node)"; }
 fp_webproxy()  { fp_make "${DOMAIN_WEB:-}" "${WEB_AD_TAG:-}"; }
-fp_harden()    { fp_make "${NEW_SSH_PORT:-}" "${USE_HY2:-}" "$(hy2_port)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${SSH_PW_OFF:-}" "${SCAN_PROTECT:-}" "${ROLE:-}"; }
+fp_harden()    { fp_make "$(public_tcp_ports)" "${NEW_SSH_PORT:-}" "${USE_HY2:-}" "$(hy2_port)" "${OPEN_NODE_PORT:-}" "${NODE_PORT:-}" "${SSH_PW_OFF:-}" "${SCAN_PROTECT:-}" "${ROLE:-}"; }
 fp_scanblock() { fp_make "${SCAN_BLOCKLIST:-}" "${PANEL_IP:-}"; }
 
 live_web() {
@@ -347,7 +347,7 @@ if [ "$RESUME_MODE" = "continue" ] || [ "$RESUME_MODE" = "domains" ]; then
   step "Продолжаю прошлый запуск"
   ROLE="${ROLE:-1}"
   if [ "$ROLE" = "1" ]; then
-    preflight_run --docker --certs --ports "80 443" || exit 1
+    preflight_run --docker --certs --ports "80" || exit 1
   else
     preflight_run || exit 1
   fi
@@ -387,7 +387,7 @@ ROLE="$CHOICE"
 # Роль известна — проверяем окружение до остальных вопросов, чтобы не гонять
 # пользователя по вопросам, если установка всё равно невозможна.
 if [ "$ROLE" = "1" ]; then
-  preflight_run --docker --certs --ports "80 443" || exit 1
+  preflight_run --docker --certs --ports "80" || exit 1
 else
   preflight_run || exit 1
 fi
@@ -458,8 +458,10 @@ if [ "$ROLE" = "1" ]; then
   # (случайные имена — по названию поддомена нельзя угадать протокол; нужна wildcard-запись DNS).
   ask_domains
 
+  configure_tcp_ports ask || exit 1
+
   # UDP-порт Hysteria2: 443 или свой (если 443/udp режут, занят или нужен «нестандартный» порт, как в чужих
-  # конфигах). Клиент подключается на этот порт по UDP; TCP-заглушка домена остаётся на 443.
+  # конфигах). Клиент подключается на этот порт по UDP; TCP-заглушка использует выбранный отдельно TCP-порт.
   if [ "$USE_HY2" = "1" ]; then
     hy2_port_pick || { err "Отменено пользователем."; exit 1; }
     hy2_port_save "$HY2_PORT"
@@ -525,7 +527,7 @@ if [ "$ROLE" = "1" ]; then
   NODE_PORT=$(ask_valid "Порт remnanode (для связи с панелью)" "${NODE_PORT:-${EXISTING_NODE_PORT:-$DEFAULT_NODE_PORT}}" is_valid_port) || exit 1
   # Порт ноды не должен совпадать с SSH, 80 и 443: иначе один из сервисов не поднимется,
   # а проверка «порт слушает» ошибочно сочтёт успехом чужой процесс.
-  while [ "$NODE_PORT" = "$NEW_SSH_PORT" ] || [ "$NODE_PORT" = "80" ] || [ "$NODE_PORT" = "443" ]; do
+  while [ "$NODE_PORT" = "$NEW_SSH_PORT" ] || [ "$NODE_PORT" = "80" ] || grep -Fxq "$NODE_PORT" <<<"$(public_tcp_ports)"; do
     err "Порт ноды ${NODE_PORT} уже занят под SSH/HTTPS — выберите другой."
     [ "${ASSUME_YES:-0}" = "1" ] && exit 1
     NODE_PORT=$(ask_valid "Порт remnanode" "" is_valid_port) || exit 1
@@ -613,6 +615,9 @@ else
   box_row "SSH-порт:           ${NEW_SSH_PORT} (без изменений)"
 fi
 if [ "$ROLE" = "1" ]; then
+  local endpoints="" p
+  for p in $(active_tcp_protocols); do endpoints+="${p^^} $(public_tcp_port "$p")/tcp  "; done
+  box_wrap "Порты HAProxy:     " "$endpoints"
   box_wrap "Домены:           " "${DOMAIN_TCP:+${DOMAIN_TCP} }${DOMAIN_GRPC:+${DOMAIN_GRPC} }${DOMAIN_XHTTP:+${DOMAIN_XHTTP} }${DOMAIN_HY2:+${DOMAIN_HY2} }${DOMAIN_TG:+${DOMAIN_TG} }${DOMAIN_WEB:+${DOMAIN_WEB} (WEB-прокси)}"
   if [ "$USE_API" = "1" ]; then
     box_row "Профиль на панели: ${C_BOLD}${PROFILE_NAME}${C_RESET}  ${C_DIM}(хосты + SECRET_KEY по API)${C_RESET}"
@@ -637,6 +642,8 @@ if [ "$ROLE" = "1" ]; then
 fi
 box_bottom
 }
+
+if [ "$ROLE" = "1" ]; then configure_tcp_ports || exit 1; fi
 
 while true; do
   show_plan
@@ -767,7 +774,10 @@ do_protect_common() {
 
     if [ "$ROLE" = "1" ]; then
       ufw allow 80/tcp comment "HTTP (certbot)" &>/dev/null || true
-      ufw allow 443/tcp comment "HTTPS TCP" &>/dev/null || true
+      local port
+      for port in $(public_tcp_ports); do
+        ufw allow "$port/tcp" comment "HAProxy TLS" &>/dev/null || true
+      done
       # Прежнее правило Hysteria2 (другой порт от прошлого запуска) убираем — иначе старый порт остался бы открытым.
       ufw_delete_matching 'Hysteria2'
       [ "$USE_HY2" = "1" ] && { ufw allow "$(hy2_port)/udp" comment "Hysteria2" &>/dev/null || true; }
@@ -908,10 +918,13 @@ fi
 if [ "$DO_HARDEN" = "1" ]; then
   # Нужные порты объявляем один раз на весь запуск: их используют и сам этап укрепления,
   # и итоговая перепроверка — иначе она «критиковала» бы результат, не зная выбранной роли.
-  HARDEN_EXPECT="${NEW_SSH_PORT}/tcp 80/tcp 443/tcp"
+  HARDEN_EXPECT="${NEW_SSH_PORT}/tcp 80/tcp"
   if [ "$ROLE" = "1" ]; then
+    for port in $(public_tcp_ports); do HARDEN_EXPECT+=" $port/tcp"; done
     [ "$USE_HY2" = "1" ] && HARDEN_EXPECT+=" $(hy2_port)/udp"
     [ "$OPEN_NODE_PORT" = "1" ] && HARDEN_EXPECT+=" ${NODE_PORT}/tcp"
+  else
+    HARDEN_EXPECT+=" 443/tcp"
   fi
   export HARDEN_EXPECT
   do_harden() { SSH_DISABLE_PASSWORD="$SSH_PW_OFF" harden_run; }

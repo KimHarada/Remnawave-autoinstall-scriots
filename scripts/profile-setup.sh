@@ -377,7 +377,7 @@ host_body() {  # host_body <proto> — JSON хоста для API
   # Если фрагментация выключена, поле finalMask НЕ отправляем: так не затираем маску, заданную в панели вручную.
   jq -nc --arg cp "$PROFILE_UUID" --arg ib "${IB_UUID[$tag]}" --arg remark "${P_REMARK[$p]}" --arg addr "$d" \
          --arg fp "$fp" --arg path "$(st_get '.protocols.xhttp.path')" --arg proto "$p" --arg fm "$fm" \
-         --argjson port "$([ "$p" = "hy2" ] && hy2_port || echo 443)" '
+         --argjson port "$([ "$p" = "hy2" ] && hy2_port || public_tcp_port "$p")" '
     {inbound:{configProfileUuid:$cp, configProfileInboundUuid:$ib}, remark:$remark, address:$addr, port:$port, sni:$addr}
     + (if $proto=="hy2" then {alpn:"h3"} else {fingerprint:$fp} end)
     + (if $proto=="xhttp" then {host:$addr, path:$path} else {} end)

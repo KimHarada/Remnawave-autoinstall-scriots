@@ -362,6 +362,75 @@ resolve_a() {
   echo "$r"
 }
 
+DORIK_PORTS_FILE="${DORIK_PORTS_FILE:-/etc/dorik/tcp-ports}"
+public_tcp_port() {
+  local var="PORT_${1^^}" port
+  port="${!var:-}"
+  if [ -z "$port" ] && [ -r "$DORIK_PORTS_FILE" ]; then
+    port="$(awk -v key="$1" '$1 == key { print $2; exit }' "$DORIK_PORTS_FILE")"
+  fi
+  port="${port:-443}"
+  if [ "$1" = "web" ] && [ "$port" != "443" ]; then return 1; fi
+  is_valid_port "$port" || return 1
+  printf '%d\n' "$((10#$port))"
+}
+
+active_tcp_protocols() {
+  local p var
+  for p in tcp grpc xhttp tg hy2 web; do
+    case "$p" in
+      tg|hy2|web) var="USE_${p^^}"; [ "${!var:-0}" = "1" ] || continue ;;
+    esac
+    var="DOMAIN_${p^^}"
+    [ -z "${!var:-}" ] || echo "$p"
+  done
+}
+
+public_tcp_ports() {
+  local p
+  for p in $(active_tcp_protocols); do public_tcp_port "$p" || return 1; done | sort -nu
+}
+
+valid_public_tcp_port() {
+  local port busy
+  is_valid_port "$1" || return 1
+  port="$((10#$1))"
+  case "$port" in 80|808[1-6]|18080|18082|56789|5679[0-2]) return 1 ;; esac
+  [ "$port" != "${NEW_SSH_PORT:-}" ] && [ "$port" != "${NODE_PORT:-}" ] || return 1
+  busy="$(ss -H -ltnp "sport = :$port" 2>/dev/null | grep -vF '"haproxy"' || true)"
+  [ -z "$busy" ]
+}
+
+configure_tcp_ports() {
+  local p var port domain_var domain
+  local -A seen=()
+  for p in $(active_tcp_protocols); do
+    domain_var="DOMAIN_${p^^}"
+    domain="${!domain_var}"
+    is_valid_domain "$domain" || { err "Некорректный домен для $p: $domain"; return 1; }
+    var="PORT_${p^^}"
+    port="$(public_tcp_port "$p")" || { err "Некорректный порт $var (для WEB-прокси нужен 443/tcp)"; return 1; }
+    if [ "$p" != "web" ] && [ "${1:-}" = "ask" ] && [ "${ASSUME_YES:-0}" != "1" ]; then
+      port="$(ask_valid "Внешний TCP-порт ${p^^} (443 — стандартный)" "$port" valid_public_tcp_port)" || return 1
+    fi
+    valid_public_tcp_port "$port" || { err "TCP-порт $port для $p занят или зарезервирован."; return 1; }
+    port="$((10#$port))"
+    if [ "$port" != "443" ] && [ -n "${seen[$port,${domain,,}]:-}" ]; then
+      err "Домен $domain уже используется на $port/tcp. Укажите другой порт или домен."
+      return 1
+    fi
+    seen[$port,${domain,,}]=1
+    printf -v "$var" '%d' "$port"
+    export "$var"
+  done
+}
+
+installed_haproxy_ports() {
+  [ -r /etc/haproxy/haproxy.cfg ] || return 0
+  awk '$1 == "frontend" { active = $2 ~ /^fe_[0-9]+$/ }
+       active && $1 == "bind" && $2 ~ /^\*:[0-9]+$/ { sub(/^\*:/, "", $2); print $2 }' /etc/haproxy/haproxy.cfg
+}
+
 # UDP-порт Hysteria2. По умолчанию 443; можно свой (HY2_PORT) — например, если 443/udp режут или
 # занят. Выбранный порт запоминается в /etc/dorik/hy2-port, чтобы firewall, укрепление, проверки и
 # профиль на панели везде брали одно и то же значение.

@@ -56,8 +56,8 @@ decoys_prefetch() {
 decoy_domain() {
   case "$1" in
     tcp)   echo "${DOMAIN_TCP:-}" ;;
-    grpc)  [ -n "${DOMAIN_GRPC:-}" ]  && [ "$DOMAIN_GRPC"  != "${DOMAIN_TCP:-}" ] && echo "$DOMAIN_GRPC" ;;
-    xhttp) [ -n "${DOMAIN_XHTTP:-}" ] && [ "$DOMAIN_XHTTP" != "${DOMAIN_TCP:-}" ] && echo "$DOMAIN_XHTTP" ;;
+    grpc)  [ -n "${DOMAIN_GRPC:-}" ]  && { [ "$DOMAIN_GRPC" != "${DOMAIN_TCP:-}" ] || [ "$(public_tcp_port grpc)" != "$(public_tcp_port tcp)" ]; } && echo "$DOMAIN_GRPC" ;;
+    xhttp) [ -n "${DOMAIN_XHTTP:-}" ] && { [ "$DOMAIN_XHTTP" != "${DOMAIN_TCP:-}" ] || [ "$(public_tcp_port xhttp)" != "$(public_tcp_port tcp)" ]; } && echo "$DOMAIN_XHTTP" ;;
     hy2)   [ -n "${DOMAIN_HY2:-}" ]   && [ "${USE_HY2:-0}" = "1" ] && echo "$DOMAIN_HY2" ;;
     tg)    [ -n "${DOMAIN_TG:-}" ]    && [ "${USE_TG:-0}" = "1" ] && echo "$DOMAIN_TG" ;;
     web)   [ -n "${DOMAIN_WEB:-}" ]   && [ "${USE_WEB:-0}" = "1" ] && echo "$DOMAIN_WEB" ;;

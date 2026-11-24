@@ -54,15 +54,21 @@ if [ -z "${DOMAIN_TCP}${DOMAIN_GRPC}${DOMAIN_XHTTP}${DOMAIN_HY2}${DOMAIN_TG}${DO
   exit 1
 fi
 
+if [ "$NONINTERACTIVE" = "1" ]; then
+  configure_tcp_ports || exit 1
+else
+  configure_tcp_ports ask || exit 1
+fi
+
 # Основной протокол: к нему HAProxy отправляет всё, что пришло с неизвестным SNI или без него
-# (заход по IP, сканер). Это первый из выбранных протоколов Xray, который слушает TCP 443.
+# (заход по IP, сканер). Это первый из выбранных протоколов Xray, который обслуживает Xray.
 declare -A XPORT=( [tcp]=56789 [grpc]=56790 [xhttp]=56791 [tg]=56792 )
 declare -A XDOM=( [tcp]="$DOMAIN_TCP" [grpc]="$DOMAIN_GRPC" [xhttp]="$DOMAIN_XHTTP" [tg]="$DOMAIN_TG" )
 PRIMARY=""; PRIMARY_DOMAIN=""
 for p in tcp grpc xhttp tg; do
   [ -n "${XDOM[$p]}" ] && { PRIMARY="$p"; PRIMARY_DOMAIN="${XDOM[$p]}"; break; }
 done
-# Только Hysteria2 и/или WEB-прокси: на TCP 443 отвечает их собственная заглушка.
+# Только Hysteria2 и/или WEB-прокси: используем домен их заглушки.
 [ -z "$PRIMARY_DOMAIN" ] && PRIMARY_DOMAIN="${DOMAIN_HY2:-$DOMAIN_WEB}"
 
 _dorik_source decoys.sh
@@ -208,77 +214,81 @@ defaults
     timeout client 1h
     timeout server 1h
 
-frontend fe_443
-    bind *:443
 EOF
-if [ "$SCAN_PROTECT" = "1" ]; then
-  cat <<EOF
+declare -A routes=() enabled=()
+for port in $(public_tcp_ports); do
+  printf '\nfrontend fe_%s\n    bind *:%s\n' "$port" "$port"
+  if [ "$SCAN_PROTECT" = "1" ]; then
+    cat <<EOF
     # лимиты на один адрес источника
     stick-table type ip size 200k expire 5m store conn_rate(10s),conn_cur
     tcp-request connection track-sc0 src
     tcp-request connection reject if { sc_conn_rate(0) gt ${HAP_RATE} }
     tcp-request connection reject if { sc_conn_cur(0) gt ${HAP_CONN_MAX} }
     # ждём ClientHello недолго: молчащий сканер не должен занимать сокет.
-    # Неизвестный/пустой SNI и не-TLS НЕ отбрасываем: они уходят в REALITY TCP, а тот показывает
-    # заглушку, как настоящий сайт (иначе проверка по IP/чужому SNI видела бы «мёртвый» порт).
     tcp-request inspect-delay 3s
     tcp-request content accept if { req.ssl_hello_type 1 }
 EOF
-else
-  cat <<'EOF'
+  else
+    cat <<'EOF'
     tcp-request inspect-delay 5s
     tcp-request content accept if { req.ssl_hello_type 1 }
 EOF
-fi
-# Какие backend'ы нужны. Протокол на том же домене, что и основной, отдельного маршрута
-# не получает: HAProxy различает только SNI.
-declare -A BE=()
-for p in grpc xhttp tg; do
-  [ "$p" = "$PRIMARY" ] && continue
-  [ -n "${XDOM[$p]}" ] && [ "${XDOM[$p]}" != "$PRIMARY_DOMAIN" ] && BE[$p]=1
+  fi
+  fallback=""
+  for p in $(active_tcp_protocols); do
+    [ "$(public_tcp_port "$p")" = "$port" ] || continue
+    var="DOMAIN_${p^^}"; d="${!var}"
+    [ -z "${routes[$port,$d]:-}" ] || continue
+    routes[$port,$d]=1
+    enabled[$p]=1
+    fallback="${fallback:-be_$p}"
+    printf '    use_backend be_%s if { req.ssl_sni -i %s }\n' "$p" "$d"
+  done
+  printf '    default_backend %s\n' "$fallback"
 done
-# Домен Hysteria2 по TCP — его собственная заглушка с его сертификатом (по UDP отвечает сам Hysteria2).
-[ -n "$DOMAIN_HY2" ] && { [ -z "$PRIMARY" ] || [ "$DOMAIN_HY2" != "$PRIMARY_DOMAIN" ]; } && BE[hy2]=1
-# WEB-прокси Telegram: веб-сервер (TLS своего домена) -> Telemt; страницу для обычных посетителей отдаёт Telemt.
-[ -n "$DOMAIN_WEB" ] && { [ -z "$PRIMARY" ] || [ "$DOMAIN_WEB" != "$PRIMARY_DOMAIN" ]; } && BE[web]=1
 
-# Куда уходит всё неизвестное: основной протокол Xray; без него — заглушка Hysteria2 или WEB-прокси.
-if [ -n "$PRIMARY" ]; then DEFAULT_BE="be_${PRIMARY}"
-elif [ -n "${BE[hy2]:-}" ]; then DEFAULT_BE="be_hy2"
-else DEFAULT_BE="be_web"; fi
-
-for p in grpc xhttp tg; do
-  [ -n "${BE[$p]:-}" ] && echo "    use_backend be_${p} if { req.ssl_sni -i ${XDOM[$p]} }"
+for p in $(active_tcp_protocols); do
+  [ -n "${enabled[$p]:-}" ] || continue
+  printf '\nbackend be_%s\n    server %s1 127.0.0.1:%s\n' "$p" "$p" "${XPORT[$p]:-${DECOY_PORT[$p]}}"
 done
-[ -n "${BE[hy2]:-}" ] && [ "$DEFAULT_BE" != "be_hy2" ] && echo "    use_backend be_hy2 if { req.ssl_sni -i ${DOMAIN_HY2} }"
-[ -n "${BE[web]:-}" ] && [ "$DEFAULT_BE" != "be_web" ] && echo "    use_backend be_web if { req.ssl_sni -i ${DOMAIN_WEB} }"
-echo "    default_backend ${DEFAULT_BE}"
-
-if [ -n "$PRIMARY" ]; then
-  printf '\nbackend be_%s\n    server %s1 127.0.0.1:%s\n' "$PRIMARY" "$PRIMARY" "${XPORT[$PRIMARY]}"
-fi
-for p in grpc xhttp tg; do
-  [ -n "${BE[$p]:-}" ] && printf '\nbackend be_%s\n    server %s1 127.0.0.1:%s\n' "$p" "$p" "${XPORT[$p]}"
-done
-if [ -n "${BE[hy2]:-}" ]; then
-  printf '\n# Hysteria2 по UDP 443 обслуживает Xray сам (masquerade); по TCP этот домен ведёт на свою заглушку\nbackend be_hy2\n    server hy2web 127.0.0.1:%s\n' "${DECOY_PORT[hy2]:-8084}"
-fi
-if [ -n "${BE[web]:-}" ]; then
-  printf '\n# WEB-прокси Telegram (веб-сервер -> Telemt)\nbackend be_web\n    server web1 127.0.0.1:%s\n' "${DECOY_PORT[web]:-8086}"
-fi
 } > "$HAP_NEW"
 
-if haproxy -c -f "$HAP_NEW" >/tmp/dorik_haproxy_check 2>&1; then
-  [ -f /etc/haproxy/haproxy.cfg ] && cp -f /etc/haproxy/haproxy.cfg "/etc/haproxy/haproxy.cfg.bak.$(date +%s)"
-  install -m 644 "$HAP_NEW" /etc/haproxy/haproxy.cfg
-  systemctl enable haproxy &>/dev/null || true
-  systemctl restart haproxy
-  ok "HAProxy настроен и перезапущен."
-else
-  err "Новый конфиг HAProxy не прошёл проверку, старый оставлен без изменений:"
+HAP_CFG=/etc/haproxy/haproxy.cfg
+HAP_BACKUP="$HAP_CFG.bak.$(date +%s%N)"
+if ! haproxy -c -f "$HAP_NEW" >/tmp/dorik_haproxy_check 2>&1; then
+  err "Новый конфиг HAProxy не прошёл проверку:"
   head -n 10 /tmp/dorik_haproxy_check >&2
+  rm -f "$HAP_NEW"
+  exit 1
 fi
+if [ -f "$HAP_CFG" ]; then cp -f "$HAP_CFG" "$HAP_BACKUP" || exit 1; fi
+install -m 644 "$HAP_NEW" "$HAP_CFG" || exit 1
 rm -f "$HAP_NEW"
+if ! systemctl restart haproxy; then
+  if [ -f "$HAP_BACKUP" ]; then
+    cp -f "$HAP_BACKUP" "$HAP_CFG" && systemctl restart haproxy
+  else
+    rm -f "$HAP_CFG"
+  fi
+  err "HAProxy не запустился с выбранными портами."
+  exit 1
+fi
+systemctl enable haproxy &>/dev/null || true
+ok "HAProxy настроен и перезапущен."
+
+mkdir -p "$(dirname "$DORIK_PORTS_FILE")" || exit 1
+PORTS_NEW="$(mktemp "${DORIK_PORTS_FILE}.XXXXXX")" || exit 1
+for p in $(active_tcp_protocols); do
+  printf '%s %s\n' "$p" "$(public_tcp_port "$p")"
+done > "$PORTS_NEW"
+mv -f "$PORTS_NEW" "$DORIK_PORTS_FILE" || exit 1
+
+if command -v ufw >/dev/null && LC_ALL=C ufw status 2>/dev/null | grep -q '^Status: active'; then
+  for port in $(public_tcp_ports); do
+    ufw allow "$port/tcp" comment "HAProxy TLS" || exit 1
+  done
+fi
 
 # ---- certbot автопродление --------------------------------------------------
 # Пакет certbot уже приносит certbot.timer; отдельная запись в crontab root
@@ -301,11 +311,13 @@ CHECK_FAIL=0
 if systemctl is-active --quiet "$WS"; then ok "${WS}: активен"; else err "${WS}: НЕ активен"; CHECK_FAIL=1; fi
 if systemctl is-active --quiet haproxy; then ok "haproxy: активен"; else err "haproxy: НЕ активен"; CHECK_FAIL=1; fi
 
-if ss -tlnp 2>/dev/null | grep -E '[:.]443[[:space:]]' | grep -q haproxy; then
-  ok "haproxy: слушает 443/tcp"
-else
-  err "haproxy: НЕ слушает 443/tcp — клиенты не смогут подключиться"; CHECK_FAIL=1
-fi
+for port in $(public_tcp_ports); do
+  if ss -H -ltnp "sport = :$port" 2>/dev/null | grep -q haproxy; then
+    ok "haproxy: слушает $port/tcp"
+  else
+    err "haproxy: НЕ слушает $port/tcp"; CHECK_FAIL=1
+  fi
+done
 if haproxy -c -f /etc/haproxy/haproxy.cfg &>/dev/null; then
   ok "haproxy: конфигурация валидна"
 else

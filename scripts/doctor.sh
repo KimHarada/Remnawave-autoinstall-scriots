@@ -129,7 +129,7 @@ doctor_scan() {
   if compgen -G "/etc/caddy/dorik/*.caddy" >/dev/null; then
     svc_active caddy || _issue web_down "Caddy настроен, но остановлен"
   fi
-  if svc_exists haproxy && [ -f /etc/haproxy/haproxy.cfg ] && grep -q 'fe_443' /etc/haproxy/haproxy.cfg; then
+  if svc_exists haproxy && [ -f /etc/haproxy/haproxy.cfg ] && grep -Eq '^frontend fe_[0-9]+$' /etc/haproxy/haproxy.cfg; then
     svc_active haproxy || _issue web_down "HAProxy настроен, но остановлен — клиенты не подключатся"
   fi
   # WEB-прокси Telegram (Telemt): установлен, но служба не работает
@@ -219,9 +219,13 @@ fix_ufw_off() {
   ufw default deny incoming &>/dev/null; ufw default allow outgoing &>/dev/null
   ufw allow "${p}/tcp" comment "SSH" &>/dev/null; info "открыт SSH ${p}/tcp"
   if svc_active nginx || svc_active caddy || svc_active haproxy || [ -f "$PANEL_DIR/docker-compose.yml" ]; then
-    ufw allow 80/tcp comment "HTTP" &>/dev/null; ufw allow 443/tcp comment "HTTPS" &>/dev/null
-    info "открыты 80/tcp и 443/tcp (работают nginx/haproxy/панель)"
+    ufw allow 80/tcp comment "HTTP" &>/dev/null
+    if [ -f "$PANEL_DIR/docker-compose.yml" ] || [ -z "$(installed_haproxy_ports)" ]; then
+      ufw allow 443/tcp comment "HTTPS" &>/dev/null
+    fi
   fi
+  local hp
+  for hp in $(installed_haproxy_ports); do ufw allow "$hp/tcp" comment "HAProxy TLS" &>/dev/null; done
   if [ -f "$NODE_DIR/docker-compose.yml" ]; then
     local np; np="$(grep -oE 'NODE_PORT=[0-9]+' "$NODE_DIR/docker-compose.yml" | head -1 | cut -d= -f2)"
     ufw allow "$(hy2_port)/udp" comment "Hysteria2" &>/dev/null
@@ -325,7 +329,7 @@ fix_web_down() {
   if compgen -G "/etc/caddy/dorik/*.caddy" >/dev/null; then
     systemctl restart caddy || rc=1
   fi
-  if svc_exists haproxy && grep -q 'fe_443' /etc/haproxy/haproxy.cfg 2>/dev/null; then
+  if svc_exists haproxy && grep -Eq '^frontend fe_[0-9]+$' /etc/haproxy/haproxy.cfg 2>/dev/null; then
     haproxy -c -f /etc/haproxy/haproxy.cfg &>/dev/null && systemctl restart haproxy || rc=1
   fi
   return $rc
